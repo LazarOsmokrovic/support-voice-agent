@@ -28,4 +28,4 @@ Full phase-by-phase plan: `PROJECT_PLAN.md`. Live status: `PROGRESS.md`.
 
 ## Repo layout
 
-See `PROJECT_PLAN.md` for the full annotated tree. Top level: `agent/` (brain + tools), `data/` (mock DB + policy docs), `io/` (transport layers per phase), `guardrails/`, `eval/`, `tests/`.
+See `PROJECT_PLAN.md` for the full annotated tree. Top level: `agent/` (brain + tools), `data/` (mock DB + policy docs), `transport/` (I/O layers per phase — named to avoid shadowing Python's stdlib `io` module), `guardrails/`, `eval/`, `tests/`.

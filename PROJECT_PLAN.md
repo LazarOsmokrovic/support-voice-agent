@@ -38,7 +38,7 @@ support_voice_agent/
   data/
     mock_db.py        # SQLite seed + access layer
     policies/          # fake policy docs for RAG
-  io/
+  transport/
     text_cli.py        # Phase 1-6 interface
     voice_local.py      # Phase 7 interface
     pipeline.py          # Phase 8 Pipecat pipeline
@@ -55,6 +55,8 @@ support_voice_agent/
 ```
 
 Keeping `agent/core.py` identical across phases 1–9 is the test of whether the architecture is actually decoupled — if you find yourself editing business logic to make voice work, that's a signal the boundary is in the wrong place.
+
+Note: the transport-layer directory is named `transport/` rather than `io/` (as an earlier draft had it) to avoid shadowing Python's built-in `io` module once it's a real importable package.
 
 ---
 
@@ -75,7 +77,7 @@ Single deterministic tool, no side effects, clear pass/fail.
 
 - Define a `get_order_status(order_id)` tool schema and implement it against the mock DB.
 - Wire into the Phase 0 tool-use loop; write a system prompt that scopes the agent to support topics only.
-- Build `io/text_cli.py` — a simple REPL chat loop.
+- Build `transport/text_cli.py` — a simple REPL chat loop.
 
 **Best practice:** this is a predictable, single-step task — use a plain deterministic function call rather than giving the model open-ended freedom here. Save autonomy for where it's actually needed (Phase 3).
 
