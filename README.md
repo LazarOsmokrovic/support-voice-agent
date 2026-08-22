@@ -54,4 +54,36 @@ A local SQLite database simulating an **Amazon-style storefront**: `customers`, 
 
 ### Checkpoint result
 
-4 passed (control-flow logic + all 3 mock-DB tests), 1 skipped/environment-dependent (the live Claude round trip — it correctly reaches the API and gets a real, structured response back; it currently fails only because the connected Anthropic account has no credit balance, which is a billing state, not a code defect).
+4 passed (control-flow logic + all 3 mock-DB tests), 1 skipped/environment-dependent (the live Claude round trip — it correctly reaches the API and gets a real, structured response back; it currently fails only because the connected Anthropic account has no credit balance).
+
+---
+
+## Phase 1 — Order & account status lookup (Done)
+
+The first real capability: the agent can look up an order in the Amazon-style mock store. Per `PROJECT_PLAN.md`'s guidance for this phase, it's implemented as a **plain deterministic function**, not open-ended model judgment — predictable, single-step lookups don't need the model to improvise.
+
+### `agent/tools/orders.py` — the `get_order_status` tool
+
+- `TOOL_SCHEMA` is the Claude tool definition (name, description, JSON `input_schema` for `order_id`) — this is what gets passed in the `tools` list on each API request.
+- `get_order_status(order_id)` is the actual implementation: validates the ID against Amazon's real order-number shape (`NNN-NNNNNNN-NNNNNNN`) with a regex *before* touching the database, then queries `data/mock_db.py`. It never raises — every outcome comes back as a plain dict:
+  - malformed ID → `{"found": False, "error": "invalid_order_id", ...}`
+  - well-formed but missing → `{"found": False, "error": "not_found", ...}`
+  - found → `{"found": True, "item": ..., "status": ..., "tracking_number": ..., ...}`
+- **Known simplification, called out deliberately:** this tool doesn't verify the caller is actually the order's owner — anyone who knows or guesses a valid order ID gets its status. That's fine for a read-only, no-PII-beyond-a-tracking-number demo tool, but it's worth revisiting before this pattern gets reused for anything more sensitive (Phase 6's refund flow explicitly calls for a "verify purchase" step first).
+
+### `agent/prompts.py` — the first real system prompt
+
+`SYSTEM_PROMPT` scopes the agent to this storefront's support topics (orders, shipping, returns, refunds, account issues), tells it to decline unrelated questions instead of answering them, and describes the one tool it has and when to use it. This is the single place later phases extend as more tools come online — `agent/core.py`'s loop doesn't need to know what's in it.
+
+### `transport/text_cli.py` — the REPL, and the first tool-wiring point
+
+A plain `input()`/`print()` loop that builds one `Agent` with `SYSTEM_PROMPT` and the current tool set, then forwards each line to `agent.send()`. `TOOLS` (the schema list) and `TOOL_HANDLERS` (name → function) are the registry every later phase (2 through 6) adds to — this file is reused as-is across all of them, per `PROJECT_PLAN.md`'s design. Run it with `python -m transport.text_cli`; type `quit` or `exit` to leave.
+
+### Tests
+
+- `tests/test_orders.py` — the checkpoint's required scripted cases: a **valid** order (full details come back), an **invalid** order-ID format (rejected before it ever reaches the database), and a well-formed but **not-found** order — plus an empty-string edge case.
+- `tests/test_text_cli.py` — proves the tool is actually wired into the loop, not just callable standalone: a mocked Claude client scripts a `tool_use` turn for `get_order_status` followed by a text turn, and asserts `Agent.send()` runs the real `dispatch_tool` from `text_cli.py` and returns the right final reply.
+
+### Checkpoint result
+
+9 of 9 relevant tests passing (all of Phase 0's plus this phase's 5 new ones). `python -m transport.text_cli` starts, prints its prompt, and exits cleanly on `quit` — confirming the wiring (imports, `Agent` construction, tool registry) is sound. A full live conversation through the REPL is still blocked by the same Anthropic account billing issue noted in Phase 0 (no credit balance) — nothing code-related, and it'll work as soon as credits are added.

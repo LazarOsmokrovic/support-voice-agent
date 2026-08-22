@@ -5,7 +5,7 @@ Update this file the moment a phase's checkpoint passes — status, date, one-li
 | # | Phase | Status | Date | Notes |
 |---|---|---|---|---|
 | 0 | Foundations (repo, mock DB, tool-use loop) | Done | 2026-08-22 | Async `Agent` tool-use loop in `agent/core.py`; SQLite mock DB (Amazon-style orders) in `data/mock_db.py`; pytest scaffold, 4 passing + 1 live-skipped |
-| 1 | Order & account status lookup | Not started | | |
+| 1 | Order & account status lookup | Done | 2026-08-22 | `get_order_status` tool wired into the Phase 0 loop; `transport/text_cli.py` REPL; 5 new tests (valid/invalid/not-found + wiring), all passing |
 | 2 | Post-session summary & CRM logging | Not started | | |
 | 3 | FAQ / policy Q&A (RAG) | Not started | | |
 | 4 | Ticket triage & escalation | Not started | | |
