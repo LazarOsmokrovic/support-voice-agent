@@ -1,9 +1,16 @@
 """REPL chat loop — Phase 1-6 interface.
 
 This is the one file reused across phases 1-6 as more tools come online —
-agent/core.py itself never changes (CLAUDE.md rule 5). TOOLS and
-TOOL_HANDLERS below are the registry of what the agent can currently do;
-extend both as later phases add tools, nothing else in this loop changes.
+agent/core.py itself never changes (CLAUDE.md rule 5). TOOLS is the static
+list of tool schemas the agent can currently use; extend it as later
+phases add tools.
+
+Starting Phase 5, tool *dispatch* can no longer be a static module-level
+dict the way TOOL_HANDLERS used to be: book_appointment/cancel_appointment
+need per-session state (a pending-confirmation tracker) and to know which
+customer is acting, unlike every earlier tool, which was a pure function
+of its arguments. build_dispatch_tool() assembles a fresh dispatcher (and
+its backing handler dict + SchedulingState) once per session instead.
 
 Run with: python -m transport.text_cli
 """
@@ -11,18 +18,21 @@ Run with: python -m transport.text_cli
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from typing import Any
 
 from agent.core import Agent, configure_logging
 from agent.prompts import SYSTEM_PROMPT
-from agent.tools import escalation, orders, policy_rag, summary
+from agent.tools import escalation, orders, policy_rag, scheduling, summary
 
-TOOLS = [orders.TOOL_SCHEMA, policy_rag.TOOL_SCHEMA, summary.END_CONVERSATION_SCHEMA]
-
-TOOL_HANDLERS = {
-    "get_order_status": orders.get_order_status,
-    "search_policy": policy_rag.search_policy,
-    "end_conversation": summary.end_conversation,
-}
+TOOLS = [
+    orders.TOOL_SCHEMA,
+    policy_rag.TOOL_SCHEMA,
+    scheduling.FIND_SLOTS_SCHEMA,
+    scheduling.BOOK_APPOINTMENT_SCHEMA,
+    scheduling.CANCEL_APPOINTMENT_SCHEMA,
+    summary.END_CONVERSATION_SCHEMA,
+]
 
 # No login/auth phase exists yet, so — same simplification as Phase 1's
 # get_order_status — the REPL just asks for a customer ID up front. It must
@@ -31,12 +41,38 @@ TOOL_HANDLERS = {
 DEFAULT_CUSTOMER_ID = "CUST-1001"
 
 
-def dispatch_tool(tool_name: str, tool_input: dict) -> dict:
-    """Route one tool_use call to the function that implements it."""
-    handler = TOOL_HANDLERS.get(tool_name)
-    if handler is None:
-        raise ValueError(f"unknown tool: {tool_name}")
-    return handler(**tool_input)
+def build_dispatch_tool(
+    customer_id: str, scheduling_state: scheduling.SchedulingState | None = None
+) -> tuple[Callable[[str, dict], Any], dict[str, Callable[..., Any]], scheduling.SchedulingState]:
+    """Assemble one session's tool dispatcher.
+
+    Returns (dispatch_tool, handlers, scheduling_state). `handlers` is
+    returned too (not just the closure) so tests can stub an individual
+    tool via monkeypatch.setitem — mutating the dict in place is visible to
+    dispatch_tool since the closure captures it by reference, not by value.
+    """
+    scheduling_state = scheduling_state or scheduling.SchedulingState()
+    handlers: dict[str, Callable[..., Any]] = {
+        "get_order_status": orders.get_order_status,
+        "search_policy": policy_rag.search_policy,
+        "find_available_slots": scheduling.find_available_slots,
+        "book_appointment": lambda **kw: scheduling.book_appointment(
+            **kw, state=scheduling_state, customer_id=customer_id
+        ),
+        "cancel_appointment": lambda **kw: scheduling.cancel_appointment(
+            **kw, state=scheduling_state, customer_id=customer_id
+        ),
+        "end_conversation": summary.end_conversation,
+    }
+
+    def dispatch_tool(tool_name: str, tool_input: dict) -> Any:
+        """Route one tool_use call to the function that implements it."""
+        handler = handlers.get(tool_name)
+        if handler is None:
+            raise ValueError(f"unknown tool: {tool_name}")
+        return handler(**tool_input)
+
+    return dispatch_tool, handlers, scheduling_state
 
 
 def should_end_session(tool_calls: list[dict]) -> bool:
@@ -46,10 +82,11 @@ def should_end_session(tool_calls: list[dict]) -> bool:
 
 async def main() -> None:
     configure_logging()
+    customer_id = input(f"Customer ID [{DEFAULT_CUSTOMER_ID}]: ").strip() or DEFAULT_CUSTOMER_ID
+    dispatch_tool, _handlers, scheduling_state = build_dispatch_tool(customer_id)
     agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
     tracker = escalation.EscalationTracker()
 
-    customer_id = input(f"Customer ID [{DEFAULT_CUSTOMER_ID}]: ").strip() or DEFAULT_CUSTOMER_ID
     print("\nSupport chat — type 'quit' or 'exit' to leave.\n")
     while True:
         try:
@@ -63,6 +100,10 @@ async def main() -> None:
         if user_text.lower() in {"quit", "exit"}:
             break
 
+        # Phase 5: advance the turn counter before each real exchange, so
+        # book_appointment/cancel_appointment can tell "proposed this turn"
+        # from "confirmed in a later one" — see agent/tools/scheduling.py.
+        scheduling_state.turn += 1
         result = await agent.send(user_text)
         print(f"Agent: {result.reply}\n")
 

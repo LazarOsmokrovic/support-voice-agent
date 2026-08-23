@@ -211,3 +211,40 @@ After every turn: check escalation (via the shared `escalation.check_escalation`
 ### Checkpoint result
 
 All 44 tests pass, including the three scripted-conversation checkpoints — confirmed 2026-08-24. The 2-consecutive thresholds held up exactly as designed on the first try: no retuning needed, unlike Phase 3's relevance threshold.
+
+---
+
+## Phase 5 — Appointment / callback scheduling (Done)
+
+A mock calendar over the `appointments` table Phase 0 already seeded: `find_available_slots`, `book_appointment`, `cancel_appointment`. The plan's own framing — "the first feature requiring multi-turn state and negotiation, not just single lookups" — turned out to be right, mostly because of one thing already sitting in this project's own rules.
+
+### The rule that shaped everything: CLAUDE.md #6
+
+*"Never let a tool execute an irreversible action (issuing a refund, **booking/cancelling**) without an explicit confirmation turn from the user first."* Booking and cancelling are named explicitly — this couldn't just be a prompt asking the model nicely. It needed real, code-level enforcement.
+
+**The mechanism, without adding a 4th tool:** `PROJECT_PLAN.md` lists exactly three scheduling tools, no separate `confirm_*`. So `book_appointment`/`cancel_appointment` became stateful across calls instead: the *first* call for a given action only proposes it and returns a `pending_confirmation` status — nothing is written to the database. Only a *second* call, referencing the same pending proposal, **in a later conversational turn** (never the same one — enforced by comparing turn numbers, not by trusting the model), actually commits it. This makes "propose and immediately book in one breath" structurally impossible.
+
+This same mechanism handles two more things for free:
+- **A slot vanishing before confirmation** (this phase's other checkpoint scenario): availability is re-checked fresh at *both* the propose and the confirm step, so a slot someone else grabbed in between is caught cleanly at confirm time even though it was free when first proposed.
+- **Mid-conversation corrections** ("actually, next week instead"): a new proposal for a different slot just overwrites the old pending one — no special-casing needed.
+
+### `agent/tools/scheduling.py`
+
+- **`find_available_slots`** generates a fixed business-hours grid (9 AM-5 PM, Mon-Fri, 30-minute slots) over the next 5 business days and filters out anything already booked. Naive (timezone-less) datetimes on purpose — Phase 0's `appointments.scheduled_time` is already stored that way, and the two need to string-match exactly for availability checks to work.
+- **`SchedulingState`** — per-session, not global: just a turn counter and one pending action. Explicitly *not* a module-level singleton, because Phase 9's telephony server will handle multiple simultaneous calls in one process, and global state would leak between them.
+- **`book_appointment`/`cancel_appointment`** implement the propose-then-confirm mechanism above. `cancel_appointment` also checks the appointment actually belongs to the requesting customer — an ownership check Phase 1's `get_order_status` deliberately skipped (low stakes, read-only) but that matters more once an action can change someone else's data.
+
+### A real architecture change: tool dispatch became a factory
+
+Every tool through Phase 4 was a pure function of its arguments, so `TOOL_HANDLERS` could be one static module-level dict. Booking/cancelling need to know *which customer* is acting and carry *per-session* pending-proposal state — the first tools that aren't stateless. `transport/text_cli.py`'s `build_dispatch_tool(customer_id)` now assembles a fresh dispatcher (closures bound to that session's `SchedulingState`) once per session instead. `TOOLS` (the schema list) stays a static constant — only *dispatch* needed to change.
+
+**Deliberately not done:** generalizing the propose-then-confirm mechanism into a shared, reusable utility, even though Phase 6 (refunds) is about to need the identical protection for "issuing a refund." One concrete use case isn't enough to responsibly generalize from — that decision waits until Phase 6 actually needs it.
+
+### Tests
+
+- `tests/test_scheduling.py` — the deterministic half, no network: slot generation respects business hours; booking/cancelling only commit on a later-turn confirmation, never the same turn; **double-booking is rejected** (checkpoint); **a slot vanishing between propose and confirm is caught and cleanly rejected** (checkpoint); a correction mid-negotiation replaces the pending proposal; **cancellation actually frees the slot and updates status** (checkpoint); cancelling someone else's appointment is refused; ambiguous (multiple scheduled) and not-found cases are both reported clearly.
+- `tests/test_text_cli.py` — **the actual "reschedule" checkpoint** (inherently conversational, so it's a live test): a 6-turn scripted conversation books a slot, then reschedules it. Assertions check end state (exactly one appointment scheduled, exactly one cancelled, and they're different slots) rather than each turn's exact wording, since minor phrasing variation from the model shouldn't break the test.
+
+### Checkpoint result
+
+All 61 tests pass, including the live reschedule conversation — confirmed 2026-08-24, on the first attempt (no retuning needed, unlike Phase 3's threshold). Blocked briefly mid-phase by the same recurring Anthropic key expiry seen in earlier phases — refreshed, then all live tests passed cleanly.

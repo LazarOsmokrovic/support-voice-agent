@@ -1,19 +1,21 @@
-"""Phase 1/2/3/4 checkpoints for the REPL: tools are actually wired into the
-Phase 0 tool-use loop, not just callable on their own, and the loop knows
-to stop when the model signals the conversation is over.
+"""Phase 1/2/3/4/5 checkpoints for the REPL: tools are actually wired into
+the Phase 0 tool-use loop, not just callable on their own, and the loop
+knows to stop when the model signals the conversation is over.
 
 Uses a mocked Claude client (no network, no API key) that scripts a
 two-turn exchange: first Claude asks for a tool, then it replies with text
-once the tool result comes back — exercising Agent.send end to end with the
-real dispatch_tool from transport/text_cli.py.
+once the tool result comes back — exercising Agent.send end to end with a
+real dispatch_tool built by transport/text_cli.py's build_dispatch_tool
+(a factory since Phase 5 — see that module's docstring for why tool
+dispatch can no longer be a static constant).
 
 The live tests (gated on a real ANTHROPIC_API_KEY) are the full-pipeline
 checkpoints: Phase 3's (a genuinely uncovered policy question, checking the
-model doesn't invent an answer once retrieval correctly comes back empty)
-and Phase 4's (scripted conversations, checking escalation fires neither
-too eagerly nor too late) — both run through the actual Agent + real Claude
-+ real tools (local embedding backend for search_policy — no Voyage key
-needed).
+model doesn't invent an answer once retrieval correctly comes back empty),
+Phase 4's (scripted conversations, checking escalation fires neither too
+eagerly nor too late), and Phase 5's (a scripted booking/reschedule
+conversation) — all run through the actual Agent + real Claude + real
+tools (local embedding backend for search_policy — no Voyage key needed).
 """
 
 from __future__ import annotations
@@ -27,7 +29,17 @@ from agent.core import Agent
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools import escalation
 from data import mock_db
-from transport.text_cli import TOOL_HANDLERS, TOOLS, dispatch_tool, should_end_session
+from transport.text_cli import TOOLS, build_dispatch_tool, should_end_session
+
+
+def _fresh_dispatch_tool(customer_id: str = "CUST-1001"):
+    """Most tests here don't care about scheduling state or which customer
+    is acting — this just saves repeating build_dispatch_tool's 3-tuple
+    unpacking everywhere. Tests that DO care call build_dispatch_tool
+    directly.
+    """
+    dispatch_tool, _handlers, _state = build_dispatch_tool(customer_id)
+    return dispatch_tool
 
 
 def _tool_use_response(name: str, tool_input: dict):
@@ -66,7 +78,7 @@ async def test_order_status_tool_is_wired_into_the_loop(tmp_path, monkeypatch):
         ]
     )
 
-    agent = Agent(client=fake_client, tools=TOOLS, tool_executor=dispatch_tool)
+    agent = Agent(client=fake_client, tools=TOOLS, tool_executor=_fresh_dispatch_tool())
     result = await agent.send(f"Where's my order {order_id}?")
 
     assert result.reply == "Your order has shipped!"
@@ -87,7 +99,7 @@ async def test_end_conversation_tool_is_wired_into_the_loop():
         ]
     )
 
-    agent = Agent(client=fake_client, tools=TOOLS, tool_executor=dispatch_tool)
+    agent = Agent(client=fake_client, tools=TOOLS, tool_executor=_fresh_dispatch_tool())
     result = await agent.send("Thanks, that's all, have a nice day!")
 
     assert result.reply == "Glad that's sorted — have a great day!"
@@ -109,8 +121,9 @@ async def test_search_policy_tool_is_wired_into_the_loop(monkeypatch):
     # test is about the wiring (does a search_policy tool_use call actually
     # reach transport.text_cli's dispatch_tool), not retrieval quality,
     # which tests/test_policy_rag.py already covers on its own.
+    dispatch_tool, handlers, _state = build_dispatch_tool("CUST-1001")
     monkeypatch.setitem(
-        TOOL_HANDLERS,
+        handlers,
         "search_policy",
         lambda query: {
             "found": True,
@@ -149,7 +162,7 @@ async def test_agent_does_not_invent_an_answer_for_an_uncovered_policy_question(
     "didn't hallucinate," not a full substitute for reading the reply —
     this was also checked by hand in the live REPL, see the phase write-up.
     """
-    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
+    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=_fresh_dispatch_tool())
 
     result = await agent.send("Do you offer price matching with other stores?")
 
@@ -179,7 +192,7 @@ async def test_agent_does_not_invent_an_answer_for_an_uncovered_policy_question(
 async def test_escalation_fires_immediately_on_explicit_human_request():
     """Phase 4 checkpoint — not too late: an explicit ask for a human
     escalates on the very first turn, not after several more exchanges."""
-    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
+    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=_fresh_dispatch_tool())
     tracker = escalation.EscalationTracker()
 
     result = await agent.send("I don't want to talk to a bot, please connect me with a real person.")
@@ -196,7 +209,7 @@ async def test_escalation_fires_on_sustained_frustration_not_on_the_first_compla
     """Phase 4 checkpoint — neither too eager nor too late: one grumpy
     message shouldn't escalate on its own, but frustration sustained across
     turns should, by the second consecutive negative turn."""
-    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
+    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=_fresh_dispatch_tool())
     tracker = escalation.EscalationTracker()
 
     turns = [
@@ -219,7 +232,7 @@ async def test_escalation_fires_on_sustained_frustration_not_on_the_first_compla
 async def test_escalation_never_fires_for_a_calm_satisfied_conversation():
     """Phase 4 checkpoint — not too eager: an ordinary, friendly
     conversation should never trip any escalation trigger."""
-    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
+    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=_fresh_dispatch_tool())
     tracker = escalation.EscalationTracker()
 
     turns = [
@@ -230,3 +243,55 @@ async def test_escalation_never_fires_for_a_calm_satisfied_conversation():
         result = await agent.send(turn)
         reason = await escalation.check_escalation(tracker, agent.messages, result.tool_calls)
         assert reason is None
+
+
+@pytest.mark.skipif(
+    not os.getenv("ANTHROPIC_API_KEY"), reason="requires a real ANTHROPIC_API_KEY to hit the live Claude API"
+)
+@pytest.mark.asyncio
+async def test_scheduling_book_then_reschedule_conversation(tmp_path, monkeypatch):
+    """Phase 5 checkpoint: reschedule. A scripted conversation books a
+    callback, then reschedules it to a different slot. Asserts on end
+    state rather than each turn's exact wording — robust to minor
+    variation in how the model phrases things, while still proving a real
+    reschedule happened (not just one booking, or two bookings with
+    nothing cancelled).
+    """
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_scheduling_live.db")
+    mock_db.reset_and_seed()
+    customer_id = "CUST-1001"
+
+    dispatch_tool, _handlers, scheduling_state = build_dispatch_tool(customer_id)
+    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
+
+    turns = [
+        (
+            "Can you check what appointment slots you have available in the next few days? "
+            "I'd like to book a callback about a return."
+        ),
+        "Great, let's book the first slot you listed.",
+        "Yes, please go ahead and confirm that.",
+        (
+            "Actually, I need to reschedule — could we move it to a later slot instead? "
+            "Whatever's next available after that one is fine."
+        ),
+        "Yes, that works — please confirm the new time, and once that's booked, cancel the old one.",
+        "Yes, please cancel the old one.",
+    ]
+    for turn in turns:
+        scheduling_state.turn += 1
+        await agent.send(turn)
+
+    with mock_db.get_connection() as conn:
+        scheduled = conn.execute(
+            "SELECT scheduled_time FROM appointments WHERE customer_id = ? AND status = 'scheduled'",
+            (customer_id,),
+        ).fetchall()
+        cancelled = conn.execute(
+            "SELECT scheduled_time FROM appointments WHERE customer_id = ? AND status = 'cancelled'",
+            (customer_id,),
+        ).fetchall()
+
+    assert len(scheduled) == 1, f"expected exactly one scheduled appointment, got {scheduled}"
+    assert len(cancelled) == 1, f"expected the original slot to end up cancelled, got {cancelled}"
+    assert scheduled[0]["scheduled_time"] != cancelled[0]["scheduled_time"]
