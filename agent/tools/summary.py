@@ -64,8 +64,10 @@ class SessionSummary(BaseModel):
     follow_up_needed: bool
 
 
-def _format_transcript(messages: list[dict[str, Any]]) -> str:
-    """Render an Agent's message history as plain text for the summary prompt.
+def format_transcript(messages: list[dict[str, Any]]) -> str:
+    """Render an Agent's message history as plain text for a summary/
+    classification prompt. Public and shared — agent/tools/escalation.py
+    (Phase 4) reuses this too, rather than duplicating it.
 
     `Agent.messages` mixes plain dicts (user turns, tool_result turns, built
     by our own code) with SDK content-block objects (assistant turns, set
@@ -109,7 +111,7 @@ async def summarize_session(
 ) -> SessionSummary:
     """Call Claude once to produce a structured summary of a finished conversation."""
     client = client or anthropic.AsyncAnthropic()
-    transcript = _format_transcript(messages)
+    transcript = format_transcript(messages)
 
     response = await client.messages.parse(
         model=model,

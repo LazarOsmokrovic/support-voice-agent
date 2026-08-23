@@ -16,8 +16,8 @@ import pytest
 
 from agent.tools.summary import (
     SessionSummary,
-    _format_transcript,
     close_session,
+    format_transcript,
     log_ticket,
     summarize_session,
 )
@@ -40,7 +40,7 @@ def test_format_transcript_renders_text_and_collapses_tool_blocks():
         {"role": "assistant", "content": [text_block]},
     ]
 
-    transcript = _format_transcript(messages)
+    transcript = format_transcript(messages)
 
     assert "user: Where's my order?" in transcript
     assert "assistant: [used tool: get_order_status]" in transcript

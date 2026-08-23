@@ -9,6 +9,13 @@ one tool it has so far.
 SUMMARY_PROMPT (Phase 2) is a separate, one-shot prompt — it's not part of
 the live conversation loop. It's used once, after a session ends, to ask
 Claude to produce a structured recap (see agent/tools/summary.py).
+
+CLASSIFICATION_PROMPT and HANDOFF_PROMPT (Phase 4) are also outside the
+live loop: CLASSIFICATION_PROMPT runs after every turn to judge intent,
+sentiment, and whether a topic needs human review regardless of tone;
+HANDOFF_PROMPT runs once, only when the escalation tracker actually decides
+to hand off, to assemble the structured packet a human agent would read
+(see agent/tools/escalation.py).
 """
 
 SYSTEM_PROMPT = """\
@@ -56,6 +63,14 @@ and then wait for another message. Do not call it while anything they \
 raised is still open, and never call it just because they said thanks for \
 one part of a still-ongoing issue.
 
+Escalation: some conversations get automatically flagged for a human agent \
+to take over — for example if you're explicitly asked for a human, or the \
+conversation touches on legal, safety, fraud, or account-deletion topics. \
+You don't need to do anything special to trigger this; just keep being \
+helpful and honest. If a customer explicitly asks for a human, acknowledge \
+that warmly (e.g. "Of course, I'll get you connected with someone who can \
+help") rather than continuing to push your own tools on them.
+
 Tone: friendly, concise, and to the point — this is a support chat, not an \
 essay. Summarize what a tool returned in plain language rather than dumping \
 raw fields at the customer.
@@ -72,6 +87,47 @@ asking about...").
 "positive", "neutral", or "negative".
 - follow_up_needed: true if anything is still unresolved, pending, or needs \
 a human to act on later; false if the conversation is fully closed.
+
+Conversation:
+{transcript}
+"""
+
+CLASSIFICATION_PROMPT = """\
+Classify the customer's most recent message in this support conversation.
+
+- intent: the best single category for what the customer is trying to do \
+in their latest message — one of: "order_status", "policy_question", \
+"refund_or_return", "complaint", "request_human", "chitchat", "other".
+- sentiment: the customer's tone in their latest message specifically (not \
+the conversation as a whole) — "positive", "neutral", or "negative".
+- policy_restricted: true if the latest message raises any of the \
+following, regardless of tone — a legal threat or mention of a \
+lawsuit/attorney, a safety or self-harm concern, an allegation of fraud or \
+a chargeback already filed with their bank, a request to permanently \
+delete their account or personal data, or abusive/harassing language \
+directed at the assistant. Otherwise false.
+
+Conversation so far:
+{transcript}
+"""
+
+HANDOFF_PROMPT = """\
+This conversation is being escalated to a human agent. Read it and produce \
+a structured handoff packet so the human has full context and doesn't need \
+to make the customer repeat themselves.
+
+- customer_intent: one or two sentences on what the customer is trying to \
+accomplish.
+- conversation_summary: a short summary of what's been discussed so far.
+- verified_account_info: what's known about who this customer is this \
+session — at minimum their customer ID, given below. Include anything else \
+established in conversation (an order number they mentioned, etc.).
+- actions_taken: what's already been tried or done this session (tools \
+used, information given). If nothing was attempted yet, say so plainly.
+- sentiment: the customer's overall tone across the conversation — \
+"positive", "neutral", or "negative".
+
+Customer ID: {customer_id}
 
 Conversation:
 {transcript}

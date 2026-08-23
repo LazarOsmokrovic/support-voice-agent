@@ -14,7 +14,7 @@ import asyncio
 
 from agent.core import Agent, configure_logging
 from agent.prompts import SYSTEM_PROMPT
-from agent.tools import orders, policy_rag, summary
+from agent.tools import escalation, orders, policy_rag, summary
 
 TOOLS = [orders.TOOL_SCHEMA, policy_rag.TOOL_SCHEMA, summary.END_CONVERSATION_SCHEMA]
 
@@ -47,6 +47,7 @@ def should_end_session(tool_calls: list[dict]) -> bool:
 async def main() -> None:
     configure_logging()
     agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
+    tracker = escalation.EscalationTracker()
 
     customer_id = input(f"Customer ID [{DEFAULT_CUSTOMER_ID}]: ").strip() or DEFAULT_CUSTOMER_ID
     print("\nSupport chat — type 'quit' or 'exit' to leave.\n")
@@ -64,6 +65,27 @@ async def main() -> None:
 
         result = await agent.send(user_text)
         print(f"Agent: {result.reply}\n")
+
+        # Phase 4: check escalation before should_end_session — a trigger
+        # here always outranks the model deciding on its own the chat is
+        # naturally over. A failure in the classifier call itself (e.g. no
+        # API credit) shouldn't take the whole turn down with it.
+        try:
+            reason = await escalation.check_escalation(tracker, agent.messages, result.tool_calls)
+        except Exception as exc:  # noqa: BLE001 — a classifier hiccup must not crash the chat
+            reason = None
+            print(f"(Could not run triage classification this turn: {exc})\n")
+
+        if reason:
+            try:
+                packet = await escalation.create_handoff_packet(customer_id, agent.messages, reason)
+                print(
+                    f"I'm connecting you with a human agent — {reason}. "
+                    f"(handoff #{packet['escalation_id']})\n"
+                )
+            except Exception as exc:  # noqa: BLE001 — exit path must never crash on this
+                print(f"(Escalation triggered ({reason}) but the handoff packet couldn't be logged: {exc})\n")
+            break
 
         if should_end_session(result.tool_calls):
             break

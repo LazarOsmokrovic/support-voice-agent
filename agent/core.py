@@ -126,8 +126,9 @@ class Agent:
             tool_results = []
             for block in tool_use_blocks:
                 logger.info("tool_call name=%s input=%s", block.name, block.input)
-                tool_calls.append({"name": block.name, "input": block.input})
-                tool_results.append(await self._run_tool(block))
+                tool_result, output = await self._run_tool(block)
+                tool_calls.append({"name": block.name, "input": block.input, "output": output})
+                tool_results.append(tool_result)
             self.messages.append({"role": "user", "content": tool_results})
 
         raise RuntimeError(
@@ -135,12 +136,17 @@ class Agent:
             "(possible runaway tool call)"
         )
 
-    async def _run_tool(self, block: Any) -> dict[str, Any]:
+    async def _run_tool(self, block: Any) -> tuple[dict[str, Any], Any]:
+        """Returns (the API-shaped tool_result dict, the tool's raw return
+        value — or None if it raised). The raw value is surfaced in
+        TurnResult.tool_calls so callers (e.g. Phase 4's escalation tracker)
+        can inspect what a tool actually returned, not just that it ran.
+        """
         try:
             output = self.tool_executor(block.name, block.input)
             if hasattr(output, "__await__"):
                 output = await output
-            return {"type": "tool_result", "tool_use_id": block.id, "content": str(output)}
+            return {"type": "tool_result", "tool_use_id": block.id, "content": str(output)}, output
         except Exception as exc:
             # Deliberately broad: never let a failing tool crash the loop —
             # the model gets a structured error to react to instead.
@@ -150,7 +156,7 @@ class Agent:
                 "tool_use_id": block.id,
                 "content": f"Error: {exc}",
                 "is_error": True,
-            }
+            }, None
 
     async def _call_api(self):
         kwargs: dict[str, Any] = {

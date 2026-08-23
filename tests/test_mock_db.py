@@ -13,13 +13,14 @@ def test_reset_and_seed_populates_all_tables(tmp_path, monkeypatch):
     with mock_db.get_connection() as conn:
         counts = {
             table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-            for table in ("customers", "orders", "tickets", "appointments")
+            for table in ("customers", "orders", "tickets", "appointments", "escalations")
         }
 
     assert counts["customers"] == len(mock_db.CUSTOMERS)
     assert counts["orders"] == len(mock_db.ORDERS)
     assert counts["tickets"] == len(mock_db.TICKETS)
     assert counts["appointments"] == len(mock_db.APPOINTMENTS)
+    assert counts["escalations"] == len(mock_db.ESCALATIONS)
 
 
 def test_seed_db_is_idempotent(tmp_path, monkeypatch):

@@ -168,3 +168,46 @@ A good retrieval threshold narrows what reaches the model, but the model still h
 ### Checkpoint result
 
 All 27 tests pass, including the live hallucination checkpoint — confirmed 2026-08-24. A bug surfaced along the way and was fixed before any of this: `LocalEmbeddingBackend` was returning `numpy.float32` scalars inside a Python list, which Chroma's `add()` path silently tolerated but its `query()` path rejected outright — ingestion "worked" while every actual search would have crashed. Caught by actually running a query, not just ingestion, before calling it done.
+
+---
+
+## Phase 4 — Ticket triage & escalation (Done)
+
+The agent can now recognize when a conversation needs a human — an explicit ask, sustained frustration, repeated failed lookups, or a policy-restricted topic — and hand off a structured packet instead of just a flag. Per `PROJECT_PLAN.md`: "the packet is the point, not the escalation flag itself."
+
+### The core design split (per CLAUDE.md rule 7: deterministic for the predictable, model judgment for the ambiguous)
+
+- **Genuinely ambiguous → the model decides.** Reading a message's intent, its emotional tone, and whether it touches something needing human review "regardless of tone" all require real language understanding. That's `classify_turn` — one lightweight structured-output call after every turn.
+- **Objective and countable → plain code decides.** "Is this the second bad turn in a row" isn't ambiguous once you have the classifications — it's arithmetic. `EscalationTracker` is a small dataclass with two counters, no LLM call involved in the decision itself.
+
+### `agent/tools/escalation.py`
+
+- **`TurnClassification`** (Pydantic): `intent` (one of 7 categories, including `request_human`), `sentiment`, `policy_restricted` — kept to 3 fields on purpose, matching the plan's "lightweight" framing. `explicit_human_request` was cut as a separate field during design — it would have just duplicated `intent == "request_human"`.
+- **`EscalationTracker.record_turn`** — the four triggers: `request_human` intent and `policy_restricted` both escalate immediately (no need to wait for a pattern); negative sentiment and failed lookups both need **2 consecutive** occurrences, so one grumpy word or one bad search doesn't trip it. A turn that goes well (positive/neutral sentiment, or a lookup that succeeds) resets its streak back to zero.
+- **`create_handoff_packet`** — deliberately **not** a tool the model calls itself, unlike `get_order_status`/`search_policy`/`end_conversation`. The escalation *decision* is already made by the time this runs (by the tracker), so there's nothing left for the model to decide by invoking it — it's triggered by the application, the same way Phase 2's `close_session` is. It's one more structured-output call (`HandoffFields`: customer intent, conversation summary, verified account info, actions taken, sentiment) over the transcript, then a write to a new `escalations` table.
+- Both structured-output calls reuse `format_transcript` from `agent/tools/summary.py` (promoted from a private `_format_transcript` to a shared public utility, rather than duplicating the same logic in a second file).
+
+### `data/mock_db.py` — a new `escalations` table
+
+Extends Phase 0's schema: `escalation_id`, `customer_id`, `reason`, `customer_intent`, `conversation_summary`, `verified_account_info`, `actions_taken`, `sentiment`, `created_at`. "For now, transfer to human just logs the packet" (the plan's words) reads as something more durable than a console print, so it's a real table — also sets up nicely for Phase 10's observability work.
+
+### `agent/core.py` — one small, generically useful addition
+
+`TurnResult.tool_calls` previously only recorded a tool's *name* and *input* — not what it actually returned. The escalation tracker needs to know whether a lookup *succeeded*, so each entry now also carries `"output"`: the tool's raw return value (or `None` if it raised). This isn't escalation-specific — it's useful telemetry for anything downstream, and Phase 10's "structured per-turn logs" will likely want it too.
+
+### `agent/prompts.py`
+
+A short "Escalation" section tells the model it doesn't need to manage any of this itself — just keep being honest — but to acknowledge warmly if a customer explicitly asks for a human, so its own reply doesn't feel disconnected from the handoff that's about to happen.
+
+### `transport/text_cli.py`
+
+After every turn: check escalation (via the shared `escalation.check_escalation` helper — classify + record in one call, so the REPL and the tests can't drift apart) *before* checking whether the model called `end_conversation` — an escalation always outranks the model's own "we're done here." If it fires, the packet is created, a transfer notice prints with the handoff ID, and the loop ends (still flowing into Phase 2's `close_session` logging afterward, same as any other exit).
+
+### Tests
+
+- `tests/test_escalation.py` — `EscalationTracker`'s rules tested directly and deterministically (no network): each of the 4 triggers, plus streak-reset behavior (a calm turn resets the negative streak; a successful lookup resets the failure streak; a turn with no lookup at all leaves the failure streak untouched). `log_escalation`/`create_handoff_packet` tested with a mocked client. Three live tests check `classify_turn`'s actual judgment quality on realistic messages.
+- `tests/test_text_cli.py` — **the actual Phase 4 checkpoint**, three scripted live conversations: an explicit human request escalates on turn 1 (not too late); one annoyed message doesn't escalate but a second consecutive frustrated one does (neither too eager nor too late); a calm, satisfied two-turn conversation never escalates at all (not too eager).
+
+### Checkpoint result
+
+All 44 tests pass, including the three scripted-conversation checkpoints — confirmed 2026-08-24. The 2-consecutive thresholds held up exactly as designed on the first try: no retuning needed, unlike Phase 3's relevance threshold.

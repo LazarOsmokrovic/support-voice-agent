@@ -1,4 +1,4 @@
-"""SQLite seed + access layer for customers/orders/tickets/appointments.
+"""SQLite seed + access layer for customers/orders/tickets/appointments/escalations.
 
 The store simulates orders placed through an Amazon-style storefront — order
 IDs follow Amazon's public "NNN-NNNNNNN-NNNNNNN" shape and items are the kind
@@ -59,6 +59,23 @@ CREATE TABLE IF NOT EXISTS appointments (
     status          TEXT NOT NULL DEFAULT 'scheduled',
     FOREIGN KEY (customer_id) REFERENCES customers (customer_id)
 );
+
+-- Phase 4: a handoff packet, created whenever the escalation tracker in
+-- agent/tools/escalation.py decides a human needs to take over. "For now,
+-- transfer to human just logs the packet" (PROJECT_PLAN.md) — this table is
+-- that log; a real warm transfer arrives in Phase 10.
+CREATE TABLE IF NOT EXISTS escalations (
+    escalation_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id            TEXT NOT NULL,
+    reason                 TEXT NOT NULL,
+    customer_intent        TEXT NOT NULL,
+    conversation_summary   TEXT NOT NULL,
+    verified_account_info  TEXT,
+    actions_taken          TEXT,
+    sentiment              TEXT NOT NULL,
+    created_at             TEXT NOT NULL,
+    FOREIGN KEY (customer_id) REFERENCES customers (customer_id)
+);
 """
 
 # customer_id, name, email, phone
@@ -102,6 +119,16 @@ APPOINTMENTS = [
     ("CUST-1004", "2026-08-25T15:00:00", "Callback re: delayed order 118-8374659-2019384", "scheduled"),
 ]
 
+# customer_id, reason, customer_intent, conversation_summary, verified_account_info,
+# actions_taken, sentiment, created_at
+ESCALATIONS = [
+    ("CUST-1002", "explicit request for a human",
+     "Wanted to speak with a person about a recurring billing problem",
+     "Customer asked for a human agent after describing a billing issue that had come up twice before.",
+     "Customer ID CUST-1002", "None — handed off before any tool was used.",
+     "negative", "2026-08-20T10:15:00"),
+]
+
 
 @contextmanager
 def get_connection():
@@ -121,6 +148,7 @@ def init_db(reset: bool = False) -> None:
     with get_connection() as conn:
         if reset:
             conn.executescript(
+                "DROP TABLE IF EXISTS escalations;"
                 "DROP TABLE IF EXISTS tickets;"
                 "DROP TABLE IF EXISTS appointments;"
                 "DROP TABLE IF EXISTS orders;"
@@ -147,6 +175,13 @@ def seed_db() -> None:
             "INSERT INTO appointments (customer_id, scheduled_time, reason, status) "
             "VALUES (?, ?, ?, ?)",
             APPOINTMENTS,
+        )
+        conn.executemany(
+            "INSERT INTO escalations "
+            "(customer_id, reason, customer_intent, conversation_summary, "
+            "verified_account_info, actions_taken, sentiment, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            ESCALATIONS,
         )
 
 
