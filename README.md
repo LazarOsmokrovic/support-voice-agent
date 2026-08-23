@@ -54,7 +54,7 @@ A local SQLite database simulating an **Amazon-style storefront**: `customers`, 
 
 ### Checkpoint result
 
-4 passed (control-flow logic + all 3 mock-DB tests), 1 skipped/environment-dependent (the live Claude round trip — it correctly reaches the API and gets a real, structured response back; it currently fails only because the connected Anthropic account has no credit balance).
+All 5 tests pass, including the live "hello" round trip — confirmed 2026-08-23 once the connected Anthropic account had a valid, funded key (it had been blocked until then by account-side issues: first no credit balance, then a since-replaced invalid key — never a code defect, but worth being honest that it went unverified for a while).
 
 ---
 
@@ -87,3 +87,42 @@ A plain `input()`/`print()` loop that builds one `Agent` with `SYSTEM_PROMPT` an
 ### Checkpoint result
 
 9 of 9 relevant tests passing (all of Phase 0's plus this phase's 5 new ones). `python -m transport.text_cli` starts, prints its prompt, and exits cleanly on `quit` — confirming the wiring (imports, `Agent` construction, tool registry) is sound. A full live conversation through the REPL is still blocked by the same Anthropic account billing issue noted in Phase 0 (no credit balance) — nothing code-related, and it'll work as soon as credits are added.
+
+---
+
+## Phase 2 — Post-session summary & CRM logging (Done)
+
+At the end of a conversation, the agent now produces a structured summary of what happened and logs it as a ticket. Unlike `get_order_status`, this isn't a tool Claude chooses to call mid-chat — it's a single, separate structured-output call the *application* makes once the session is over.
+
+### `agent/prompts.py` — `SUMMARY_PROMPT`
+
+A second prompt, independent of `SYSTEM_PROMPT`: it asks Claude to read a finished conversation and produce four things — `issue`, `resolution`, `sentiment`, `follow_up_needed` — with a `{transcript}` placeholder for the actual conversation text.
+
+### `agent/tools/summary.py` — the structured-output call and the CRM write
+
+- **`SessionSummary`** (a Pydantic model) *is* "the JSON schema" the plan calls for — `issue: str`, `resolution: str`, `sentiment: Literal["positive","neutral","negative"]`, `follow_up_needed: bool` — expressed as a typed class instead of a hand-written schema dict.
+- **`summarize_session(messages, client=None, model=...)`** is the one structured-output call: it flattens the conversation into readable text, plugs it into `SUMMARY_PROMPT`, and calls `client.messages.parse(..., output_format=SessionSummary)`. The SDK both constrains Claude's output to that shape *and* validates the response, handing back an already-parsed `SessionSummary` rather than a string to `json.loads()` yourself.
+- **`_format_transcript(messages)`** flattens `Agent.messages` (a mix of plain dicts and raw SDK content-block objects) into plain lines like `user: Where's my order?` / `assistant: [used tool: get_order_status]`, so the summarizer sees a readable conversation instead of raw API JSON.
+- **`log_ticket(customer_id, summary, created_at=None)`** writes one row into the `tickets` table from Phase 0.
+- **`close_session(customer_id, messages, client=None)`** does both of the above back to back and returns `(summary, ticket_id)` — this is what an interface calls when a session ends.
+
+### `transport/text_cli.py` — wired at both ends
+
+- **At session start**, the REPL now asks `Customer ID [CUST-1001]:`. There's no login/auth phase yet, so — same simplification as Phase 1's order lookup — it just asks; the ID must already exist in the mock DB, since `tickets.customer_id` has a foreign-key constraint.
+- **At session end** (on `quit`/`exit`/Ctrl-C/Ctrl-D), if any messages were exchanged, it calls `summary.close_session(...)` and prints e.g. `Session logged as ticket #7 (sentiment=neutral, follow_up_needed=False)`, wrapped in a `try/except` so a failure here (no API credit, bad customer ID) prints a plain message instead of a raw traceback on exit.
+
+### Tests (`tests/test_summary.py`)
+
+- Four offline/mocked tests (no network): transcript formatting, a direct DB write via `log_ticket`, `summarize_session` against a mocked client, and `close_session`'s summarize-then-log combination end to end.
+- **The actual Phase 2 checkpoint**, `test_summarize_session_always_validates_against_schema`: calls the real Claude API 20 times against a fixed transcript and asserts every result validates against `SessionSummary` — LLM structured output can occasionally drift, so this is an empirical check across many calls, not trust in a single one. `skipif`'d without a real `ANTHROPIC_API_KEY`, same pattern as Phase 0/1's live tests.
+
+### Two fixes from live REPL testing
+
+Running an actual live conversation (once the account had a funded, valid key) surfaced two real gaps, both fixed:
+
+- **Logging noise in the chat.** `configure_logging()` defaulted to `INFO`, which also surfaced the SDK's own HTTP request logs and our `tool_call` log line interleaved with the visible conversation. It now defaults to `WARNING` — a clean chat — and reads an optional `LOG_LEVEL` env var (`INFO`/`DEBUG`) to turn verbosity back on for troubleshooting.
+- **No way for the agent to end things on its own.** Previously the only way to end a session was the customer typing `quit`/`exit` — the agent had no way to recognize "we're done" from a natural goodbye. Recognizing that is a genuinely ambiguous judgment call (not a fixed keyword check), so it's handled the same way as `get_order_status`: a new tool, `end_conversation` (schema + handler in `agent/tools/summary.py`, since it's tied to session-end behavior), that the model calls once it judges the issue is resolved and the customer has signed off. `transport/text_cli.py`'s `should_end_session(tool_calls)` watches for that call and breaks the loop right after printing the agent's closing reply — which then flows straight into the existing `close_session` logging, no special-casing needed there.
+
+### Checkpoint result
+
+All 18 tests pass, including **the phase's actual checkpoint** — `test_summarize_session_always_validates_against_schema`, 20 real calls to Claude, every one validating against `SessionSummary` — confirmed 2026-08-23 once the account had a valid, funded key. Phase 0's live "hello" test passed in the same run.

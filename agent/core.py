@@ -33,8 +33,17 @@ DEFAULT_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-opus-5")
 DEFAULT_MAX_TOKENS = 1024  # a support-chat turn rarely needs more; raise if replies get cut off
 
 
-def configure_logging(level: int = logging.INFO) -> None:
-    """basicConfig, guarded so importing this module twice doesn't duplicate handlers."""
+def configure_logging(level: int | None = None) -> None:
+    """basicConfig, guarded so importing this module twice doesn't duplicate handlers.
+
+    Defaults to WARNING — a chat REPL shouldn't have the SDK's HTTP request
+    logs and our own tool_call logs interleaved with the visible
+    conversation. Set the LOG_LEVEL env var (e.g. LOG_LEVEL=INFO or DEBUG)
+    to turn that verbosity back on for troubleshooting, or pass a level
+    explicitly to override both.
+    """
+    if level is None:
+        level = getattr(logging, os.getenv("LOG_LEVEL", "WARNING").upper(), logging.WARNING)
     if not logging.getLogger().handlers:
         logging.basicConfig(
             level=level,
