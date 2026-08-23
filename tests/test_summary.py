@@ -14,7 +14,6 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-import data.mock_db as mock_db
 from agent.tools.summary import (
     SessionSummary,
     _format_transcript,
@@ -22,6 +21,7 @@ from agent.tools.summary import (
     log_ticket,
     summarize_session,
 )
+from data import mock_db
 
 
 def test_format_transcript_renders_text_and_collapses_tool_blocks():

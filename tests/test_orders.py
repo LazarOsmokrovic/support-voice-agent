@@ -3,8 +3,8 @@ format, and a well-formed but nonexistent order."""
 
 from __future__ import annotations
 
-import data.mock_db as mock_db
 from agent.tools.orders import get_order_status
+from data import mock_db
 
 
 def _fresh_seeded_db(tmp_path, monkeypatch):

@@ -6,3 +6,7 @@ pytest-asyncio>=0.24
 
 # dev tooling — .vscode/settings.json already assumes this for format-on-save
 ruff>=0.8
+
+# Phase 3 — FAQ/policy Q&A via RAG
+chromadb>=0.5
+voyageai>=0.3

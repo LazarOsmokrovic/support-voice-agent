@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import data.mock_db as mock_db
+from data import mock_db
 
 
 def test_reset_and_seed_populates_all_tables(tmp_path, monkeypatch):

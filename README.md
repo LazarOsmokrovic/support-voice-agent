@@ -126,3 +126,45 @@ Running an actual live conversation (once the account had a funded, valid key) s
 ### Checkpoint result
 
 All 18 tests pass, including **the phase's actual checkpoint** — `test_summarize_session_always_validates_against_schema`, 20 real calls to Claude, every one validating against `SessionSummary` — confirmed 2026-08-23 once the account had a valid, funded key. Phase 0's live "hello" test passed in the same run.
+
+---
+
+## Phase 3 — FAQ / policy Q&A via RAG (Done)
+
+The agent can now answer policy questions — returns, refunds, shipping, warranty, and 12 more topics — by retrieving from real policy documents instead of guessing. This is the project's first hallucination-avoidance mechanism, and the plan's own checkpoint frames it as exactly that: "ask questions not covered by the docs and confirm the agent doesn't invent an answer."
+
+### A decision made before writing any code: swappable embeddings
+
+`PROJECT_PLAN.md`'s tech stack specifies Voyage AI for embeddings, but `VOYAGE_API_KEY` was empty — a separate signup from Anthropic's, with the same wait we'd already been through once. Rather than block Phase 3 on that or silently swap the plan's stated choice for something else, `agent/tools/policy_rag.py` implements both behind one `EmbeddingBackend` interface (`embed_documents` / `embed_query`), selected by an `EMBEDDING_BACKEND` env var:
+- **`local`** (default) — chromadb's bundled MiniLM ONNX model. Free, no signup, works immediately; downloads its small model on first use, then runs fully offline.
+- **`voyage`** — Voyage AI, exactly as the plan specifies, using its asymmetric document/query embeddings (`input_type="document"` at ingestion, `"query"` at search — Voyage's own recommendation for retrieval quality). Needs `VOYAGE_API_KEY`; model configurable via `VOYAGE_MODEL` (default `voyage-3`).
+
+Nothing else in this file or its callers changes based on which backend is active.
+
+### `data/policies/*.md` — 16 fake policy documents
+
+Returns, refunds, shipping, international shipping, warranty, damaged/defective items, cancellations, price adjustments, gift returns, payment methods, account security, gift cards, digital purchases, lost/stolen packages, restocking fees, and subscription deliveries. All fictional, written for this demo store — not a claim about any real company's actual policies.
+
+### `agent/tools/policy_rag.py` — chunking, embedding, retrieval
+
+- **`_chunk_document`** splits each doc into paragraph-level chunks and prefixes every chunk with the doc's title — a chunk like "...must be in original packaging." means nothing on its own without knowing it's from the Returns policy, so every chunk is self-contained context.
+- **`ingest_policies`** wipes and rebuilds the Chroma collection from scratch each run — same convention as `data/mock_db.py`'s `reset_and_seed()`: the docs are static fixture data, not something worth diffing incrementally. 16 docs → 58 chunks.
+- **`search_policy`** embeds the question, queries Chroma (configured for cosine distance), and filters out anything above `RELEVANCE_THRESHOLD` before returning results — a chunk that's merely topically adjacent but doesn't actually answer the question shouldn't reach the model at all.
+- **The threshold was tuned against real data, not guessed.** A first pass at 0.8 let a real false positive through: "Can I get a discount code for my birthday?" (not covered by any policy) still matched `gift_cards.md` at distance 0.572. Checking 8 hand-labeled questions (4 genuinely covered, 4 genuinely not) against the real corpus showed a clean gap — in-scope questions topped out at 0.504, uncovered ones started at 0.572 — so the threshold is set at 0.55, right in that gap. This was checked with the local backend only; switching to Voyage means re-checking it, since a different embedding model has a different distance distribution.
+
+### `agent/prompts.py` — the second layer of defense
+
+A good retrieval threshold narrows what reaches the model, but the model still has to actually use it correctly. `SYSTEM_PROMPT` now has an explicit "Policy and FAQ questions" section: always call `search_policy` for policy questions (never answer from memory, however confident), answer only from what came back, and if `found: false`, say so honestly rather than filling the gap. Retrieval filtering and prompt instruction are deliberately two independent safeguards against the same failure mode.
+
+### `transport/text_cli.py`
+
+`search_policy` registered in `TOOLS`/`TOOL_HANDLERS`, same pattern as the other two tools — no changes to the loop itself.
+
+### Tests
+
+- `tests/test_policy_rag.py` — chunking logic, loading the real 16-doc corpus, and ingest/search against a synthetic 2-doc corpus with a deterministic fake embedding backend (a bag-of-words hash: meaningfully similar for shared vocabulary, ~orthogonal otherwise) on an in-memory Chroma collection — fully offline, no network, no model download. One more test uses the *real* 16-doc corpus and the real local embedding model (still no API key — that's the default) to confirm retrieval genuinely abstains on a real uncovered question.
+- `tests/test_text_cli.py` — a mocked wiring test proving `search_policy` reaches `dispatch_tool` correctly, plus **the actual Phase 3 checkpoint**: a live Claude call asked a question none of the 16 real docs cover, checking it calls `search_policy`, sees `found: false`, and responds with an honest "I don't know" rather than a fabricated answer (a keyword-based check — a best-effort automated proxy, not a substitute for actually reading the reply).
+
+### Checkpoint result
+
+All 27 tests pass, including the live hallucination checkpoint — confirmed 2026-08-24. A bug surfaced along the way and was fixed before any of this: `LocalEmbeddingBackend` was returning `numpy.float32` scalars inside a Python list, which Chroma's `add()` path silently tolerated but its `query()` path rejected outright — ingestion "worked" while every actual search would have crashed. Caught by actually running a query, not just ingestion, before calling it done.

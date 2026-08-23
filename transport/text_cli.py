@@ -14,12 +14,13 @@ import asyncio
 
 from agent.core import Agent, configure_logging
 from agent.prompts import SYSTEM_PROMPT
-from agent.tools import orders, summary
+from agent.tools import orders, policy_rag, summary
 
-TOOLS = [orders.TOOL_SCHEMA, summary.END_CONVERSATION_SCHEMA]
+TOOLS = [orders.TOOL_SCHEMA, policy_rag.TOOL_SCHEMA, summary.END_CONVERSATION_SCHEMA]
 
 TOOL_HANDLERS = {
     "get_order_status": orders.get_order_status,
+    "search_policy": policy_rag.search_policy,
     "end_conversation": summary.end_conversation,
 }
 

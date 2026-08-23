@@ -4,3 +4,5 @@ __pycache__/
 .env
 *.db
 .DS_Store
+data/chroma_db/
+.ruff_cache/

@@ -141,7 +141,9 @@ class Agent:
             if hasattr(output, "__await__"):
                 output = await output
             return {"type": "tool_result", "tool_use_id": block.id, "content": str(output)}
-        except Exception as exc:  # noqa: BLE001 — deliberately broad: never let a tool crash the loop
+        except Exception as exc:
+            # Deliberately broad: never let a failing tool crash the loop —
+            # the model gets a structured error to react to instead.
             logger.exception("tool_call failed name=%s", block.name)
             return {
                 "type": "tool_result",
