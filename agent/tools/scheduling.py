@@ -19,18 +19,23 @@ same mechanism: availability is re-checked fresh at BOTH the propose step
 and the confirm step, so a slot someone else grabbed in between is caught
 at confirm time even if it was free when first proposed.
 
-SchedulingState is per-session, not global — Phase 9's telephony server
-will handle multiple concurrent calls in one process, and global state
-would leak across them. See transport/text_cli.py's build_dispatch_tool
-for how a fresh instance is threaded in and its `turn` counter advanced.
+The propose-then-confirm mechanism itself is generic — see
+agent/confirmation.py's PendingActionGate, shared with Phase 6's
+issue_refund rather than reimplemented here a second time. Two calls
+(book_appointment, cancel_appointment) share ONE gate instance (only one
+pending scheduling action at a time); the gate is per-session, not global —
+Phase 9's telephony server will handle multiple concurrent calls in one
+process, and global state would leak across them. See
+transport/text_cli.py's build_dispatch_tool for how it's threaded in and
+its `turn` counter advanced.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from agent.confirmation import PendingActionGate
 from data.mock_db import get_connection
 
 BUSINESS_START_HOUR = 9
@@ -117,17 +122,6 @@ def find_available_slots(start_date: str | None = None, now: datetime | None = N
     return {"slots": available}
 
 
-@dataclass
-class SchedulingState:
-    """Per-session state: which turn we're on, and any pending (proposed
-    but not yet confirmed) booking or cancellation. One instance per
-    session — see the module docstring.
-    """
-
-    turn: int = 0
-    pending: dict[str, Any] | None = None
-
-
 BOOK_APPOINTMENT_SCHEMA: dict[str, Any] = {
     "name": "book_appointment",
     "description": (
@@ -152,27 +146,17 @@ BOOK_APPOINTMENT_SCHEMA: dict[str, Any] = {
 }
 
 
-def book_appointment(slot_time: str, reason: str, state: SchedulingState, customer_id: str) -> dict[str, Any]:
+def book_appointment(slot_time: str, reason: str, state: PendingActionGate, customer_id: str) -> dict[str, Any]:
     """Propose-then-confirm booking. See module docstring for the mechanism."""
     if slot_time in _booked_slot_times():
-        state.pending = None
+        state.clear()
         return {
             "booked": False,
             "error": "slot_unavailable",
             "message": f"{slot_time} is no longer available — someone else has booked it.",
         }
 
-    pending = state.pending
-    is_confirmation = (
-        pending is not None
-        and pending.get("kind") == "book"
-        and pending.get("slot_time") == slot_time
-        and pending.get("reason") == reason
-        and pending["proposed_turn"] < state.turn
-    )
-
-    if not is_confirmation:
-        state.pending = {"kind": "book", "slot_time": slot_time, "reason": reason, "proposed_turn": state.turn}
+    if not state.check(key=("book", slot_time, reason)):
         return {
             "booked": False,
             "status": "pending_confirmation",
@@ -186,7 +170,6 @@ def book_appointment(slot_time: str, reason: str, state: SchedulingState, custom
         )
         appointment_id = cursor.lastrowid
 
-    state.pending = None
     return {"booked": True, "appointment_id": appointment_id, "slot_time": slot_time, "reason": reason}
 
 
@@ -222,16 +205,16 @@ def _customers_scheduled_appointments(customer_id: str) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
-def cancel_appointment(state: SchedulingState, customer_id: str, slot_time: str | None = None) -> dict[str, Any]:
+def cancel_appointment(state: PendingActionGate, customer_id: str, slot_time: str | None = None) -> dict[str, Any]:
     """Propose-then-confirm cancellation, scoped to this customer's own appointments."""
     appointments = _customers_scheduled_appointments(customer_id)
     matches = [a for a in appointments if a["scheduled_time"] == slot_time] if slot_time else appointments
 
     if not matches:
-        state.pending = None
+        state.clear()
         return {"cancelled": False, "error": "not_found", "message": "No matching scheduled appointment found."}
     if len(matches) > 1:
-        state.pending = None
+        state.clear()
         return {
             "cancelled": False,
             "error": "ambiguous",
@@ -240,16 +223,7 @@ def cancel_appointment(state: SchedulingState, customer_id: str, slot_time: str 
         }
 
     target = matches[0]
-    pending = state.pending
-    is_confirmation = (
-        pending is not None
-        and pending.get("kind") == "cancel"
-        and pending.get("appointment_id") == target["appointment_id"]
-        and pending["proposed_turn"] < state.turn
-    )
-
-    if not is_confirmation:
-        state.pending = {"kind": "cancel", "appointment_id": target["appointment_id"], "proposed_turn": state.turn}
+    if not state.check(key=("cancel", target["appointment_id"])):
         return {
             "cancelled": False,
             "status": "pending_confirmation",
@@ -260,5 +234,4 @@ def cancel_appointment(state: SchedulingState, customer_id: str, slot_time: str 
     with get_connection() as conn:
         conn.execute("UPDATE appointments SET status = 'cancelled' WHERE appointment_id = ?", (target["appointment_id"],))
 
-    state.pending = None
     return {"cancelled": True, "appointment_id": target["appointment_id"], "slot_time": target["scheduled_time"]}

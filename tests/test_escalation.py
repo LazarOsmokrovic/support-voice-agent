@@ -49,6 +49,33 @@ def test_policy_restricted_topic_escalates_immediately():
     assert reason == "policy-restricted topic"
 
 
+def test_a_tool_signaling_escalate_fires_immediately():
+    """Phase 6: issue_refund (or any future tool) can trigger escalation
+    directly by returning escalate: true — the tracker doesn't need to
+    know anything refund-specific to honor it."""
+    tracker = EscalationTracker()
+    tool_calls = [
+        {
+            "name": "issue_refund",
+            "input": {},
+            "output": {"escalate": True, "escalation_reason": "high-value refund ($349.99) requires specialist approval"},
+        }
+    ]
+
+    reason = tracker.record_turn(_classification(), tool_calls)
+
+    assert reason == "high-value refund ($349.99) requires specialist approval"
+
+
+def test_a_tool_escalate_flag_takes_priority_over_a_calm_classification():
+    tracker = EscalationTracker()
+    tool_calls = [{"name": "issue_refund", "input": {}, "output": {"escalate": True}}]
+
+    reason = tracker.record_turn(_classification(sentiment="positive"), tool_calls)
+
+    assert reason == "a high-value action requires human approval"  # default reason, none was provided
+
+
 def test_single_negative_turn_does_not_escalate():
     tracker = EscalationTracker()
     reason = tracker.record_turn(_classification(sentiment="negative"), [])

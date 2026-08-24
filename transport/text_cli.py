@@ -7,10 +7,11 @@ phases add tools.
 
 Starting Phase 5, tool *dispatch* can no longer be a static module-level
 dict the way TOOL_HANDLERS used to be: book_appointment/cancel_appointment
-need per-session state (a pending-confirmation tracker) and to know which
+(and, since Phase 6, issue_refund) need per-session state (a
+pending-confirmation gate — see agent/confirmation.py) and to know which
 customer is acting, unlike every earlier tool, which was a pure function
 of its arguments. build_dispatch_tool() assembles a fresh dispatcher (and
-its backing handler dict + SchedulingState) once per session instead.
+its backing handler dict + SessionGates) once per session instead.
 
 Run with: python -m transport.text_cli
 """
@@ -19,11 +20,13 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
+from agent.confirmation import PendingActionGate
 from agent.core import Agent, configure_logging
 from agent.prompts import SYSTEM_PROMPT
-from agent.tools import escalation, orders, policy_rag, scheduling, summary
+from agent.tools import escalation, orders, policy_rag, refunds, scheduling, summary
 
 TOOLS = [
     orders.TOOL_SCHEMA,
@@ -31,6 +34,7 @@ TOOLS = [
     scheduling.FIND_SLOTS_SCHEMA,
     scheduling.BOOK_APPOINTMENT_SCHEMA,
     scheduling.CANCEL_APPOINTMENT_SCHEMA,
+    refunds.TOOL_SCHEMA,
     summary.END_CONVERSATION_SCHEMA,
 ]
 
@@ -41,27 +45,44 @@ TOOLS = [
 DEFAULT_CUSTOMER_ID = "CUST-1001"
 
 
+@dataclass
+class SessionGates:
+    """One PendingActionGate per gated-action family this session needs.
+    Scheduling (booking/cancelling) and refunds each get their own — a
+    pending refund shouldn't be clobbered by an unrelated pending booking,
+    or vice versa.
+    """
+
+    scheduling: PendingActionGate = field(default_factory=PendingActionGate)
+    refunds: PendingActionGate = field(default_factory=PendingActionGate)
+
+    def advance_turn(self) -> None:
+        self.scheduling.turn += 1
+        self.refunds.turn += 1
+
+
 def build_dispatch_tool(
-    customer_id: str, scheduling_state: scheduling.SchedulingState | None = None
-) -> tuple[Callable[[str, dict], Any], dict[str, Callable[..., Any]], scheduling.SchedulingState]:
+    customer_id: str, gates: SessionGates | None = None
+) -> tuple[Callable[[str, dict], Any], dict[str, Callable[..., Any]], SessionGates]:
     """Assemble one session's tool dispatcher.
 
-    Returns (dispatch_tool, handlers, scheduling_state). `handlers` is
-    returned too (not just the closure) so tests can stub an individual
-    tool via monkeypatch.setitem — mutating the dict in place is visible to
+    Returns (dispatch_tool, handlers, gates). `handlers` is returned too
+    (not just the closure) so tests can stub an individual tool via
+    monkeypatch.setitem — mutating the dict in place is visible to
     dispatch_tool since the closure captures it by reference, not by value.
     """
-    scheduling_state = scheduling_state or scheduling.SchedulingState()
+    gates = gates or SessionGates()
     handlers: dict[str, Callable[..., Any]] = {
         "get_order_status": orders.get_order_status,
         "search_policy": policy_rag.search_policy,
         "find_available_slots": scheduling.find_available_slots,
         "book_appointment": lambda **kw: scheduling.book_appointment(
-            **kw, state=scheduling_state, customer_id=customer_id
+            **kw, state=gates.scheduling, customer_id=customer_id
         ),
         "cancel_appointment": lambda **kw: scheduling.cancel_appointment(
-            **kw, state=scheduling_state, customer_id=customer_id
+            **kw, state=gates.scheduling, customer_id=customer_id
         ),
+        "issue_refund": lambda **kw: refunds.issue_refund(**kw, state=gates.refunds, customer_id=customer_id),
         "end_conversation": summary.end_conversation,
     }
 
@@ -72,7 +93,7 @@ def build_dispatch_tool(
             raise ValueError(f"unknown tool: {tool_name}")
         return handler(**tool_input)
 
-    return dispatch_tool, handlers, scheduling_state
+    return dispatch_tool, handlers, gates
 
 
 def should_end_session(tool_calls: list[dict]) -> bool:
@@ -83,7 +104,7 @@ def should_end_session(tool_calls: list[dict]) -> bool:
 async def main() -> None:
     configure_logging()
     customer_id = input(f"Customer ID [{DEFAULT_CUSTOMER_ID}]: ").strip() or DEFAULT_CUSTOMER_ID
-    dispatch_tool, _handlers, scheduling_state = build_dispatch_tool(customer_id)
+    dispatch_tool, _handlers, gates = build_dispatch_tool(customer_id)
     agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
     tracker = escalation.EscalationTracker()
 
@@ -100,10 +121,11 @@ async def main() -> None:
         if user_text.lower() in {"quit", "exit"}:
             break
 
-        # Phase 5: advance the turn counter before each real exchange, so
-        # book_appointment/cancel_appointment can tell "proposed this turn"
-        # from "confirmed in a later one" — see agent/tools/scheduling.py.
-        scheduling_state.turn += 1
+        # Phase 5/6: advance both gates' turn counters before each real
+        # exchange, so book_appointment/cancel_appointment/issue_refund can
+        # tell "proposed this turn" from "confirmed in a later one" — see
+        # agent/confirmation.py.
+        gates.advance_turn()
         result = await agent.send(user_text)
         print(f"Agent: {result.reply}\n")
 

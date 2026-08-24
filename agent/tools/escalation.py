@@ -12,7 +12,11 @@ Three pieces:
    and "sustained negative sentiment" are objective, countable things, so
    they're tracked as plain counters in code rather than re-judged by the
    model every turn. record_turn() returns an escalation reason the moment
-   a trigger actually fires, or None otherwise.
+   a trigger actually fires, or None otherwise. A tool can also signal
+   escalation directly (Phase 6's issue_refund does, for high-value
+   refunds) via a generic escalate/escalation_reason convention in its
+   output — this file doesn't need to know anything refund-specific to
+   honor it.
 
 3. HandoffFields / create_handoff_packet — once EscalationTracker decides
    to escalate, this assembles the actual packet (customer intent, summary,
@@ -97,6 +101,20 @@ def _turn_tool_outcomes(tool_calls: list[dict[str, Any]]) -> list[bool]:
     return outcomes
 
 
+def _tool_signaled_escalation(tool_calls: list[dict[str, Any]]) -> str | None:
+    """Phase 6: any tool can ask for escalation directly by returning a
+    truthy "escalate" in its output (issue_refund does this for high-value
+    refunds) — this is a deliberately generic convention, not specific to
+    refunds, so future tools can reuse it the same way without this file
+    needing to know about them.
+    """
+    for call in tool_calls:
+        output = call.get("output")
+        if isinstance(output, dict) and output.get("escalate"):
+            return output.get("escalation_reason", "a high-value action requires human approval")
+    return None
+
+
 @dataclass
 class EscalationTracker:
     """One instance per session. Call record_turn() after every turn."""
@@ -108,10 +126,14 @@ class EscalationTracker:
         """Update counters from this turn; return an escalation reason the
         moment a trigger fires, else None.
 
-        Immediate triggers (explicit human request, policy-restricted
-        topic) short-circuit without touching the streak counters —
-        nothing else matters once either fires.
+        Immediate triggers (a tool directly signaling escalation, an
+        explicit human request, or a policy-restricted topic) short-circuit
+        without touching the streak counters — nothing else matters once
+        one fires.
         """
+        tool_escalation = _tool_signaled_escalation(tool_calls)
+        if tool_escalation:
+            return tool_escalation
         if classification.intent == "request_human":
             return "explicit request for a human"
         if classification.policy_restricted:

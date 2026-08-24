@@ -231,14 +231,14 @@ This same mechanism handles two more things for free:
 ### `agent/tools/scheduling.py`
 
 - **`find_available_slots`** generates a fixed business-hours grid (9 AM-5 PM, Mon-Fri, 30-minute slots) over the next 5 business days and filters out anything already booked. Naive (timezone-less) datetimes on purpose — Phase 0's `appointments.scheduled_time` is already stored that way, and the two need to string-match exactly for availability checks to work.
-- **`SchedulingState`** — per-session, not global: just a turn counter and one pending action. Explicitly *not* a module-level singleton, because Phase 9's telephony server will handle multiple simultaneous calls in one process, and global state would leak between them.
+- **A per-session pending-action gate** (originally a bespoke `SchedulingState`, since Phase 6 the shared `PendingActionGate` — see that phase's write-up) — just a turn counter and one pending action. Explicitly *not* a module-level singleton, because Phase 9's telephony server will handle multiple simultaneous calls in one process, and global state would leak between them.
 - **`book_appointment`/`cancel_appointment`** implement the propose-then-confirm mechanism above. `cancel_appointment` also checks the appointment actually belongs to the requesting customer — an ownership check Phase 1's `get_order_status` deliberately skipped (low stakes, read-only) but that matters more once an action can change someone else's data.
 
 ### A real architecture change: tool dispatch became a factory
 
-Every tool through Phase 4 was a pure function of its arguments, so `TOOL_HANDLERS` could be one static module-level dict. Booking/cancelling need to know *which customer* is acting and carry *per-session* pending-proposal state — the first tools that aren't stateless. `transport/text_cli.py`'s `build_dispatch_tool(customer_id)` now assembles a fresh dispatcher (closures bound to that session's `SchedulingState`) once per session instead. `TOOLS` (the schema list) stays a static constant — only *dispatch* needed to change.
+Every tool through Phase 4 was a pure function of its arguments, so `TOOL_HANDLERS` could be one static module-level dict. Booking/cancelling need to know *which customer* is acting and carry *per-session* pending-proposal state — the first tools that aren't stateless. `transport/text_cli.py`'s `build_dispatch_tool(customer_id)` now assembles a fresh dispatcher (closures bound to that session's state) once per session instead. `TOOLS` (the schema list) stays a static constant — only *dispatch* needed to change.
 
-**Deliberately not done:** generalizing the propose-then-confirm mechanism into a shared, reusable utility, even though Phase 6 (refunds) is about to need the identical protection for "issuing a refund." One concrete use case isn't enough to responsibly generalize from — that decision waits until Phase 6 actually needs it.
+**Deliberately not done (at the time):** generalizing the propose-then-confirm mechanism into a shared, reusable utility, even though Phase 6 (refunds) was about to need the identical protection for "issuing a refund." One concrete use case wasn't enough to responsibly generalize from — see Phase 6 for what happened once there were two.
 
 ### Tests
 
@@ -248,3 +248,47 @@ Every tool through Phase 4 was a pure function of its arguments, so `TOOL_HANDLE
 ### Checkpoint result
 
 All 61 tests pass, including the live reschedule conversation — confirmed 2026-08-24, on the first attempt (no retuning needed, unlike Phase 3's threshold). Blocked briefly mid-phase by the same recurring Anthropic key expiry seen in earlier phases — refreshed, then all live tests passed cleanly.
+
+---
+
+## Phase 6 — Returns & refunds workflow (Done)
+
+`PROJECT_PLAN.md` calls this "the hardest business logic" — the first phase to tie together order lookup, policy RAG, and escalation, and the first tool that moves money. This phase was planned in full (using Claude Code's plan mode) before any code was written, including one explicit architecture decision put to a vote.
+
+### The decision point: generalize the confirmation gate, or copy it again?
+
+Phase 5 deliberately didn't extract its propose-then-confirm mechanism into a shared utility — "one use case isn't enough to know the right shape yet." Phase 6's `issue_refund` needed the exact same protection (CLAUDE.md rule 6 names "issuing a refund" explicitly, right alongside booking/cancelling). With a second real use case in hand, this was the moment to decide: copy the ~20-line pattern a second time, or extract it. Chose to extract.
+
+**`agent/confirmation.py` (new)** — `PendingActionGate`: a turn counter, one pending action, and a single method, `check(key)`, that returns `True` only if `key` matches a proposal from a strictly earlier turn. `agent/tools/scheduling.py` was refactored to use it too — `book_appointment`/`cancel_appointment`'s hand-rolled dict comparisons became one-line `state.check(key=...)` calls, a genuine simplification, not just a rename. Scheduling keeps one shared gate between booking and cancelling; refunds get their own, separate gate, so a pending refund and a pending booking in the same conversation can't clobber each other.
+
+### `agent/tools/refunds.py` (new) — `issue_refund`
+
+One tool, not two — like `book_appointment`, the first call already doubles as the eligibility check. Follows the plan's decision path exactly:
+
+1. **Verify purchase** — valid order ID, belongs to the requesting customer (ownership check, same pattern as `cancel_appointment`), not already refunded, actually delivered (this tool handles returns of delivered items; cancelling an order before it ships is a different, unmodeled policy path).
+2. **Check the window against policy** — three conditions, each with its own eligibility:
+   - `unopened_or_unwanted` — 30 days (`data/policies/returns_policy.md`)
+   - `damaged_or_defective` — 14 days (`data/policies/damaged_or_defective_items.md`)
+   - `opened_software_or_digital` — never eligible, any window
+   
+   The tool also calls the existing `search_policy` for the real retrieved policy text, included as `policy_reference` — the literal "check against policy" tie-in — while the actual eligibility math stays deterministic and testable, not left to retrieval.
+3. **Calculate the amount** — `price × quantity`. Known simplifications, stated plainly: no restocking fee (`restocking_fees.md`) since the mock orders have no product-category/size data to key one off, and no separate shipping-refund line item, since the schema doesn't track shipping as its own charge.
+4. **Auto-escalate above $150** (`HIGH_VALUE_REFUND_THRESHOLD`, splitting the seeded delivered orders meaningfully — Echo Dot and the Nike shoes stay under it, the Sony headphones go over) — and per the plan's literal ordering, this **replaces** the confirmation step entirely rather than following it. A human approves a high-value refund; the AI doesn't, even with the customer's own agreement.
+5. **Require confirmation** (everything at or under the threshold) via `PendingActionGate`, then **issue**: a new `refunds` row, and the order's status flips to `Refunded`.
+
+### `agent/tools/escalation.py` — one new, deliberately generic trigger
+
+`EscalationTracker` gets a fourth immediate trigger: any tool call this turn with a truthy `escalate` in its output escalates, using that output's `escalation_reason`. `issue_refund` is the first tool to use it, but the tracker doesn't know anything refund-specific — any future tool could set the same flag and it would just work. This is the literal "ties together... escalation" integration the plan calls for.
+
+### Tests
+
+- `tests/test_refunds.py` (new) — every branch of the decision path, no network: invalid/unknown/wrong-owner orders, not-yet-delivered, the permanently-ineligible category, both windows tested on their own boundary (14 vs. 30 days, since a fixed date sits between them), propose-then-confirm (including same-turn rejection), a real commit that writes `refunds` and flips the order's status, double-refund rejected, and the high-value path skipping confirmation entirely.
+- `tests/test_escalation.py` — one new test confirming the tracker honors a tool's `escalate` flag, independent of what the classifier itself thinks of the turn.
+- `tests/test_scheduling.py` — mechanical: every `SchedulingState` reference became `PendingActionGate` (identical shape), confirming the refactor didn't change scheduling's behavior at all.
+- `tests/test_text_cli.py` — **two live conversations**, the actual Phase 6 checkpoint: a normal refund (propose → confirm → verify the DB), and a high-value one (verify it escalates — checked structurally via the `escalate` flag and a zero-row `refunds` table, plus confirming `EscalationTracker` actually recognizes it) rather than asking to confirm.
+
+One noted, honest limitation: the live refund tests check eligibility against the *real* current date vs. the seeded orders' fixed 2026-08 delivery dates — valid for the foreseeable future from when this was written, but bound to drift out of window eventually as real time passes. The deterministic tests inject `now` explicitly and don't have this problem; they're what actually proves the window logic, not the live ones.
+
+### Checkpoint result
+
+All 78 tests pass, including both live refund conversations — confirmed 2026-08-25. Blocked once mid-phase by the same recurring Anthropic key issue as every prior phase; refreshed, then everything passed cleanly.

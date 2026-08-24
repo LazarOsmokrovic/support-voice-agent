@@ -13,8 +13,11 @@ from typing import Any
 
 from data.mock_db import get_connection
 
-# Amazon's real order-ID shape: 3 digits - 7 digits - 7 digits.
-_ORDER_ID_PATTERN = re.compile(r"^\d{3}-\d{7}-\d{7}$")
+# Amazon's real order-ID shape: 3 digits - 7 digits - 7 digits. Public
+# (not _ORDER_ID_PATTERN) since Phase 6's refunds.py validates order IDs
+# the same way — reused, not redefined, same move as Phase 4 promoting
+# _format_transcript to format_transcript.
+ORDER_ID_PATTERN = re.compile(r"^\d{3}-\d{7}-\d{7}$")
 
 TOOL_SCHEMA: dict[str, Any] = {
     "name": "get_order_status",
@@ -42,7 +45,7 @@ def get_order_status(order_id: str) -> dict[str, Any]:
     """Look up an order by ID. Always returns a dict; never raises."""
     order_id = (order_id or "").strip()
 
-    if not _ORDER_ID_PATTERN.match(order_id):
+    if not ORDER_ID_PATTERN.match(order_id):
         return {
             "found": False,
             "error": "invalid_order_id",

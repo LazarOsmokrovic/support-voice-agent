@@ -261,7 +261,7 @@ async def test_scheduling_book_then_reschedule_conversation(tmp_path, monkeypatc
     mock_db.reset_and_seed()
     customer_id = "CUST-1001"
 
-    dispatch_tool, _handlers, scheduling_state = build_dispatch_tool(customer_id)
+    dispatch_tool, _handlers, gates = build_dispatch_tool(customer_id)
     agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
 
     turns = [
@@ -279,7 +279,7 @@ async def test_scheduling_book_then_reschedule_conversation(tmp_path, monkeypatc
         "Yes, please cancel the old one.",
     ]
     for turn in turns:
-        scheduling_state.turn += 1
+        gates.advance_turn()
         await agent.send(turn)
 
     with mock_db.get_connection() as conn:
@@ -295,3 +295,77 @@ async def test_scheduling_book_then_reschedule_conversation(tmp_path, monkeypatc
     assert len(scheduled) == 1, f"expected exactly one scheduled appointment, got {scheduled}"
     assert len(cancelled) == 1, f"expected the original slot to end up cancelled, got {cancelled}"
     assert scheduled[0]["scheduled_time"] != cancelled[0]["scheduled_time"]
+
+
+@pytest.mark.skipif(
+    not os.getenv("ANTHROPIC_API_KEY"), reason="requires a real ANTHROPIC_API_KEY to hit the live Claude API"
+)
+@pytest.mark.asyncio
+async def test_refund_conversation_proposes_then_confirms(tmp_path, monkeypatch):
+    """Phase 6 checkpoint: a normal, low-value refund conversation actually
+    writes a refund and updates the order.
+
+    Note on calendar drift: issue_refund's tool schema doesn't expose `now`
+    to the model (matching find_available_slots), so this live test checks
+    eligibility against the REAL current date vs. the seeded order's fixed
+    2026-08-13 delivery date. It's valid for the foreseeable future from
+    when this was written (2026-08-25), but will eventually fall outside
+    the 30-day window as real time passes — the deterministic tests in
+    tests/test_refunds.py inject `now` explicitly and don't have this
+    problem; they're what actually proves the window logic is correct.
+    """
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_refund_live.db")
+    mock_db.reset_and_seed()
+    customer_id = "CUST-1001"
+    order_id = "112-3487561-2938471"  # Echo Dot, $34.99, delivered 2026-08-13
+
+    dispatch_tool, _handlers, gates = build_dispatch_tool(customer_id)
+    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
+
+    turns = [
+        f"I'd like to return order {order_id} — I just changed my mind about it.",
+        "Yes, please go ahead and refund it.",
+    ]
+    for turn in turns:
+        gates.advance_turn()
+        await agent.send(turn)
+
+    with mock_db.get_connection() as conn:
+        refund = conn.execute("SELECT * FROM refunds WHERE order_id = ?", (order_id,)).fetchone()
+        order_status = conn.execute("SELECT status FROM orders WHERE order_id = ?", (order_id,)).fetchone()["status"]
+
+    assert refund is not None, "expected a refund row to have been written"
+    assert refund["amount"] == 34.99
+    assert order_status == "Refunded"
+
+
+@pytest.mark.skipif(
+    not os.getenv("ANTHROPIC_API_KEY"), reason="requires a real ANTHROPIC_API_KEY to hit the live Claude API"
+)
+@pytest.mark.asyncio
+async def test_high_value_refund_conversation_escalates_instead_of_confirming(tmp_path, monkeypatch):
+    """Phase 6 checkpoint: auto-escalate above the $ threshold — proven live,
+    not just at the tool level. Same calendar-drift caveat as the test
+    above (valid from 2026-08-25 for the foreseeable future).
+    """
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_refund_escalate_live.db")
+    mock_db.reset_and_seed()
+    customer_id = "CUST-1005"
+    order_id = "119-5647382-9182736"  # Sony WH-1000XM5, $349.99, delivered 2026-08-02
+
+    dispatch_tool, _handlers, gates = build_dispatch_tool(customer_id)
+    agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
+    tracker = escalation.EscalationTracker()
+
+    gates.advance_turn()
+    result = await agent.send(f"I'd like to return order {order_id} — I don't want them anymore.")
+
+    refund_calls = [c for c in result.tool_calls if c["name"] == "issue_refund"]
+    assert refund_calls, "expected the model to call issue_refund"
+    assert any(c["output"].get("escalate") for c in refund_calls), "expected the high-value refund to signal escalate"
+
+    with mock_db.get_connection() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM refunds").fetchone()[0] == 0, "should not have been issued"
+
+    reason = await escalation.check_escalation(tracker, agent.messages, result.tool_calls)
+    assert reason is not None, "the tracker should recognize the tool's escalate signal and escalate the session"

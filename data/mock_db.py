@@ -1,4 +1,4 @@
-"""SQLite seed + access layer for customers/orders/tickets/appointments/escalations.
+"""SQLite seed + access layer for customers/orders/tickets/appointments/escalations/refunds.
 
 The store simulates orders placed through an Amazon-style storefront — order
 IDs follow Amazon's public "NNN-NNNNNNN-NNNNNNN" shape and items are the kind
@@ -76,6 +76,23 @@ CREATE TABLE IF NOT EXISTS escalations (
     created_at             TEXT NOT NULL,
     FOREIGN KEY (customer_id) REFERENCES customers (customer_id)
 );
+
+-- Phase 6: one row per issued refund. No seed data on purpose — adding a
+-- sample row would mean retroactively marking one of the ORDERS rows above
+-- "Refunded", which risks breaking other phases' tests that reference
+-- specific seeded orders by status. Every refunds test builds its own
+-- isolated DB anyway, matching this project's existing convention.
+CREATE TABLE IF NOT EXISTS refunds (
+    refund_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id        TEXT NOT NULL,
+    customer_id     TEXT NOT NULL,
+    amount          REAL NOT NULL,
+    item_condition  TEXT NOT NULL,
+    reason          TEXT,
+    issued_at       TEXT NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES orders (order_id),
+    FOREIGN KEY (customer_id) REFERENCES customers (customer_id)
+);
 """
 
 # customer_id, name, email, phone
@@ -148,6 +165,7 @@ def init_db(reset: bool = False) -> None:
     with get_connection() as conn:
         if reset:
             conn.executescript(
+                "DROP TABLE IF EXISTS refunds;"
                 "DROP TABLE IF EXISTS escalations;"
                 "DROP TABLE IF EXISTS tickets;"
                 "DROP TABLE IF EXISTS appointments;"

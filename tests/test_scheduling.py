@@ -14,8 +14,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from agent.confirmation import PendingActionGate
 from agent.tools.scheduling import (
-    SchedulingState,
     book_appointment,
     cancel_appointment,
     find_available_slots,
@@ -77,7 +77,7 @@ def test_find_available_slots_respects_start_date_override(tmp_path, monkeypatch
 
 def test_book_appointment_first_call_only_proposes(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
 
     result = book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
 
@@ -90,7 +90,7 @@ def test_book_appointment_first_call_only_proposes(tmp_path, monkeypatch):
 
 def test_book_appointment_confirms_in_a_later_turn(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
 
     state.turn = 2  # a later turn
@@ -103,7 +103,7 @@ def test_book_appointment_confirms_in_a_later_turn(tmp_path, monkeypatch):
 
 def test_book_appointment_rejects_confirmation_attempted_in_the_same_turn(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
 
     result = book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
@@ -115,13 +115,13 @@ def test_book_appointment_rejects_confirmation_attempted_in_the_same_turn(tmp_pa
 def test_book_appointment_rejects_double_booking(tmp_path, monkeypatch):
     """Phase 5 checkpoint: a double-booking attempt."""
     _seed(tmp_path, monkeypatch)
-    state_a = SchedulingState(turn=1)
+    state_a = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "callback", state=state_a, customer_id="CUST-1001")
     state_a.turn = 2
     first = book_appointment("2026-08-25T09:00:00", "callback", state=state_a, customer_id="CUST-1001")
     assert first["booked"] is True
 
-    state_b = SchedulingState(turn=1)
+    state_b = PendingActionGate(turn=1)
     second = book_appointment("2026-08-25T09:00:00", "different reason", state=state_b, customer_id="CUST-1002")
 
     assert second["booked"] is False
@@ -134,12 +134,12 @@ def test_book_appointment_rejects_slot_that_vanished_before_confirmation(tmp_pat
     the confirming call comes in.
     """
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
     proposal = book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
     assert proposal["status"] == "pending_confirmation"
 
     # A different customer grabs the same slot in between.
-    other_state = SchedulingState(turn=1)
+    other_state = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "someone else's reason", state=other_state, customer_id="CUST-1002")
     other_state.turn = 2
     book_appointment("2026-08-25T09:00:00", "someone else's reason", state=other_state, customer_id="CUST-1002")
@@ -155,7 +155,7 @@ def test_book_appointment_rejects_slot_that_vanished_before_confirmation(tmp_pat
 def test_a_new_proposal_replaces_the_old_pending_one(tmp_path, monkeypatch):
     """Handles a mid-conversation correction ('actually, next week instead')."""
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
 
     state.turn = 2
@@ -176,7 +176,7 @@ def test_a_new_proposal_replaces_the_old_pending_one(tmp_path, monkeypatch):
 
 def test_cancel_appointment_first_call_only_proposes(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
     state.turn = 2
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
@@ -196,7 +196,7 @@ def test_cancel_appointment_first_call_only_proposes(tmp_path, monkeypatch):
 def test_cancel_appointment_confirms_in_a_later_turn(tmp_path, monkeypatch):
     """Phase 5 checkpoint: cancellation."""
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
     state.turn = 2
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
@@ -216,7 +216,7 @@ def test_cancel_appointment_confirms_in_a_later_turn(tmp_path, monkeypatch):
 
 def test_cancelling_frees_the_slot_for_rebooking(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
     state.turn = 2
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
@@ -225,7 +225,7 @@ def test_cancelling_frees_the_slot_for_rebooking(tmp_path, monkeypatch):
     state.turn = 4
     cancel_appointment(state=state, customer_id="CUST-1001")
 
-    other_state = SchedulingState(turn=1)
+    other_state = PendingActionGate(turn=1)
     result = book_appointment("2026-08-25T09:00:00", "a different customer's callback", state=other_state, customer_id="CUST-1002")
 
     assert result["status"] == "pending_confirmation"  # slot is free again, not rejected as unavailable
@@ -233,12 +233,12 @@ def test_cancelling_frees_the_slot_for_rebooking(tmp_path, monkeypatch):
 
 def test_cancel_appointment_will_not_cancel_someone_elses_appointment(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
     state.turn = 2
     book_appointment("2026-08-25T09:00:00", "callback", state=state, customer_id="CUST-1001")
 
-    other_state = SchedulingState(turn=1)
+    other_state = PendingActionGate(turn=1)
     result = cancel_appointment(state=other_state, customer_id="CUST-1002")
 
     assert result["cancelled"] is False
@@ -247,7 +247,7 @@ def test_cancel_appointment_will_not_cancel_someone_elses_appointment(tmp_path, 
 
 def test_cancel_appointment_reports_not_found_when_none_scheduled(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
 
     result = cancel_appointment(state=state, customer_id="CUST-1001")
 
@@ -257,7 +257,7 @@ def test_cancel_appointment_reports_not_found_when_none_scheduled(tmp_path, monk
 
 def test_cancel_appointment_reports_ambiguous_with_multiple_scheduled(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "first", state=state, customer_id="CUST-1001")
     state.turn = 2
     book_appointment("2026-08-25T09:00:00", "first", state=state, customer_id="CUST-1001")
@@ -276,7 +276,7 @@ def test_cancel_appointment_reports_ambiguous_with_multiple_scheduled(tmp_path, 
 
 def test_cancel_appointment_disambiguates_via_slot_time(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
-    state = SchedulingState(turn=1)
+    state = PendingActionGate(turn=1)
     book_appointment("2026-08-25T09:00:00", "first", state=state, customer_id="CUST-1001")
     state.turn = 2
     book_appointment("2026-08-25T09:00:00", "first", state=state, customer_id="CUST-1001")
