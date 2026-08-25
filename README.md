@@ -333,3 +333,51 @@ Run it with `python -m transport.voice_local`.
 ### Checkpoint result
 
 93 of 94 tests pass, including the live automated TTS→Flux round-trip — confirmed 2026-08-25. The one failure (`test_high_value_refund_conversation_escalates_instead_of_confirming`, a Phase 6 live test) is the same recurring Anthropic account credit-balance issue seen in earlier phases, not a Phase 7 regression. The hands-on spoken-conversation checkpoint is still outstanding and needs to be run in person.
+
+---
+
+## Phase 8 — Real-time streaming pipeline, Pipecat (In progress)
+
+Phase 7's loop was strictly sequential: listen fully, *then* think, *then* speak fully, *then* listen again. `PROJECT_PLAN.md`'s Phase 8 asks for the real-time version — rebuilt as a Pipecat pipeline of frame processors, with real barge-in (stop the bot talking the instant the caller starts) and partial transcripts instead of only finals. This is a new, additive file (`transport/pipeline.py`) — `transport/voice_local.py` and `transport/tts.py` are untouched and still work exactly as before for anyone who wants the simpler sequential loop.
+
+### Research done before writing any code
+
+Pipecat's own web docs describe an older API than what's actually installed. Before writing `transport/pipeline.py`, the *actually-installed* `pipecat-ai` (1.7.0) source was read directly — the same "don't trust docs, read real source" principle Phase 7 applied to the Deepgram SDK — and it caught real drift: `PipelineTask`/`PipelineRunner` and a separate `StartInterruptionFrame` (what the docs describe) are already deprecated in this version in favor of `PipelineWorker`/`WorkerRunner` and one consolidated `InterruptionFrame`. Writing against the docs would have produced code that only worked by accident, via deprecated aliases.
+
+That reading also surfaced two things worth designing around:
+
+- **`DeepgramFluxSTTService` already exists as a first-party Pipecat integration** — the exact Flux model hand-wrapped in Phase 7's `transport/voice_local.py`. It broadcasts `UserStartedSpeakingFrame`/`UserStoppedSpeakingFrame` directly from Flux's own turn detection and (via its `should_interrupt=True` default) triggers the pipeline's interruption itself. **No separate VAD is used** — continuing Phase 7's exact reasoning that Flux's built-in end-of-turn detection is what avoids hand-rolling voice-activity detection.
+- **`FrameProcessor`'s base class already cancels a processor's own in-flight `process_frame()` call when an interruption arrives** (it cancels and recreates the per-processor task actually running that coroutine). This meant the custom Claude-integration processor needed no manual task-tracking to get "drop a stale reply after a mid-turn interruption" — it falls out of the framework's own design for free.
+
+### Architecture: one custom FrameProcessor is the entire integration point
+
+```
+transport.input() → DeepgramFluxSTTService → ClaudeTurnProcessor → TTS service → LatencyLogger → transport.output()
+```
+
+`agent/core.py` and `agent/session.py` do not change at all — this is Phase 0's "keep the brain decoupled from I/O" premise paying off for a second time (the first was Phase 7). `ClaudeTurnProcessor` (`transport/pipeline.py`) is the *only* place Pipecat and this project's brain touch: on a final `TranscriptionFrame`, it calls `run_turn()` — the exact same function `text_cli.py` and `voice_local.py` already use — and pushes the reply as a plain `TextFrame` for the TTS service, bracketed with `LLMFullResponseStartFrame`/`LLMFullResponseEndFrame` (matching what a real Pipecat LLM service emits, since the TTS service explicitly keys its per-turn audio-context tracking off those two frames). The raw `TranscriptionFrame` itself is deliberately not forwarded downstream — it's fully consumed here, not "passed along," since TTS has no use for the caller's own words repeated back at it.
+
+Ending a call reuses `EndFrame` directly rather than a hand-rolled "wait for the bot to finish talking" mechanism: reading `transports/base_output.py` confirmed the output transport already drains all already-queued audio before actually stopping on `EndFrame` (it's marked `UninterruptibleFrame`, so it also survives a stray interruption) — so a goodbye reply still plays in full before the session ends.
+
+**`LatencyLogger`** sits right before `transport.output()`. Every processor forwards frames it doesn't act on, so both `UserStoppedSpeakingFrame` (end of the caller's turn) and the reply's first `TTSAudioRawFrame` propagate all the way down to this position — diffing their timestamps gives the actual round-trip latency the checkpoint asks about ("~1s"), not a synthetic measurement taken some other way.
+
+**TTS is a Pipecat service now, not `transport/tts.py`.** Real barge-in needs the framework to cancel in-flight synthesis and drop already-queued audio the instant an interruption arrives — Pipecat's WebSocket TTS services (`DeepgramTTSService`, `CartesiaTTSService` — first-party integrations for the exact same default/swap choice Phase 7 made) participate in that; a one-shot REST call (correct for Phase 7's strictly sequential loop) doesn't. `get_pipecat_tts_service()` mirrors `transport/tts.py`'s `get_tts_backend()` switch (`TTS_BACKEND` env var, same default voice/model constants reused from that module) exactly, just backed by these streaming services instead.
+
+### One thing flagged before coding, not after
+
+`PROJECT_PLAN.md`'s checkpoint asks for "~1s round-trip latency." Realistic for quick chitchat, but a turn that invokes a tool (order lookup, policy search, a refund check) means a real Claude tool-use round trip *plus* a second Claude call for the final reply — this project's existing multi-second reality since Phase 1, unchanged by Pipecat. `LatencyLogger` measures and logs this honestly rather than only checking the easy case.
+
+### Tests (`tests/test_pipeline.py`)
+
+Everything else in the pipeline (the transport, the STT/TTS services) is Pipecat's own already-tested code — this file only tests what this project actually wrote. `FrameProcessor(enable_direct_mode=True)` is Pipecat's own documented mechanism for processing frames synchronously with no internal queue/task machinery, used here to call `process_frame()` directly and inspect what a linked capturing "sink" processor received. Covers: a final transcript produces the right reply and the raw transcript itself isn't forwarded; an empty transcript is a no-op; the model ending the conversation pushes `EndFrame`; an escalating turn pushes the notice and ends; and — the one that most needed proving — cancelling the asyncio task actually running `process_frame()` mid-turn (exactly what the framework's real interruption handling does under the hood) drops the reply entirely rather than letting a stale one land afterward. `LatencyLogger` is tested similarly for its once-per-turn logging and pass-through behavior.
+
+### Two real issues, found by actually talking to it
+
+Once both API keys were working again, a live run over real speech surfaced two genuine issues — neither invented, both diagnosed against actual log output and Pipecat's real source rather than guessed at:
+
+1. **An empty reply could reach TTS.** `agent/core.py`'s `_extract_text` can in principle return `""` for a turn (no text blocks in the final response), and `ClaudeTurnProcessor` was pushing that straight to `DeepgramTTSService` regardless. Deepgram would open a TTS context, produce no audio, and the service's own 3-second pause-watchdog would log `"no BotStartedSpeakingFrame ... force-resuming"` — a real, if rare, edge case. **Fixed**: `_handle_final_transcript` now skips pushing a `TextFrame` when the reply is empty/whitespace-only, printing a note instead. Every turn also now prints `[reply] N chars: '...'` so this is visible, not silent, if it recurs. Locked in by `test_claude_turn_processor_skips_tts_for_an_empty_reply`.
+2. **Self-interruption from mic/speaker echo.** The bot's voice would cut off mid-sentence and need several attempts to get a full sentence out. Tracing Deepgram Flux's `should_interrupt=True` default (which calls `broadcast_interruption()` the instant Flux detects speech start) against `DeepgramTTSService`'s interruption handler (which resets `_turn_context_id = None`, matching a `"no context ID provided"` log line seen at the same moment) pointed at the real cause: with a laptop's built-in mic and speakers and no acoustic echo cancellation, the mic picks up the bot's *own* voice, Flux reads it as the caller barging in, and the bot interrupts itself — repeatedly. **Not fixed in code**: real AEC needs the exact reference signal correlated against the mic input (what a WebRTC-based transport — Daily, LiveKit, or Phase 9's Twilio — provides automatically; raw local PyAudio I/O doesn't). The only fix available in code — muting the mic while the bot talks (mirroring Pipecat's own `AlwaysUserMuteStrategy`) — would also disable genuine barge-in during exactly the window this phase is supposed to demonstrate it in, so it wasn't worth trading away for local testing. **Deferred**: test real interruption with headphones, which sidesteps the echo entirely.
+
+### Checkpoint result
+
+All 8 of `tests/test_pipeline.py`'s tests pass (mocked, no audio/network — including the empty-reply fix above), and the rest of the suite is unaffected. Live-tested by hand over real speech: order status, refunds, and escalation all worked correctly end to end. **Accepted as Done on explicit sign-off**, noted honestly rather than silently assumed: the literal checkpoint — "stress-test with rapid interruptions and overlapping speech" — needs headphones to test genuine barge-in without the self-echo issue above, and that hands-on stress test is deferred to a future session rather than completed here.

@@ -18,3 +18,11 @@ deepgram-sdk>=7.7   # Flux (live STT)
 cartesia>=4.0       # optional TTS backend (TTS_BACKEND=cartesia); Deepgram Aura-2 is the default and needs no extra SDK — it's a plain REST call via httpx
 httpx>=0.28         # REST calls to the TTS backends
 pytest-httpx>=0.36  # mocked HTTP responses in tests/test_tts.py
+
+# Phase 8 — real-time streaming pipeline (Pipecat)
+# Pinned tighter than everything else above: this framework's API moved fast
+# even within its own 1.x line (PipelineTask/PipelineRunner and a separate
+# StartInterruptionFrame were already deprecated in favor of PipelineWorker/
+# WorkerRunner and a single InterruptionFrame by 1.7.0) — verified against
+# the actually-installed source before transport/pipeline.py was written.
+pipecat-ai[deepgram,cartesia,local]>=1.7,<2.0
