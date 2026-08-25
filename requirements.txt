@@ -10,3 +10,11 @@ ruff>=0.8
 # Phase 3 — FAQ/policy Q&A via RAG
 chromadb>=0.5
 voyageai>=0.3
+
+# Phase 7 — voice I/O (local loop)
+sounddevice>=0.5    # mic capture + speaker playback
+numpy>=2.0          # decoded PCM audio arrays, for sounddevice
+deepgram-sdk>=7.7   # Flux (live STT)
+cartesia>=4.0       # optional TTS backend (TTS_BACKEND=cartesia); Deepgram Aura-2 is the default and needs no extra SDK — it's a plain REST call via httpx
+httpx>=0.28         # REST calls to the TTS backends
+pytest-httpx>=0.36  # mocked HTTP responses in tests/test_tts.py

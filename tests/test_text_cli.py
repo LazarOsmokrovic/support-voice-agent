@@ -1,21 +1,23 @@
-"""Phase 1/2/3/4/5 checkpoints for the REPL: tools are actually wired into
-the Phase 0 tool-use loop, not just callable on their own, and the loop
-knows to stop when the model signals the conversation is over.
+"""Phase 1/2/3/4/5/6 checkpoints for the tool-use loop: tools are actually
+wired into it, not just callable on their own, and the loop knows to stop
+when the model signals the conversation is over. Since Phase 7, the tool
+registry/dispatcher these tests exercise (TOOLS, build_dispatch_tool,
+should_end_session) lives in agent/session.py, shared with
+transport/voice_local.py — see that module's docstring for why.
 
 Uses a mocked Claude client (no network, no API key) that scripts a
 two-turn exchange: first Claude asks for a tool, then it replies with text
 once the tool result comes back — exercising Agent.send end to end with a
-real dispatch_tool built by transport/text_cli.py's build_dispatch_tool
-(a factory since Phase 5 — see that module's docstring for why tool
-dispatch can no longer be a static constant).
+real dispatch_tool.
 
 The live tests (gated on a real ANTHROPIC_API_KEY) are the full-pipeline
 checkpoints: Phase 3's (a genuinely uncovered policy question, checking the
 model doesn't invent an answer once retrieval correctly comes back empty),
 Phase 4's (scripted conversations, checking escalation fires neither too
-eagerly nor too late), and Phase 5's (a scripted booking/reschedule
-conversation) — all run through the actual Agent + real Claude + real
-tools (local embedding backend for search_policy — no Voyage key needed).
+eagerly nor too late), Phase 5's (a scripted booking/reschedule
+conversation), and Phase 6's (refund conversations, normal and high-value)
+— all run through the actual Agent + real Claude + real tools (local
+embedding backend for search_policy — no Voyage key needed).
 """
 
 from __future__ import annotations
@@ -27,9 +29,9 @@ import pytest
 
 from agent.core import Agent
 from agent.prompts import SYSTEM_PROMPT
+from agent.session import TOOLS, build_dispatch_tool, should_end_session
 from agent.tools import escalation
 from data import mock_db
-from transport.text_cli import TOOLS, build_dispatch_tool, should_end_session
 
 
 def _fresh_dispatch_tool(customer_id: str = "CUST-1001"):
@@ -119,8 +121,8 @@ def test_should_end_session_is_false_with_no_tool_calls():
 async def test_search_policy_tool_is_wired_into_the_loop(monkeypatch):
     # Stub the handler rather than hit the real retrieval pipeline — this
     # test is about the wiring (does a search_policy tool_use call actually
-    # reach transport.text_cli's dispatch_tool), not retrieval quality,
-    # which tests/test_policy_rag.py already covers on its own.
+    # reach dispatch_tool), not retrieval quality, which
+    # tests/test_policy_rag.py already covers on its own.
     dispatch_tool, handlers, _state = build_dispatch_tool("CUST-1001")
     monkeypatch.setitem(
         handlers,

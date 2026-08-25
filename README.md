@@ -292,3 +292,44 @@ One noted, honest limitation: the live refund tests check eligibility against th
 ### Checkpoint result
 
 All 78 tests pass, including both live refund conversations — confirmed 2026-08-25. Blocked once mid-phase by the same recurring Anthropic key issue as every prior phase; refreshed, then everything passed cleanly.
+
+---
+
+## Phase 7 — Voice I/O, local loop (Done)
+
+The agent stops being a terminal script: a real microphone and real speakers now drive the same brain that's been running since Phase 1. `PROJECT_PLAN.md`'s framing for this phase — mic → Deepgram STT → *the same* `agent/core.py` loop, unchanged → TTS → speaker playback, with per-turn latency logged from the start — is exactly what got built, plus one refactor that had to happen first.
+
+### A refactor first: `agent/session.py` (new)
+
+`transport/text_cli.py` owned all the turn-orchestration logic through Phase 6: which tools exist, how a turn advances the confirmation gates, checks escalation, maybe hands off, and detects the model ending the conversation. `transport/voice_local.py` needs that *exact* behavior — a transport depending on another transport module would be backwards, and copying the logic risks the two drifting the moment a 7th tool gets added. This is the same "extract on the second real use case" call made for `agent/confirmation.py` in Phase 6, and precisely what CLAUDE.md rule 5 is watching for: a new I/O layer forcing a change to how business logic is organized.
+
+**To be explicit about what did and didn't change**, since this is a refactor and not new behavior: `TOOLS`, `SessionGates`, `build_dispatch_tool`, `should_end_session`, and `DEFAULT_CUSTOMER_ID` moved out of `text_cli.py` as-is. New in `agent/session.py`: a `Session` dataclass bundling everything one conversation needs; `create_session(customer_id)` to build one; a `TurnOutcome` dataclass (`reply`, `ended`, `end_reason`, `notice`, `llm_latency_seconds`, `warnings`) capturing what one turn produced as data instead of printing it; `run_turn(session, user_text)`, doing exactly what `text_cli.py`'s loop body did inline (advance gates → time the LLM call → check escalation → maybe hand off → check for `end_conversation`), just returning that structured result; and `close_session(session)`, wrapping Phase 2's summarize-and-log with the same try/except `text_cli.py` already had. `transport/text_cli.py` itself shrank to real I/O only — `input()`/`print()` around `create_session`/`run_turn`/`close_session` — but text chat works identically to before; nothing about talking to the agent by typing was removed, only *where the shared logic lives* changed. Verified by re-running all 78 pre-existing tests after the move, unchanged.
+
+### `transport/tts.py` (new) — the swappable TTS backend
+
+Mirrors `agent/tools/policy_rag.py`'s `EmbeddingBackend` pattern from Phase 3, for the same underlying reason: Deepgram is mandatory anyway (Flux, for STT, has no alternative), so defaulting TTS to Deepgram too means no second signup, while Cartesia Sonic — independently benchmarked as more natural-sounding — stays one env var away for whoever wants it. `TTSBackend` is a one-method protocol (`synthesize(text) -> bytes`); `DeepgramTTSBackend` and `CartesiaTTSBackend` each wrap their provider's one-shot REST endpoint (not the streaming APIs both providers also offer — Phase 7 is a sequential local loop, not real-time streaming; that's Phase 8's job via Pipecat); `get_tts_backend()` reads `TTS_BACKEND` (`"deepgram"` default, `"cartesia"` alternative).
+
+**One fix caught before it caused a bad bug:** Deepgram's `/v1/speak` endpoint defaults to MP3 if you don't ask otherwise, but the playback code decodes WAV via Python's stdlib `wave` module, which can't parse MP3 at all. Fixed by explicitly requesting `encoding=linear16&container=wav` in every Deepgram TTS request — an ambiguity worth catching before it turned into "TTS silently returns unplayable audio."
+
+### `transport/voice_local.py` (new) — the actual voice loop
+
+- **`listen_and_transcribe()`** opens a live Deepgram Flux WebSocket connection (`client.listen.v2.connect(model="flux-general-en", encoding="linear16", sample_rate=16000)`) and streams mic audio into it via `sounddevice.RawInputStream`, using an `asyncio.Queue` to hand chunks from PortAudio's callback thread to the async socket-sender task. Flux's whole value is built-in end-of-turn detection — the function just watches for its `EndOfTurn` event (part of a state machine also including `StartOfTurn`/`Update`/`EagerEndOfTurn`/`TurnResumed`) and returns that turn's final transcript, with zero hand-rolled silence detection. The exact request/response shapes here came from reading the installed `deepgram-sdk` source directly, not from web docs — the vendor's own published guides left real gaps (how audio bytes actually get sent, the exact event-type names), and guessing at an SDK's usage is exactly the kind of thing worth verifying against real source instead.
+- **`speak()`** calls the active `TTSBackend`, decodes the returned WAV via stdlib `wave` into a numpy array, and plays it with `sounddevice.play()` — blocking until playback finishes, since Phase 7's loop is strictly sequential (the agent finishes speaking, *then* starts listening again). No barge-in, no partial-transcript handling — explicitly Phase 8's job once Pipecat is in the picture.
+- **`main()`** has the same shape as `text_cli.py`'s loop, swapping `input()`/`print()` for `listen_and_transcribe()`/`speak()` around the identical `create_session`/`run_turn`/`close_session` calls. After every turn it logs one line — `STT: Xms | LLM: Yms | TTS: Zms | Total: Wms` — the literal "log per-turn latency from the start" requirement, giving Phase 8 a real baseline to improve on.
+
+Run it with `python -m transport.voice_local`.
+
+### Tests
+
+- `tests/test_session.py` (new) — the orchestration logic moved out of `text_cli.py`'s implicit coverage: `run_turn` with a mocked Claude client (plain reply, a tool call, an escalating turn producing a notice, the model ending the conversation), and a classifier failure surfacing as a warning instead of crashing the turn.
+- `tests/test_tts.py` (new) — both backends against mocked HTTP responses (`pytest-httpx`, no real network) verifying the exact request shape each provider expects, plus `get_tts_backend()`'s env-var switching.
+- `tests/test_voice_local.py` (new) — `listen_and_transcribe`'s control flow against a fake Flux socket (stopping exactly at `EndOfTurn`, raising cleanly on a fatal error), WAV encode/decode round-tripping, and `speak()`'s playback call, all without touching a real mic or network. Plus **a live, fully automated round-trip test**: synthesize a known phrase through the real TTS backend, feed the resulting audio straight into a real Flux connection, and assert the transcript reasonably matches — proving the STT↔TTS integration end-to-end with zero human voice needed.
+
+### Two things worth being upfront about
+
+- **A one-time local environment fix, not a code issue:** this machine's Python.org build doesn't wire the stdlib `ssl` module into macOS's system certificate store, which makes the `websockets` library (used for the Flux connection) fail its TLS handshake with `CERTIFICATE_VERIFY_FAILED` — `httpx` calls (the TTS side) are unaffected since it bundles its own CA bundle via `certifi`. Fixed locally by setting `SSL_CERT_FILE` to `certifi`'s bundle before running voice code; the standard permanent fix is running the "Install Certificates.command" that ships alongside python.org's macOS installers.
+- **What no automated test can cover:** an actual person speaking into an actual microphone. Every test above proves the pieces (STT, TTS, orchestration) work and even that they work *together* automatically — but the phase's literal checkpoint, "a full spoken conversation for at least two of the six features," needs a real voice and real ears. That part is yours to run: `python -m transport.voice_local`, have a real exchange covering e.g. an order-status question and a policy question, confirm it feels right.
+
+### Checkpoint result
+
+93 of 94 tests pass, including the live automated TTS→Flux round-trip — confirmed 2026-08-25. The one failure (`test_high_value_refund_conversation_escalates_instead_of_confirming`, a Phase 6 live test) is the same recurring Anthropic account credit-balance issue seen in earlier phases, not a Phase 7 regression. The hands-on spoken-conversation checkpoint is still outstanding and needs to be run in person.
