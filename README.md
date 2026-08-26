@@ -336,7 +336,7 @@ Run it with `python -m transport.voice_local`.
 
 ---
 
-## Phase 8 — Real-time streaming pipeline, Pipecat (In progress)
+## Phase 8 — Real-time streaming pipeline, Pipecat (Done)
 
 Phase 7's loop was strictly sequential: listen fully, *then* think, *then* speak fully, *then* listen again. `PROJECT_PLAN.md`'s Phase 8 asks for the real-time version — rebuilt as a Pipecat pipeline of frame processors, with real barge-in (stop the bot talking the instant the caller starts) and partial transcripts instead of only finals. This is a new, additive file (`transport/pipeline.py`) — `transport/voice_local.py` and `transport/tts.py` are untouched and still work exactly as before for anyone who wants the simpler sequential loop.
 
@@ -381,3 +381,40 @@ Once both API keys were working again, a live run over real speech surfaced two 
 ### Checkpoint result
 
 All 8 of `tests/test_pipeline.py`'s tests pass (mocked, no audio/network — including the empty-reply fix above), and the rest of the suite is unaffected. Live-tested by hand over real speech: order status, refunds, and escalation all worked correctly end to end. **Accepted as Done on explicit sign-off**, noted honestly rather than silently assumed: the literal checkpoint — "stress-test with rapid interruptions and overlapping speech" — needs headphones to test genuine barge-in without the self-echo issue above, and that hands-on stress test is deferred to a future session rather than completed here.
+
+---
+
+## Phase 9 — Telephony, Twilio (Done)
+
+A real phone number, a real caller, no laptop required. `PROJECT_PLAN.md`'s Phase 9: provision a Twilio number, build a webhook server that accepts Twilio's Media Streams over WebSocket, route that audio into the *same* Pipecat pipeline Phase 8 built, add a DTMF "press 0 for a human" fallback independent of the AI, and get it reachable from a real phone call via ngrok.
+
+### A real refactor first: `transport/pipecat_processors.py`
+
+`transport/pipeline.py` owned `ClaudeTurnProcessor`, `LatencyLogger`, and `get_pipecat_tts_service()` since Phase 8. The new `transport/telephony.py` needs the identical processors — a transport importing from another transport module would repeat the exact mistake Phase 7 already fixed once (`agent/session.py`'s extraction). Since this code imports `pipecat.frames`/`pipecat.processors` directly, it can't live in `agent/` either — `agent/` must stay completely decoupled from whatever's driving it (CLAUDE.md rule 5). New home: **`transport/pipecat_processors.py`**, a sibling module both transports import from.
+
+**What moved, unchanged:** `ClaudeTurnProcessor`, `LatencyLogger`, `get_pipecat_tts_service()`. **What's new:** `build_pipeline(transport, session)`, extracted from `transport/pipeline.py`'s `main()` — the exact same `transport.input() → stt → ClaudeTurnProcessor → tts → LatencyLogger → transport.output()` list both transports need identically, differing only in which `transport` object gets passed in. `transport/pipeline.py` shrank to building a `LocalAudioTransport` and calling `build_pipeline()` — no behavior change, confirmed by re-running its tests (moved to `tests/test_pipecat_processors.py`, mirroring `agent/session.py`'s own `test_session.py` precedent — `tests/test_pipeline.py` no longer exists).
+
+### The DTMF fallback: an addition, not a replacement
+
+`PROJECT_PLAN.md` asks for a DTMF "press 0 for a human" fallback "independent of the AI." **To be explicit about what this does and doesn't change**, since it's easy to misread as new escalation logic: automatic, spoken-request escalation already exists and is unchanged — `agent/tools/escalation.py`'s `classify_turn` + `EscalationTracker` have escalated on an explicit spoken request, repeated failures, or a policy-restricted topic since Phase 4, with zero button presses, and `ClaudeTurnProcessor` still runs that on every turn via `run_turn()` exactly as before. DTMF is a **second, additional** layer for when that detection doesn't fire — the model misjudges the request, or the pipeline itself is misbehaving. `ClaudeTurnProcessor` gets one new branch: on `InputDTMFFrame` with digit `0`, it calls `escalation.create_handoff_packet(...)` directly — no `classify_turn`, no `run_turn()` — pushes a spoken notice, then `EndFrame()`. Not a new processor; one more deterministic branch next to the existing model-driven one, the same pattern `EscalationTracker`'s counters already use next to `classify_turn` (CLAUDE.md rule 7). `InputDTMFFrame` never occurs from a keyboard or local mic, so this is a harmless no-op on `transport/pipeline.py`.
+
+Real call *transfer* to a human is Phase 10's job ("implement an actual Twilio call transfer using the Phase 4 handoff packet"). This logs the packet and ends the call with a spoken notice — the safety net the plan asks for, not the transfer itself.
+
+### `transport/telephony.py` (new)
+
+Twilio's flow is the synchronous model its own docs describe, confirmed against the installed `twilio`/`pipecat-ai` source rather than guessed:
+
+- **`POST /voice`** — Twilio's incoming-call webhook, form-encoded. Validates `X-Twilio-Signature` via `twilio.request_validator.RequestValidator` (HMAC-SHA1 against the exact webhook URL, built from a `PUBLIC_HOSTNAME` env var rather than trusted from the request itself, since proxying through ngrok makes that unreliable) — 403 on failure. Returns TwiML built with the `twilio` SDK's `VoiceResponse`/`Connect` helpers: `<Connect><Stream url="wss://{PUBLIC_HOSTNAME}/media-stream" /></Connect>` — `<Connect>`, not the one-way `<Start>`, since the bot needs to talk back.
+- **`WS /media-stream`** — accepts the socket, reads `connected` then `start` via a small, independently-testable `_read_start_event()` helper to get the `streamSid`/`callSid`/`accountSid` `TwilioFrameSerializer` needs, builds it plus `FastAPIWebsocketTransport`, creates a session defaulting to `DEFAULT_CUSTOMER_ID` (no way to prompt for a customer ID over a phone call — the same "no auth yet" simplification every transport already has, stated plainly rather than silently), calls the shared `build_pipeline()`, and runs it. `close_session()` after, same ticket-logging as every other transport. An `EndFrame` later triggers `TwilioFrameSerializer`'s own `auto_hang_up` (a real Twilio REST call) and an `InterruptionFrame` becomes Twilio's own `"clear"` message — both already implemented inside the serializer, nothing to add here.
+- Run with `python -m transport.telephony` (port 8765 by default).
+
+**Scope boundary, decided before coding:** `PROJECT_PLAN.md` mentions "a small VM/Fly.io/Render after" ngrok, but Phase 10 has its own explicit "Deploy: Dockerize, document env vars" bullet — persistent hosting belongs there. This phase's own checkpoint only needs ngrok exposing a locally-running server.
+
+### Tests
+
+- `tests/test_pipecat_processors.py` — the Phase 8 processor tests, moved, plus new ones for the DTMF branch: pressing 0 escalates and ends the call *without the fake Claude client ever being called* (proving the independence the plan asks for), a non-zero digit is a no-op, and the escalation notice still gets pushed even if logging the handoff packet itself fails (so a broken dependency can't strand a caller).
+- `tests/test_telephony.py` — signature validation (missing header, wrong signing key, a validly-signed request), the returned TwiML's shape, and `_read_start_event()` against canned Twilio message shapes. Signatures are computed by hand in the test (Twilio's own HMAC-SHA1 scheme, replicated rather than imported) so a bug in this project's *use* of `RequestValidator` couldn't be masked by reusing the same code to both sign and check. All offline — no real Twilio account or network.
+
+### Checkpoint result
+
+All 16 new tests pass (11 + 5), and the rest of the suite is unaffected by this phase (13 pre-existing failures are the same recurring Anthropic/Deepgram API-key issue seen in earlier phases, unrelated to this code). The actual checkpoint — placing a real call and running it end to end — was confirmed live: a real call to the Twilio number went through and worked.

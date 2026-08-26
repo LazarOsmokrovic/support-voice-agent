@@ -26,3 +26,10 @@ pytest-httpx>=0.36  # mocked HTTP responses in tests/test_tts.py
 # WorkerRunner and a single InterruptionFrame by 1.7.0) — verified against
 # the actually-installed source before transport/pipeline.py was written.
 pipecat-ai[deepgram,cartesia,local]>=1.7,<2.0
+
+# Phase 9 — telephony (Twilio) — see transport/telephony.py
+pipecat-ai[websocket]>=1.7,<2.0   # FastAPIWebsocketTransport
+fastapi>=0.115                    # the webhook + Media Streams server itself
+python-multipart>=0.0.9           # needed for request.form() on the /voice webhook
+uvicorn[standard]>=0.32           # ASGI server to run it
+twilio>=9.0                       # TwiML responses + X-Twilio-Signature validation

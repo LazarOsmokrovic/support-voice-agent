@@ -1,0 +1,246 @@
+"""Pipecat-specific glue shared by transport/pipeline.py (local mic) and
+transport/telephony.py (Twilio) — Phase 9.
+
+Extracted out of transport/pipeline.py on Twilio's arrival as a second real
+use case, for the same reason agent/session.py was extracted out of
+transport/text_cli.py in Phase 7: a transport importing from another
+transport module would be backwards, and duplicating this logic risks the
+two drifting apart. It can't live in agent/ either — it imports
+pipecat.frames/pipecat.processors directly, and agent/ has to stay
+completely decoupled from whatever I/O layer is driving it (CLAUDE.md
+rule 5). This is the framework-facing half of that boundary; agent/core.py
+and agent/session.py themselves are untouched by Phase 9, same as Phase 8.
+
+Nothing here changed behavior from Phase 8 except one addition: a new
+deterministic DTMF branch in ClaudeTurnProcessor ("press 0 for a human",
+PROJECT_PLAN.md's Phase 9 safety net) — an *additional* layer on top of the
+model-driven escalation agent/tools/escalation.py already does automatically
+via run_turn() (an explicit spoken request, repeated failures, or a
+policy-restricted topic all already escalate with zero button presses, since
+Phase 4). This is a fallback for when that detection doesn't fire — the
+model misjudges the request or the pipeline misbehaves — not a replacement
+for it. Telephony-only in practice (a local mic never produces an
+InputDTMFFrame), but harmless to share since it's just one more isinstance()
+branch next to the existing model-driven one.
+
+Entirely provider-agnostic: nothing here imports Twilio (or any other
+telephony provider) directly — that lives only in transport/telephony.py,
+which supplies the `transport` object build_pipeline() wires in.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+
+from pipecat.audio.dtmf.types import KeypadEntry
+from pipecat.frames.frames import (
+    EndFrame,
+    Frame,
+    InputDTMFFrame,
+    LLMFullResponseEndFrame,
+    LLMFullResponseStartFrame,
+    TextFrame,
+    TranscriptionFrame,
+    TTSAudioRawFrame,
+    UserStoppedSpeakingFrame,
+)
+from pipecat.pipeline.pipeline import Pipeline
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.services.cartesia.tts import CartesiaTTSService
+from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
+from pipecat.services.deepgram.tts import DeepgramTTSService
+from pipecat.transports.base_transport import BaseTransport
+
+from agent.session import Session, run_turn
+from agent.tools import escalation
+from transport.tts import (
+    DEFAULT_CARTESIA_MODEL,
+    DEFAULT_CARTESIA_VOICE,
+    DEFAULT_DEEPGRAM_VOICE,
+)
+
+
+class ClaudeTurnProcessor(FrameProcessor):
+    """The one integration point between Pipecat and this project's brain.
+
+    On a final TranscriptionFrame, runs the turn through agent/session.py's
+    run_turn() — the exact same function transport/text_cli.py and
+    transport/voice_local.py already use — and pushes the reply as a plain
+    TextFrame for the TTS service downstream. Brackets it with
+    LLMFullResponseStart/EndFrame, matching what a real Pipecat LLM service
+    would emit (TTSService explicitly keys its per-turn audio-context
+    tracking off these two frames).
+
+    Barge-in needs no special handling *here*: FrameProcessor's base
+    process_frame() already cancels this processor's own in-flight
+    process_frame() call when an InterruptionFrame arrives (it cancels and
+    recreates the per-processor task actually running this coroutine) — so a
+    mid-turn interruption simply aborts the `await run_turn(...)` call
+    already in flight. Nothing past that point ever executes, so no stale
+    reply gets pushed after the interruption.
+
+    The raw TranscriptionFrame itself is deliberately not forwarded
+    downstream — it's fully consumed here, not "passed along," since
+    downstream (TTS) has no use for the caller's own words.
+
+    Phase 9 adds one more branch: InputDTMFFrame. Pressing 0 is
+    PROJECT_PLAN.md's "safety net independent of the AI" — an *additional*
+    layer on top of the model-driven escalation run_turn() already performs
+    every turn (an explicit spoken request, repeated failures, or a
+    policy-restricted topic already escalate automatically, since Phase 4).
+    The decision to act on a 0 press is a plain isinstance() check, never
+    classify_turn() or any other model judgment, matching how
+    EscalationTracker's deterministic counters already sit next to
+    classify_turn's model-driven one in agent/tools/escalation.py (CLAUDE.md
+    rule 7). Since InputDTMFFrame is a SystemFrame it can arrive and be
+    handled on a separate, higher-priority task while a
+    TranscriptionFrame-triggered turn is still in flight on this same
+    processor — acceptable here since the fallback is meant to preempt
+    whatever the AI is doing, not queue politely behind it.
+    """
+
+    def __init__(self, *, session: Session, **kwargs):
+        super().__init__(**kwargs)
+        self._session = session
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, InputDTMFFrame):
+            if frame.button == KeypadEntry.ZERO:
+                await self._handle_dtmf_escalation()
+            return
+
+        if isinstance(frame, TranscriptionFrame):
+            if frame.text.strip():
+                await self._handle_final_transcript(frame.text)
+            return
+
+        await self.push_frame(frame, direction)
+
+    async def _handle_dtmf_escalation(self) -> None:
+        try:
+            packet = await escalation.create_handoff_packet(
+                self._session.customer_id, self._session.agent.messages, "caller pressed 0 for a human"
+            )
+            notice = f"Connecting you with a human agent. (handoff #{packet['escalation_id']})"
+        except Exception as exc:  # noqa: BLE001 — the fallback must never crash the call
+            notice = "Connecting you with a human agent."
+            print(f"(DTMF escalation triggered, but the handoff packet couldn't be logged: {exc})")
+
+        print(notice)
+        await self.push_frame(LLMFullResponseStartFrame())
+        await self.push_frame(TextFrame(text=notice))
+        await self.push_frame(LLMFullResponseEndFrame())
+        await self.push_frame(EndFrame())
+
+    async def _handle_final_transcript(self, text: str) -> None:
+        outcome = await run_turn(self._session, text)
+        print(f"[latency] LLM turn: {outcome.llm_latency_seconds * 1000:.0f}ms")
+        print(f"[reply] {len(outcome.reply)} chars: {outcome.reply!r}")
+        for warning in outcome.warnings:
+            print(f"({warning})")
+
+        await self.push_frame(LLMFullResponseStartFrame())
+        if outcome.reply.strip():
+            await self.push_frame(TextFrame(text=outcome.reply))
+        else:
+            # Nothing to synthesize — pushing an empty TextFrame would ask
+            # DeepgramTTSService to open a TTS context that produces zero
+            # audio, which is exactly what its own 3s pause-watchdog logs as
+            # "no BotStartedSpeakingFrame ... force-resuming". Skipping it
+            # keeps that (rare, model-side) edge case from ever reaching TTS.
+            print("(model returned an empty reply this turn — nothing to speak)")
+        if outcome.notice:
+            print(outcome.notice)
+            await self.push_frame(TextFrame(text=outcome.notice))
+        await self.push_frame(LLMFullResponseEndFrame())
+
+        if outcome.ended:
+            # EndFrame is a ControlFrame (ordered, not high-priority) and
+            # UninterruptibleFrame — it queues in after the reply above and
+            # survives a stray interruption, and the output transport drains
+            # already-queued audio before actually stopping. So this reply
+            # still gets spoken in full before the call ends; no abrupt cut.
+            await self.push_frame(EndFrame())
+
+
+class LatencyLogger(FrameProcessor):
+    """Sits right before transport.output(). Every processor forwards frames
+    it doesn't act on, so both UserStoppedSpeakingFrame (end of the caller's
+    turn) and the reply's first TTSAudioRawFrame propagate all the way down
+    to this position — diffing their timestamps gives the actual round-trip
+    latency PROJECT_PLAN.md's checkpoint asks about ("~1s"), not a synthetic
+    one measured some other way.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._turn_ended_at: float | None = None
+        self._logged_this_turn = False
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, UserStoppedSpeakingFrame):
+            self._turn_ended_at = time.perf_counter()
+            self._logged_this_turn = False
+        elif (
+            isinstance(frame, TTSAudioRawFrame)
+            and self._turn_ended_at is not None
+            and not self._logged_this_turn
+        ):
+            round_trip = time.perf_counter() - self._turn_ended_at
+            print(f"[latency] round-trip (end-of-turn -> first bot audio): {round_trip * 1000:.0f}ms")
+            self._logged_this_turn = True
+
+        await self.push_frame(frame, direction)
+
+
+def get_pipecat_tts_service():
+    """TTS_BACKEND env var: "deepgram" (default) or "cartesia" — same switch
+    and same default voice/model constants as transport/tts.py's
+    get_tts_backend(), just backed by Pipecat's own streaming TTS services
+    (which participate in interruption) instead of a one-shot REST call.
+    """
+    backend_name = os.getenv("TTS_BACKEND", "deepgram").lower()
+    if backend_name == "cartesia":
+        return CartesiaTTSService(
+            api_key=os.getenv("CARTESIA_API_KEY"),
+            settings=CartesiaTTSService.Settings(
+                voice=os.getenv("CARTESIA_TTS_VOICE", DEFAULT_CARTESIA_VOICE),
+                model=os.getenv("CARTESIA_TTS_MODEL", DEFAULT_CARTESIA_MODEL),
+            ),
+        )
+    if backend_name != "deepgram":
+        raise ValueError(f"unknown TTS_BACKEND: {backend_name!r} (expected 'deepgram' or 'cartesia')")
+    return DeepgramTTSService(
+        api_key=os.getenv("DEEPGRAM_API_KEY"),
+        settings=DeepgramTTSService.Settings(voice=os.getenv("DEEPGRAM_TTS_VOICE", DEFAULT_DEEPGRAM_VOICE)),
+    )
+
+
+def build_pipeline(transport: BaseTransport, session: Session) -> Pipeline:
+    """Assemble the one pipeline shape both transports share:
+
+        transport.input() -> DeepgramFluxSTTService -> ClaudeTurnProcessor
+            -> TTS service -> LatencyLogger -> transport.output()
+
+    `transport` is the only thing that differs between transport/pipeline.py
+    (LocalAudioTransport) and transport/telephony.py (FastAPIWebsocketTransport
+    + TwilioFrameSerializer) — everything downstream of "raw audio in" is
+    identical, which is the whole point of extracting it here.
+    """
+    stt = DeepgramFluxSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
+    tts = get_pipecat_tts_service()
+    return Pipeline(
+        [
+            transport.input(),
+            stt,
+            ClaudeTurnProcessor(session=session),
+            tts,
+            LatencyLogger(),
+            transport.output(),
+        ]
+    )
