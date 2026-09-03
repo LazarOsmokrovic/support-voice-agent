@@ -33,6 +33,12 @@ def test_redact_packet_masks_phone_number():
     assert "[redacted-phone]" in result["verified_account_info"]
 
 
+def test_redact_packet_masks_card_like_number_preserves_surrounding_spacing():
+    packet = {"conversation_summary": "Card number is 4111 1111 1111 1111 for the refund."}
+    result = redact_packet(packet)
+    assert result["conversation_summary"] == "Card number is [redacted-number] for the refund."
+
+
 def test_redact_packet_leaves_ordinary_text_untouched():
     packet = {"actions_taken": "Looked up order status, found no issue."}
     result = redact_packet(packet)

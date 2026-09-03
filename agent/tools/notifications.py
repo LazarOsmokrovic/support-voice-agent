@@ -28,7 +28,10 @@ import re
 from typing import Any
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-_CARDLIKE_RE = re.compile(r"\b(?:\d[ -]?){13,19}\b")
+# Separator only ever appears *between* digits (never trailing), so a match
+# can't swallow a space/dash that belongs to the surrounding text. Still
+# matches runs of 13-19 digits: 1 leading digit + 12..18 more.
+_CARDLIKE_RE = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")
 _PHONE_RE = re.compile(r"\+?\d[\d\-\s]{7,}\d")
 
 # Free-text fields on a handoff packet (see agent/tools/escalation.py's
@@ -41,9 +44,12 @@ _REDACTED_FIELDS = ("customer_intent", "conversation_summary", "verified_account
 def _redact(text: str) -> str:
     """Mask emails, card-like digit runs, and phone-like digit runs.
 
-    Order matters: card-like sequences (13-19 digits) are masked before the
-    looser phone pattern, so a card number is never partially caught and
-    left visible by the phone regex running first.
+    Card-like sequences (13-19 digits) are masked before the looser phone
+    pattern. This is not required for full coverage — _PHONE_RE's {7,}
+    quantifier would consume a card-length digit run just as completely if
+    it ran first — but running card detection first means a card-length run
+    gets labelled [redacted-number] rather than the less accurate
+    [redacted-phone].
     """
     text = _EMAIL_RE.sub("[redacted-email]", text)
     text = _CARDLIKE_RE.sub("[redacted-number]", text)
