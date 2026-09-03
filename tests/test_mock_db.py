@@ -51,3 +51,15 @@ def test_orders_reference_amazon_style_ids_and_known_customers(tmp_path, monkeyp
         assert len(parts) == 3
         assert [len(p) for p in parts] == [3, 7, 7]
         assert customer_id in customer_ids
+
+
+def test_escalations_have_notified_columns_defaulting_to_unnotified(tmp_path, monkeypatch):
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_mock_data.db")
+    mock_db.reset_and_seed()
+
+    with mock_db.get_connection() as conn:
+        row = conn.execute("SELECT notified, notified_at FROM escalations LIMIT 1").fetchone()
+
+    assert row is not None, "expected the seeded ESCALATIONS row"
+    assert row["notified"] == 0
+    assert row["notified_at"] is None

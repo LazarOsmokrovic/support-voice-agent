@@ -74,6 +74,12 @@ CREATE TABLE IF NOT EXISTS escalations (
     actions_taken          TEXT,
     sentiment              TEXT NOT NULL,
     created_at             TEXT NOT NULL,
+    -- Phase 11: whether create_handoff_packet's call to notify_escalation()
+    -- (agent/tools/notifications.py) actually delivered this packet to the
+    -- configured automation platform. Defaults to unnotified; a session
+    -- with no ESCALATION_WEBHOOK_URL configured leaves every row this way.
+    notified                INTEGER NOT NULL DEFAULT 0,
+    notified_at             TEXT,
     FOREIGN KEY (customer_id) REFERENCES customers (customer_id)
 );
 
