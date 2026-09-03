@@ -7,3 +7,4 @@ __pycache__/
 data/chroma_db/
 .ruff_cache/
 .scratch/
+.worktrees/
