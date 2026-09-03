@@ -33,6 +33,7 @@ Three pieces:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal
@@ -42,8 +43,11 @@ from pydantic import BaseModel
 
 from agent.core import DEFAULT_MODEL
 from agent.prompts import CLASSIFICATION_PROMPT, HANDOFF_PROMPT
+from agent.tools.notifications import notify_escalation
 from agent.tools.summary import format_transcript
 from data.mock_db import get_connection
+
+logger = logging.getLogger("agent.tools.escalation")
 
 # How many consecutive turns of the same bad signal before actually
 # escalating — chosen to avoid firing on one grumpy word or one bad lookup,
@@ -225,18 +229,44 @@ def log_escalation(
         return cursor.lastrowid
 
 
+def mark_notified(escalation_id: int, delivered: bool, notified_at: str | None = None) -> None:
+    """Record whether notify_escalation actually delivered this handoff to
+    the automation platform. Always called after log_escalation, whether or
+    not delivery succeeded — the escalations table is the durable record of
+    both what happened and whether a human was actually told.
+    """
+    notified_at = notified_at or datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE escalations SET notified = ?, notified_at = ? WHERE escalation_id = ?",
+            (int(delivered), notified_at, escalation_id),
+        )
+
+
 async def create_handoff_packet(
     customer_id: str,
     messages: list[dict[str, Any]],
     reason: str,
     client: anthropic.AsyncAnthropic | None = None,
 ) -> dict[str, Any]:
-    """Assemble a structured handoff packet and persist it in one call.
+    """Assemble a structured handoff packet, persist it, and notify an
+    external automation platform (Phase 11) — see agent/tools/notifications.py.
 
     Not a tool the model calls itself — see the module docstring. Returns
     the full packet, including its escalation_id, for the transport layer
-    to relay (e.g. print a transfer notice).
+    to relay (e.g. print a transfer notice). Notification delivery never
+    affects this return value — persisting the packet must not depend on
+    whether anyone was actually told about it.
     """
     fields = await _infer_handoff_fields(customer_id, messages, client=client)
     escalation_id = log_escalation(customer_id, reason, fields)
-    return {"escalation_id": escalation_id, "reason": reason, **fields.model_dump()}
+    packet = {"escalation_id": escalation_id, "reason": reason, **fields.model_dump()}
+
+    try:
+        delivered = await notify_escalation(packet)
+    except Exception:  # noqa: BLE001 — a broken webhook must never break escalation
+        logger.exception("notify_escalation raised unexpectedly")
+        delivered = False
+    mark_notified(escalation_id, delivered)
+
+    return packet

@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent.tools import escalation
 from agent.tools.escalation import (
     EscalationTracker,
     HandoffFields,
@@ -194,6 +195,77 @@ async def test_create_handoff_packet_infers_fields_and_logs(tmp_path, monkeypatc
             "SELECT * FROM escalations WHERE escalation_id = ?", (packet["escalation_id"],)
         ).fetchone()
     assert row is not None
+
+
+@pytest.mark.asyncio
+async def test_create_handoff_packet_marks_notified_true_on_successful_delivery(tmp_path, monkeypatch):
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_handoff_notify.db")
+    mock_db.reset_and_seed()
+    customer_id = mock_db.CUSTOMERS[0][0]
+
+    fake_fields = HandoffFields(
+        customer_intent="Wanted a refund",
+        conversation_summary="Asked about a refund.",
+        verified_account_info=f"Customer ID {customer_id}",
+        actions_taken="None yet",
+        sentiment="negative",
+    )
+    fake_response = MagicMock()
+    fake_response.parsed_output = fake_fields
+    fake_client = MagicMock()
+    fake_client.messages.parse = AsyncMock(return_value=fake_response)
+    monkeypatch.setattr(escalation, "notify_escalation", AsyncMock(return_value=True))
+
+    packet = await create_handoff_packet(
+        customer_id,
+        [{"role": "user", "content": "I want a refund"}],
+        "explicit request for a human",
+        client=fake_client,
+    )
+
+    with mock_db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT notified, notified_at FROM escalations WHERE escalation_id = ?", (packet["escalation_id"],)
+        ).fetchone()
+    assert row["notified"] == 1
+    assert row["notified_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_create_handoff_packet_still_returns_and_logs_when_notify_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_handoff_notify_fail.db")
+    mock_db.reset_and_seed()
+    customer_id = mock_db.CUSTOMERS[0][0]
+
+    fake_fields = HandoffFields(
+        customer_intent="Wanted a refund",
+        conversation_summary="Asked about a refund.",
+        verified_account_info=f"Customer ID {customer_id}",
+        actions_taken="None yet",
+        sentiment="negative",
+    )
+    fake_response = MagicMock()
+    fake_response.parsed_output = fake_fields
+    fake_client = MagicMock()
+    fake_client.messages.parse = AsyncMock(return_value=fake_response)
+    monkeypatch.setattr(
+        escalation, "notify_escalation", AsyncMock(side_effect=RuntimeError("webhook host unreachable"))
+    )
+
+    packet = await create_handoff_packet(
+        customer_id,
+        [{"role": "user", "content": "I want a refund"}],
+        "explicit request for a human",
+        client=fake_client,
+    )
+
+    assert packet["reason"] == "explicit request for a human"
+    with mock_db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT notified, notified_at FROM escalations WHERE escalation_id = ?", (packet["escalation_id"],)
+        ).fetchone()
+    assert row["notified"] == 0
+    assert row["notified_at"] is not None  # mark_notified still ran, just with delivered=False
 
 
 # --- classify_turn: live checks that the model's judgment actually matches intent ---
