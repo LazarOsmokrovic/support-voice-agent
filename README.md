@@ -434,32 +434,60 @@ full design rationale (approaches considered, why n8n, why not a durable queue).
 ### `agent/tools/notifications.py` (new)
 
 `notify_escalation(packet)` — a plain `async` function, no new architectural layer:
-redacts the packet's free-text fields (emails, phone-like and card-like digit runs —
+redacts four free-text fields on the packet (`customer_intent`, `conversation_summary`,
+`verified_account_info`, `actions_taken` — the ones that can carry customer-supplied
+text; `escalation_id`/`reason`/`sentiment` are short and structured, never PII, and pass
+through untouched) for emails, phone-like digit runs, and card-like digit runs —
 deliberately narrow, not Phase 10's eventual real PII pipeline in `guardrails/pii.py`,
-which stays an untouched stub), signs the serialized body with HMAC-SHA256 if
-`ESCALATION_WEBHOOK_SECRET` is set (the outbound mirror of `transport/telephony.py`'s
-inbound `X-Twilio-Signature` verification), and POSTs it to `ESCALATION_WEBHOOK_URL`
-with up to 3 attempts (5s timeout each, 0.5s/1.5s backoff). Retries are driven by
+which stays an untouched stub. **Order IDs are explicitly exempted from this redaction**:
+this project's order IDs are Amazon-shaped (`NNN-NNNNNNN-NNNNNNN`, 17 digits,
+hyphen-separated — `ORDER_ID_PATTERN` in `agent/tools/orders.py`), the same length as a
+card number, and an order ID is not PII — it's the single most useful identifier a human
+taking a handoff can be given, and `agent/prompts.py` explicitly asks the model to
+include it in `verified_account_info`. A run of digits that's exactly order-ID-shaped
+survives both the card-like and the phone-like pass intact. One related identifier is
+NOT exempted and is a known limitation: a tracking number (e.g. `TBA123456789US`) is
+currently caught by the phone-like pattern and redacted like a phone number — not fixed
+in this phase.
+
+The redacted body is signed with HMAC-SHA256 if `ESCALATION_WEBHOOK_SECRET` is set (the
+outbound mirror of `transport/telephony.py`'s inbound `X-Twilio-Signature` verification),
+and POSTed to `ESCALATION_WEBHOOK_URL` with up to 3 attempts (5s timeout each, 0.5s/1.5s
+backoff) — but the whole retry loop is capped by `NOTIFY_TOTAL_BUDGET_SECONDS` (3s), so
+worst-case notification latency is now bounded at 3s rather than the
+`MAX_ATTEMPTS * WEBHOOK_TIMEOUT_SECONDS` + backoff = up to 17s it could reach before: both
+callers (`agent/session.py`'s `run_turn`, `transport/pipecat_processors.py`'s DTMF
+handler) speak their reply only after this call returns, so 17s was dead air on a live
+call at the exact moment an already-frustrated caller was being handed off. A budget
+overrun is treated as a failed delivery (returns `False`, logs a warning), not an
+exception — `asyncio.CancelledError` from a genuine outer cancellation (e.g. Pipecat
+barge-in) is a different exception and still propagates normally. Retries are driven by
 `httpx.RequestError` (which covers both a connection/transport failure and a response
 body that fails to decode) or a 5xx status; a malformed `ESCALATION_WEBHOOK_URL` is
-caught separately as `httpx.InvalidURL` and treated as permanent — a config error, not
-a transient one, so it fails fast on attempt one instead of retrying — and any other
-4xx is likewise treated as permanent and not retried. `ESCALATION_WEBHOOK_URL` unset is
-a normal working state: silent no-op, no HTTP call at all — the same optional-by-default
-convention `TTS_BACKEND`/`EMBEDDING_BACKEND` already use. Never raises, by design — a
-broken webhook must never affect the escalation itself.
+caught separately as `httpx.InvalidURL`, and a scheme-less one (e.g.
+`n8n.example.com/webhook`, the likeliest operator typo) as `httpx.UnsupportedProtocol` —
+both treated as permanent, a config error, not a transient one, so they fail fast on
+attempt one instead of burning all 3 retries — and any other 4xx is likewise treated as
+permanent and not retried. `ESCALATION_WEBHOOK_URL` unset is a normal working state:
+silent no-op, no HTTP call at all — the same optional-by-default convention
+`TTS_BACKEND`/`EMBEDDING_BACKEND` already use. Never raises, by design — a broken webhook
+must never affect the escalation itself.
 
 ### `agent/tools/escalation.py` — wired at the handoff, not the transport
 
-`create_handoff_packet` gets one new step, right after `log_escalation` persists the
+`create_handoff_packet` gets two new steps, right after `log_escalation` persists the
 row: call `notify_escalation(packet)` (wrapped in a defensive `try`/`except`, since the
-function is documented never to raise but the call site doesn't rely on that alone),
-then record the outcome via the new `mark_notified(escalation_id, delivered)`. The
-packet is still returned and still logged even if notification fails or raises —
-persistence never depends on delivery succeeding. No signature change, so its callers
-(`agent/session.py::run_turn`, `transport/pipecat_processors.py`'s DTMF handler) needed
-zero changes — CLAUDE.md rule 5's decoupling holds exactly: nothing in `transport/`,
-`agent/core.py`, or `agent/session.py` changed for this phase.
+function is documented never to raise but the call site doesn't rely on that alone), then
+record the outcome via the new `mark_notified(escalation_id, delivered)` — itself in its
+own, separate `try`/`except`, so a failure updating the `notified`/`notified_at` columns
+(e.g. a pre-existing DB that never picked up those columns, or write-lock contention
+under simultaneous escalations) can't discard a packet that `log_escalation` already
+durably persisted, and the two distinct failure modes stay distinguishable in the logs.
+The packet is still returned and still logged even if notification or the notified-status
+update fails or raises — persistence never depends on delivery succeeding. No signature
+change, so its callers (`agent/session.py::run_turn`, `transport/pipecat_processors.py`'s
+DTMF handler) needed zero changes — CLAUDE.md rule 5's decoupling holds exactly: nothing
+in `transport/`, `agent/core.py`, or `agent/session.py` changed for this phase.
 
 ### `data/mock_db.py` — `notified`/`notified_at` columns
 
@@ -485,30 +513,48 @@ in this project). Run `python -m data.mock_db` to pick them up in a local dev DB
 
 ### Tests
 
-`tests/test_notifications.py` (new, 18 tests, all offline via `pytest-httpx` — mirrors
+`tests/test_notifications.py` (21 tests, all offline via `pytest-httpx` — mirrors
 `tests/test_tts.py`'s pattern exactly): redaction (email/phone/card-like masking,
 ordinary text untouched, non-redacted fields untouched, card-like masking preserves
-surrounding spacing), HMAC signing, deterministic serialization, no-op with no webhook
+surrounding spacing, **a real seeded order ID surviving redaction intact inside a
+realistic sentence**), HMAC signing, deterministic serialization, no-op with no webhook
 URL configured, success on the first attempt, a successful retry after one transient
 failure, exhausting all 3 attempts on persistent failure, a malformed webhook URL and a
-response-decoding error both failing without raising, a 4xx not being retried, a
-caller-supplied `httpx.AsyncClient` not being closed by `notify_escalation`, and the
-signature header present/absent correctly.
+response-decoding error both failing without raising, a scheme-less URL failing fast
+without retrying, a 4xx not being retried, the total-time-budget cap being enforced
+without raising (well under the old 17s worst case), a caller-supplied
+`httpx.AsyncClient` not being closed by `notify_escalation`, and the signature header
+present/absent correctly.
 
-`tests/test_escalation.py`: 2 new cases confirming `create_handoff_packet` records
-`notified=1` on a successful delivery and `notified=0` (while still returning and
-logging the packet) when `notify_escalation` raises.
+`tests/test_escalation.py`: 3 cases confirming `create_handoff_packet` records
+`notified=1` on a successful delivery, `notified=0` (while still returning and logging
+the packet) when `notify_escalation` raises, and that the packet and its already-logged
+row still survive when `mark_notified` itself raises.
 
-`tests/test_mock_db.py`: 1 new case confirming the seeded `escalations` row defaults to
+`tests/test_mock_db.py`: 1 case confirming the seeded `escalations` row defaults to
 `notified=0`, `notified_at=NULL`.
+
+`tests/conftest.py` (new — the repo's first): an autouse fixture strips
+`ESCALATION_WEBHOOK_URL`/`ESCALATION_WEBHOOK_SECRET` from the environment before every
+test. Without it, a real `ESCALATION_WEBHOOK_URL` sitting in a developer's `.env` (put
+there for the manual n8n checkpoint below) leaks into `os.environ` at import time
+(`agent/core.py` calls `load_dotenv()`), and any test exercising `create_handoff_packet`
+without explicitly stubbing `notify_escalation` fires a real outbound webhook POST. Tests
+that need one of these vars set still work — they set it explicitly via
+`monkeypatch.setenv` inside the test body, which wins over this fixture.
 
 ### Checkpoint result
 
-All new tests pass (21 new: 18 in `test_notifications.py`, 2 in `test_escalation.py`, 1
+All new tests pass (25 new: 21 in `test_notifications.py`, 3 in `test_escalation.py`, 1
 in `test_mock_db.py`), and the full existing suite is unaffected: `pytest -v` reports
-118 passed, 13 failed — the same 13 pre-existing, API-key-gated live-test failures
+122 passed, 13 failed — the same 13 pre-existing, API-key-gated live-test failures
 called out in every phase back through Phase 7 (stale/invalid Anthropic/Deepgram
-credentials in this environment), none of them in Phase 11's own files. The manual
+credentials in this environment), none of them in Phase 11's own files. (A whole-branch
+code review after the initial checkpoint fixed six findings — order-ID-shaped digit runs
+surviving redaction, the notification retry loop's total time budget, `mark_notified`
+failures no longer discarding an already-persisted escalation, a stray real webhook call
+from the test suite, and a scheme-less URL burning all 3 retry attempts — accounting for
+the 4 additional passing tests above the original 21.) The manual
 checkpoint — actually running n8n locally, wiring it to Slack (or console) output, and
 confirming a real escalation notification arrives with a legible, redacted payload — has
 **not** been performed in this environment: no n8n instance was run, no webhook request

@@ -267,6 +267,16 @@ async def create_handoff_packet(
     except Exception:  # noqa: BLE001 — a broken webhook must never break escalation
         logger.exception("notify_escalation raised unexpectedly")
         delivered = False
-    mark_notified(escalation_id, delivered)
+
+    # Separate try/except from the notify call above: mark_notified is a
+    # second, independent thing that can fail (e.g. a pre-existing DB
+    # missing the notified/notified_at columns, or write-lock contention
+    # under simultaneous escalations) and it must not discard a packet that
+    # log_escalation already durably persisted. Kept as its own except block
+    # so the two distinct failure modes stay distinguishable in logs.
+    try:
+        mark_notified(escalation_id, delivered)
+    except Exception:  # noqa: BLE001 — recording delivery status must never break escalation
+        logger.exception("mark_notified raised unexpectedly")
 
     return packet

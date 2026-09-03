@@ -28,9 +28,11 @@ import json
 import logging
 import os
 import re
-from typing import Any
+from typing import Any, Callable
 
 import httpx
+
+from agent.tools.orders import ORDER_ID_PATTERN
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 # Separator only ever appears *between* digits (never trailing), so a match
@@ -46,6 +48,31 @@ _PHONE_RE = re.compile(r"\+?\d[\d\-\s]{7,}\d")
 _REDACTED_FIELDS = ("customer_intent", "conversation_summary", "verified_account_info", "actions_taken")
 
 
+def _mask_unless_order_id(replacement: str) -> Callable[[re.Match[str]], str]:
+    """Build a re.sub replacement function that masks a matched digit run
+    with `replacement`, except when the match is exactly the shape of one of
+    this project's own order IDs (3-7-7 digits, hyphen-separated —
+    ORDER_ID_PATTERN). An order ID is not PII — it's the single most useful
+    identifier a human taking a handoff can be given.
+
+    Used for both _CARDLIKE_RE and _PHONE_RE: an order ID (17 digits, 2
+    separators) is exactly card-length, so it's also long enough to match
+    the looser phone pattern. If only the card-like pass exempted it, the
+    phone-like pass running right after would still catch and mask the very
+    same digits — this needs to hold at both stages, not just the first.
+    """
+
+    def _mask(match: re.Match[str]) -> str:
+        text = match.group()
+        return text if ORDER_ID_PATTERN.match(text) else replacement
+
+    return _mask
+
+
+_mask_cardlike = _mask_unless_order_id("[redacted-number]")
+_mask_phonelike = _mask_unless_order_id("[redacted-phone]")
+
+
 def _redact(text: str) -> str:
     """Mask emails, card-like digit runs, and phone-like digit runs.
 
@@ -57,8 +84,8 @@ def _redact(text: str) -> str:
     [redacted-phone].
     """
     text = _EMAIL_RE.sub("[redacted-email]", text)
-    text = _CARDLIKE_RE.sub("[redacted-number]", text)
-    text = _PHONE_RE.sub("[redacted-phone]", text)
+    text = _CARDLIKE_RE.sub(_mask_cardlike, text)
+    text = _PHONE_RE.sub(_mask_phonelike, text)
     return text
 
 
@@ -93,15 +120,27 @@ MAX_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = (0.5, 1.5)  # sleep after attempt 1, then after attempt 2
 RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 
+# Worst case without this cap is MAX_ATTEMPTS * WEBHOOK_TIMEOUT_SECONDS +
+# sum(RETRY_BACKOFF_SECONDS) = up to 17s, awaited synchronously by both
+# callers (agent/session.py's run_turn, transport/pipecat_processors.py's
+# DTMF handler) *before* they speak their reply — dead air on a live call at
+# the exact moment an already-frustrated caller is being handed off. This is
+# a hard ceiling on the whole retry loop, independent of how MAX_ATTEMPTS/
+# WEBHOOK_TIMEOUT_SECONDS get tuned later.
+NOTIFY_TOTAL_BUDGET_SECONDS = 3.0
+
 
 async def notify_escalation(packet: dict[str, Any], *, client: httpx.AsyncClient | None = None) -> bool:
     """POST a redacted, signed escalation packet to ESCALATION_WEBHOOK_URL.
 
     Returns True if delivered (2xx on any attempt), False otherwise —
-    including when no webhook URL is configured, which is a silent no-op by
-    design. Never raises: a broken or misconfigured webhook must never
-    affect the escalation itself completing (see agent/tools/escalation.py's
-    create_handoff_packet, which also wraps this call defensively).
+    including when no webhook URL is configured (silent no-op by design) or
+    when the retry loop overruns NOTIFY_TOTAL_BUDGET_SECONDS (treated as a
+    failed delivery). Never raises: a broken or misconfigured webhook must
+    never affect the escalation itself completing (see
+    agent/tools/escalation.py's create_handoff_packet, which also wraps this
+    call defensively). A genuine outer cancellation (e.g. Pipecat barge-in)
+    is not caught here and propagates as normal.
     """
     url = os.getenv("ESCALATION_WEBHOOK_URL")
     if not url:
@@ -115,13 +154,18 @@ async def notify_escalation(packet: dict[str, Any], *, client: httpx.AsyncClient
 
     owns_client = client is None
     client = client or httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT_SECONDS)
-    try:
+
+    async def _attempt_delivery() -> bool:
         for attempt in range(MAX_ATTEMPTS):
             try:
                 response = await client.post(url, content=body, headers=headers)
-            except httpx.InvalidURL as exc:
-                # A malformed ESCALATION_WEBHOOK_URL is a configuration error,
-                # not a transient one — retrying won't make it valid.
+            except (httpx.InvalidURL, httpx.UnsupportedProtocol) as exc:
+                # A malformed/scheme-less ESCALATION_WEBHOOK_URL is a
+                # configuration error, not a transient one — retrying won't
+                # make it valid. (UnsupportedProtocol is technically a
+                # RequestError subclass, so it must be caught here, ahead of
+                # the generic RequestError branch below, or it'd burn all
+                # MAX_ATTEMPTS retrying a typo like "n8n.example.com/hook".)
                 logger.warning("escalation webhook URL is invalid: %s", exc)
                 return False
             except httpx.RequestError as exc:
@@ -141,6 +185,20 @@ async def notify_escalation(packet: dict[str, Any], *, client: httpx.AsyncClient
             if attempt < MAX_ATTEMPTS - 1:
                 await asyncio.sleep(RETRY_BACKOFF_SECONDS[attempt])
         logger.warning("escalation webhook: all %d attempts failed", MAX_ATTEMPTS)
+        return False
+
+    try:
+        return await asyncio.wait_for(_attempt_delivery(), timeout=NOTIFY_TOTAL_BUDGET_SECONDS)
+    except TimeoutError:
+        # asyncio.TimeoutError (an alias of the builtin TimeoutError on
+        # Python 3.11+): the retry loop itself is cancelled by wait_for
+        # here, NOT a genuine outer cancellation — asyncio.CancelledError
+        # from a real barge-in is a different exception and is not caught by
+        # this clause, so it still propagates normally, straight through
+        # this try/finally, same as before this fix.
+        logger.warning(
+            "escalation webhook: exceeded total budget of %.1fs, giving up", NOTIFY_TOTAL_BUDGET_SECONDS
+        )
         return False
     finally:
         if owns_client:

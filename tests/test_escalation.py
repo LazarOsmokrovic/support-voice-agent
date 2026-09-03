@@ -268,6 +268,49 @@ async def test_create_handoff_packet_still_returns_and_logs_when_notify_raises(t
     assert row["notified_at"] is not None  # mark_notified still ran, just with delivered=False
 
 
+@pytest.mark.asyncio
+async def test_create_handoff_packet_still_returns_and_logs_when_mark_notified_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_handoff_marknotify_fail.db")
+    mock_db.reset_and_seed()
+    customer_id = mock_db.CUSTOMERS[0][0]
+
+    fake_fields = HandoffFields(
+        customer_intent="Wanted a refund",
+        conversation_summary="Asked about a refund.",
+        verified_account_info=f"Customer ID {customer_id}",
+        actions_taken="None yet",
+        sentiment="negative",
+    )
+    fake_response = MagicMock()
+    fake_response.parsed_output = fake_fields
+    fake_client = MagicMock()
+    fake_client.messages.parse = AsyncMock(return_value=fake_response)
+    monkeypatch.setattr(escalation, "notify_escalation", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        escalation, "mark_notified", MagicMock(side_effect=RuntimeError("database is locked"))
+    )
+
+    packet = await create_handoff_packet(
+        customer_id,
+        [{"role": "user", "content": "I want a refund"}],
+        "explicit request for a human",
+        client=fake_client,
+    )
+
+    assert packet["reason"] == "explicit request for a human"
+    assert "escalation_id" in packet
+    # The escalation row from log_escalation must survive a failing
+    # mark_notified intact — that's the whole point: an already-persisted
+    # escalation must never be discarded because the *follow-up* status
+    # update failed.
+    with mock_db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT * FROM escalations WHERE escalation_id = ?", (packet["escalation_id"],)
+        ).fetchone()
+    assert row is not None
+    assert row["customer_id"] == customer_id
+
+
 # --- classify_turn: live checks that the model's judgment actually matches intent ---
 
 

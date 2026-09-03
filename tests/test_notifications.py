@@ -6,13 +6,16 @@ half (added in Task 3); this file starts with the pure-function half.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac as hmac_module
+import time
 
 import httpx
 import pytest
 
 from agent.tools.notifications import MAX_ATTEMPTS, notify_escalation, redact_packet, serialize_packet, sign_payload
+from data.mock_db import ORDERS
 
 
 def test_redact_packet_masks_email():
@@ -40,6 +43,18 @@ def test_redact_packet_masks_card_like_number_preserves_surrounding_spacing():
     packet = {"conversation_summary": "Card number is 4111 1111 1111 1111 for the refund."}
     result = redact_packet(packet)
     assert result["conversation_summary"] == "Card number is [redacted-number] for the refund."
+
+
+def test_redact_packet_preserves_a_real_order_id():
+    # Order IDs (3-7-7 digits, hyphen-separated — ORDER_ID_PATTERN in
+    # agent/tools/orders.py) are exactly 17 digits with two separators, the
+    # same shape _CARDLIKE_RE looks for. A real seeded order ID must survive
+    # redaction intact — it's not PII, and it's the single most useful
+    # identifier a human taking a handoff can be given.
+    order_id = ORDERS[0][0]
+    packet = {"verified_account_info": f"Order {order_id} never arrived."}
+    result = redact_packet(packet)
+    assert result["verified_account_info"] == f"Order {order_id} never arrived."
 
 
 def test_redact_packet_leaves_ordinary_text_untouched():
@@ -208,3 +223,52 @@ async def test_notify_escalation_omits_signature_header_without_a_secret(monkeyp
 
     request = httpx_mock.get_requests()[0]
     assert "x-signature-256" not in request.headers
+
+
+@pytest.mark.asyncio
+async def test_notify_escalation_does_not_retry_a_scheme_less_url(monkeypatch, httpx_mock):
+    # httpx.UnsupportedProtocol is what real httpx raises for a scheme-less
+    # ESCALATION_WEBHOOK_URL like "n8n.example.com/webhook" (the likeliest
+    # operator typo) — deep in httpcore's transport, the same layer
+    # pytest-httpx replaces wholesale, so (mirroring the DecodingError test
+    # above) the exception is injected directly on a syntactically valid URL
+    # to exercise the fast-fail branch itself, rather than relying on
+    # httpx's own scheme check, which httpx_mock bypasses. It's technically
+    # a RequestError subclass, so without a dedicated except branch ahead of
+    # the generic one it would be retried MAX_ATTEMPTS times as if
+    # transient — burning the whole retry budget on a one-time typo.
+    monkeypatch.setenv("ESCALATION_WEBHOOK_URL", WEBHOOK_URL)
+    httpx_mock.add_exception(
+        httpx.UnsupportedProtocol("Request URL is missing an 'http://' or 'https://' protocol."),
+        url=WEBHOOK_URL,
+    )
+
+    delivered = await notify_escalation(SAMPLE_PACKET)
+
+    assert delivered is False
+    assert len(httpx_mock.get_requests()) == 1
+
+
+@pytest.mark.asyncio
+async def test_notify_escalation_gives_up_once_the_total_time_budget_is_exceeded(monkeypatch, httpx_mock):
+    # Regression test for the up-to-17s dead-air bug: MAX_ATTEMPTS *
+    # WEBHOOK_TIMEOUT_SECONDS + backoff could previously run for 17s,
+    # awaited synchronously before either caller speaks its reply on a live
+    # call. NOTIFY_TOTAL_BUDGET_SECONDS is monkeypatched to a tiny value so
+    # this test proves the cap without actually waiting anywhere near 3s
+    # (let alone 17s), and asserts no exception escapes notify_escalation.
+    monkeypatch.setenv("ESCALATION_WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setattr("agent.tools.notifications.NOTIFY_TOTAL_BUDGET_SECONDS", 0.05)
+
+    async def _hang(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(10)  # far longer than the tiny budget above
+        return httpx.Response(200)  # pragma: no cover — never reached, cancelled first
+
+    httpx_mock.add_callback(_hang, url=WEBHOOK_URL)
+
+    started = time.monotonic()
+    delivered = await notify_escalation(SAMPLE_PACKET)
+    elapsed = time.monotonic() - started
+
+    assert delivered is False
+    assert elapsed < 2.0  # well under the old 17s worst case (and the old default 3-attempt budget)
