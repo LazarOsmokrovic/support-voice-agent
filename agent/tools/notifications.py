@@ -21,11 +21,16 @@ transport/telephony.py's inbound X-Twilio-Signature verification.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
+import logging
+import os
 import re
 from typing import Any
+
+import httpx
 
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 # Separator only ever appears *between* digits (never trailing), so a match
@@ -79,3 +84,64 @@ def serialize_packet(packet: dict[str, Any]) -> bytes:
     the actual POST body always agree on the exact bytes signed.
     """
     return json.dumps(packet, sort_keys=True).encode()
+
+
+logger = logging.getLogger("agent.tools.notifications")
+
+WEBHOOK_TIMEOUT_SECONDS = 5.0
+MAX_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = (0.5, 1.5)  # sleep after attempt 1, then after attempt 2
+RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+
+
+async def notify_escalation(packet: dict[str, Any], *, client: httpx.AsyncClient | None = None) -> bool:
+    """POST a redacted, signed escalation packet to ESCALATION_WEBHOOK_URL.
+
+    Returns True if delivered (2xx on any attempt), False otherwise —
+    including when no webhook URL is configured, which is a silent no-op by
+    design. Never raises: a broken or misconfigured webhook must never
+    affect the escalation itself completing (see agent/tools/escalation.py's
+    create_handoff_packet, which also wraps this call defensively).
+    """
+    url = os.getenv("ESCALATION_WEBHOOK_URL")
+    if not url:
+        return False
+
+    body = serialize_packet(redact_packet(packet))
+    headers = {"Content-Type": "application/json"}
+    secret = os.getenv("ESCALATION_WEBHOOK_SECRET")
+    if secret:
+        headers["X-Signature-256"] = sign_payload(body, secret)
+
+    owns_client = client is None
+    client = client or httpx.AsyncClient(timeout=WEBHOOK_TIMEOUT_SECONDS)
+    try:
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                response = await client.post(url, content=body, headers=headers)
+            except httpx.InvalidURL as exc:
+                # A malformed ESCALATION_WEBHOOK_URL is a configuration error,
+                # not a transient one — retrying won't make it valid.
+                logger.warning("escalation webhook URL is invalid: %s", exc)
+                return False
+            except httpx.TransportError as exc:
+                logger.warning("escalation webhook attempt %d/%d failed: %s", attempt + 1, MAX_ATTEMPTS, exc)
+            else:
+                if response.status_code < 300:
+                    return True
+                if response.status_code not in RETRYABLE_STATUS_CODES:
+                    logger.warning(
+                        "escalation webhook rejected (status=%d), not retrying", response.status_code
+                    )
+                    return False
+                logger.warning(
+                    "escalation webhook attempt %d/%d got status=%d, retrying",
+                    attempt + 1, MAX_ATTEMPTS, response.status_code,
+                )
+            if attempt < MAX_ATTEMPTS - 1:
+                await asyncio.sleep(RETRY_BACKOFF_SECONDS[attempt])
+        logger.warning("escalation webhook: all %d attempts failed", MAX_ATTEMPTS)
+        return False
+    finally:
+        if owns_client:
+            await client.aclose()
