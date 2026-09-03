@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac as hmac_module
 
+import httpx
 import pytest
 
 from agent.tools.notifications import MAX_ATTEMPTS, notify_escalation, redact_packet, serialize_packet, sign_payload
@@ -136,6 +137,38 @@ async def test_notify_escalation_does_not_raise_on_a_malformed_webhook_url(monke
 
     assert delivered is False
     assert len(httpx_mock.get_requests()) == 0
+
+
+@pytest.mark.asyncio
+async def test_notify_escalation_does_not_raise_on_a_decoding_error(monkeypatch, httpx_mock):
+    # DecodingError is a sibling of TransportError under RequestError (raised
+    # when a webhook responds with a malformed/unsupported Content-Encoding)
+    # — it must be treated as a retryable transport-level failure, not
+    # escape uncaught. Deliberately not wrapped in try/except: an uncaught
+    # exception here fails the test.
+    monkeypatch.setenv("ESCALATION_WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setattr("agent.tools.notifications.RETRY_BACKOFF_SECONDS", (0.0, 0.0))
+    httpx_mock.add_exception(httpx.DecodingError("bad content-encoding"), url=WEBHOOK_URL)
+    httpx_mock.add_response(url=WEBHOOK_URL, status_code=200)
+
+    delivered = await notify_escalation(SAMPLE_PACKET)
+
+    assert delivered is True
+    assert len(httpx_mock.get_requests()) == 2
+
+
+@pytest.mark.asyncio
+async def test_notify_escalation_does_not_close_a_caller_supplied_client(monkeypatch, httpx_mock):
+    monkeypatch.setenv("ESCALATION_WEBHOOK_URL", WEBHOOK_URL)
+    httpx_mock.add_response(url=WEBHOOK_URL, status_code=200)
+    client = httpx.AsyncClient()
+
+    try:
+        delivered = await notify_escalation(SAMPLE_PACKET, client=client)
+        assert delivered is True
+        assert client.is_closed is False
+    finally:
+        await client.aclose()
 
 
 @pytest.mark.asyncio

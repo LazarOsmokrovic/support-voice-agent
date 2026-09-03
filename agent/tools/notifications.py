@@ -124,7 +124,7 @@ async def notify_escalation(packet: dict[str, Any], *, client: httpx.AsyncClient
                 # not a transient one — retrying won't make it valid.
                 logger.warning("escalation webhook URL is invalid: %s", exc)
                 return False
-            except httpx.TransportError as exc:
+            except httpx.RequestError as exc:
                 logger.warning("escalation webhook attempt %d/%d failed: %s", attempt + 1, MAX_ATTEMPTS, exc)
             else:
                 if response.status_code < 300:
