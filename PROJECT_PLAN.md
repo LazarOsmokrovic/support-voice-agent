@@ -34,6 +34,7 @@ support_voice_agent/
       scheduling.py
       refunds.py
       summary.py
+      notifications.py
     prompts.py
   data/
     mock_db.py        # SQLite seed + access layer
@@ -190,6 +191,39 @@ At this point all six original ideas work end-to-end over text chat, fully teste
 
 ---
 
+## Phase 11 — AI automation: escalation notifications (n8n)
+
+**Independent of Phase 10** — this phase depends only on Phase 4 (ticket triage &
+escalation) being done, not on Phase 10's guardrails work. This is a deliberate,
+explicit exception to this plan's normal "one phase at a time, in order" rule
+(CLAUDE.md rule 1), made at the project owner's direction so Phase 10 stays untouched
+while this phase is built. See `docs/superpowers/specs/2026-09-03-phase-11-escalation-notifications-design.md`
+for the full design rationale.
+
+- Today, `create_handoff_packet` (Phase 4) only writes the handoff packet to SQLite —
+  no human is ever actually told an escalation happened. Close that gap with a real
+  outbound notification.
+- New `agent/tools/notifications.py`: `notify_escalation(packet)` POSTs a redacted,
+  optionally HMAC-signed copy of the handoff packet to `ESCALATION_WEBHOOK_URL` (an n8n
+  webhook trigger), with a bounded retry+backoff on transient failures. Unconfigured →
+  silent no-op, same optional-by-default convention as `TTS_BACKEND`/`EMBEDDING_BACKEND`.
+- Redaction here is narrow and self-contained (emails, phone-like and card-like digit
+  runs, in the packet's free-text fields only) — explicitly not Phase 10's eventual real
+  PII pipeline (`guardrails/pii.py` stays an untouched stub), just enough to not ship
+  unredacted customer text to a third-party webhook by default.
+- `escalations` table gains `notified`/`notified_at` columns — a durable record of
+  whether a human was actually told, not just that an escalation happened.
+- No changes to `agent/core.py`, `agent/session.py`, or anything under `transport/` —
+  the entire integration lives inside `agent/tools/`.
+
+**Checkpoint:** automated — all new tests pass offline (redaction, signing, retry/backoff,
+and the `create_handoff_packet` integration), no real n8n instance needed. Manual — run
+n8n locally via Docker, wire a Webhook-trigger node to a Slack (or console) output, set
+`ESCALATION_WEBHOOK_URL`, run `transport/text_cli.py`, trigger a real escalation, and
+confirm the notification arrives with a legible, redacted payload.
+
+---
+
 ## Rough effort sizing
 
 | Phase | Size |
@@ -205,6 +239,7 @@ At this point all six original ideas work end-to-end over text chat, fully teste
 | 8 — Pipecat streaming | L |
 | 9 — Telephony | M |
 | 10 — Hardening | L |
+| 11 — AI automation (n8n) | M |
 
 (S/M/L = relative effort, not calendar time — depends entirely on your pace.)
 

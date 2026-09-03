@@ -418,3 +418,101 @@ Twilio's flow is the synchronous model its own docs describe, confirmed against 
 ### Checkpoint result
 
 All 16 new tests pass (11 + 5), and the rest of the suite is unaffected by this phase (13 pre-existing failures are the same recurring Anthropic/Deepgram API-key issue seen in earlier phases, unrelated to this code). The actual checkpoint — placing a real call and running it end to end — was confirmed live: a real call to the Twilio number went through and worked.
+
+---
+
+## Phase 11 — AI automation: escalation notifications, n8n (Done)
+
+`create_handoff_packet` (Phase 4) used to only write a handoff packet to SQLite — no
+human was ever actually told an escalation happened. This phase closes that gap with a
+real outbound notification to an automation platform, and is deliberately **independent
+of Phase 10** — an explicit, documented exception to this project's usual "one phase at
+a time, in order" rule, made at the project owner's direction; see
+`docs/superpowers/specs/2026-09-03-phase-11-escalation-notifications-design.md` for the
+full design rationale (approaches considered, why n8n, why not a durable queue).
+
+### `agent/tools/notifications.py` (new)
+
+`notify_escalation(packet)` — a plain `async` function, no new architectural layer:
+redacts the packet's free-text fields (emails, phone-like and card-like digit runs —
+deliberately narrow, not Phase 10's eventual real PII pipeline in `guardrails/pii.py`,
+which stays an untouched stub), signs the serialized body with HMAC-SHA256 if
+`ESCALATION_WEBHOOK_SECRET` is set (the outbound mirror of `transport/telephony.py`'s
+inbound `X-Twilio-Signature` verification), and POSTs it to `ESCALATION_WEBHOOK_URL`
+with up to 3 attempts (5s timeout each, 0.5s/1.5s backoff). Retries are driven by
+`httpx.RequestError` (which covers both a connection/transport failure and a response
+body that fails to decode) or a 5xx status; a malformed `ESCALATION_WEBHOOK_URL` is
+caught separately as `httpx.InvalidURL` and treated as permanent — a config error, not
+a transient one, so it fails fast on attempt one instead of retrying — and any other
+4xx is likewise treated as permanent and not retried. `ESCALATION_WEBHOOK_URL` unset is
+a normal working state: silent no-op, no HTTP call at all — the same optional-by-default
+convention `TTS_BACKEND`/`EMBEDDING_BACKEND` already use. Never raises, by design — a
+broken webhook must never affect the escalation itself.
+
+### `agent/tools/escalation.py` — wired at the handoff, not the transport
+
+`create_handoff_packet` gets one new step, right after `log_escalation` persists the
+row: call `notify_escalation(packet)` (wrapped in a defensive `try`/`except`, since the
+function is documented never to raise but the call site doesn't rely on that alone),
+then record the outcome via the new `mark_notified(escalation_id, delivered)`. The
+packet is still returned and still logged even if notification fails or raises —
+persistence never depends on delivery succeeding. No signature change, so its callers
+(`agent/session.py::run_turn`, `transport/pipecat_processors.py`'s DTMF handler) needed
+zero changes — CLAUDE.md rule 5's decoupling holds exactly: nothing in `transport/`,
+`agent/core.py`, or `agent/session.py` changed for this phase.
+
+### `data/mock_db.py` — `notified`/`notified_at` columns
+
+Two new columns on the existing `escalations` table, added the same way every prior
+phase has extended the schema (a `CREATE TABLE IF NOT EXISTS` edit — no migration system
+in this project). Run `python -m data.mock_db` to pick them up in a local dev DB.
+
+### Setting up n8n locally (for the manual checkpoint)
+
+1. `docker run -it --rm -p 5678:5678 n8nio/n8n` (or `docker compose`, if you already run
+   one elsewhere).
+2. In the n8n editor, add a **Webhook** node (POST, e.g. path `/escalation`), and copy
+   its "Test URL" or "Production URL" into `ESCALATION_WEBHOOK_URL` in `.env`.
+3. (Optional but recommended) Add a **Code** node right after the Webhook node that
+   recomputes the HMAC-SHA256 of the raw body using the same secret you put in
+   `ESCALATION_WEBHOOK_SECRET`, and compares it to the incoming `X-Signature-256`
+   header — reject the workflow (or route to an error branch) on a mismatch.
+4. Wire the Webhook node to whatever should actually notify a human — a **Slack** node
+   posting the `reason`/`customer_intent`/`conversation_summary` fields into a channel
+   is the natural choice; a plain **NoOp**/console output node is enough to just verify
+   delivery.
+5. Activate the workflow.
+
+### Tests
+
+`tests/test_notifications.py` (new, 18 tests, all offline via `pytest-httpx` — mirrors
+`tests/test_tts.py`'s pattern exactly): redaction (email/phone/card-like masking,
+ordinary text untouched, non-redacted fields untouched, card-like masking preserves
+surrounding spacing), HMAC signing, deterministic serialization, no-op with no webhook
+URL configured, success on the first attempt, a successful retry after one transient
+failure, exhausting all 3 attempts on persistent failure, a malformed webhook URL and a
+response-decoding error both failing without raising, a 4xx not being retried, a
+caller-supplied `httpx.AsyncClient` not being closed by `notify_escalation`, and the
+signature header present/absent correctly.
+
+`tests/test_escalation.py`: 2 new cases confirming `create_handoff_packet` records
+`notified=1` on a successful delivery and `notified=0` (while still returning and
+logging the packet) when `notify_escalation` raises.
+
+`tests/test_mock_db.py`: 1 new case confirming the seeded `escalations` row defaults to
+`notified=0`, `notified_at=NULL`.
+
+### Checkpoint result
+
+All new tests pass (21 new: 18 in `test_notifications.py`, 2 in `test_escalation.py`, 1
+in `test_mock_db.py`), and the full existing suite is unaffected: `pytest -v` reports
+118 passed, 13 failed — the same 13 pre-existing, API-key-gated live-test failures
+called out in every phase back through Phase 7 (stale/invalid Anthropic/Deepgram
+credentials in this environment), none of them in Phase 11's own files. The manual
+checkpoint — actually running n8n locally, wiring it to Slack (or console) output, and
+confirming a real escalation notification arrives with a legible, redacted payload — has
+**not** been performed in this environment: no n8n instance was run, no webhook request
+left this machine, and every test above exercises `notify_escalation` offline against a
+mocked HTTP layer. Same honest-limitation convention as Phase 7-9's real-mic/real-call
+checks: the automated half is fully verified here; the hands-on half needs a real n8n
+instance running, which is yours to do.
