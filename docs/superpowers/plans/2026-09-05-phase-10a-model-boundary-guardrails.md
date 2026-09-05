@@ -430,7 +430,7 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: nothing (pure functions).
-- Produces: `check_reply_grounding(reply: str, tool_calls: list[dict[str, Any]]) -> list[str]` and `hedge_for(turn: int) -> str` — both consumed by Task 6's wiring.
+- Produces: `check_reply_grounding(reply: str, tool_calls: list[dict[str, Any]]) -> list[str]`, `hedge_for(index: int) -> str`, and `HEDGE_PHRASES: tuple[str, ...]` — all consumed by Task 6's wiring (and `HEDGE_PHRASES` by Task 6's tests).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -564,14 +564,15 @@ HEDGE_PHRASES: tuple[str, ...] = (
 )
 
 
-def hedge_for(turn: int) -> str:
+def hedge_for(index: int) -> str:
     """A hedge line to speak instead of an ungrounded reply.
 
-    Rotates by turn number so a customer who hits this twice doesn't hear the
-    identical robotic sentence. Deterministic (not random) so tests stay
-    reproducible.
+    `index` is how many consecutive ungrounded replies preceded this one, so a
+    customer who hits this twice in a row doesn't hear the identical robotic
+    sentence. Deterministic (not random) so tests stay reproducible, and
+    caller-supplied rather than stateful so this module stays pure.
     """
-    return HEDGE_PHRASES[turn % len(HEDGE_PHRASES)]
+    return HEDGE_PHRASES[index % len(HEDGE_PHRASES)]
 
 
 def _claimed_numbers(reply: str) -> list[str]:
@@ -1052,7 +1053,12 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
         warnings.append(f"Could not check reply grounding this turn: {exc}")
     if findings:
         warnings.extend(findings)
-        reply = hedge_for(session.gates.refunds.turn)
+        # Rotate on how many consecutive ungrounded replies preceded this one.
+        # The tracker's counter is still the PREVIOUS count here — it is
+        # incremented inside check_escalation below — so a first flag gets
+        # HEDGE_PHRASES[0] and a second consecutive flag gets a different
+        # line, which is exactly the point of varying it.
+        reply = hedge_for(session.tracker.consecutive_ungrounded_replies)
 
     # Check escalation before should_end_session — a trigger here always
     # outranks the model deciding on its own the chat is naturally over.
@@ -1136,6 +1142,8 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 **Placeholder scan:** no TBDs. Every code step carries the literal code to write; every test step carries the literal test.
 
-**Type consistency:** `redact_text(str) -> str`, `redact_fields(dict, Sequence[str]) -> dict` and `HANDOFF_TEXT_FIELDS` are defined once in Task 1 and consumed with those exact names in Tasks 1 and 2. `check_reply_grounding(str, list[dict]) -> list[str]` and `hedge_for(int) -> str` are defined in Task 3 and consumed with matching signatures in Task 6. `sanitize_user_text(str) -> tuple[str, list[str]]` is defined in Task 4 and unpacked as two values in Task 6. `record_turn(..., ungrounded: bool = False)` and `check_escalation(..., ungrounded: bool = False, ...)` are defined in Task 5 and called with the keyword in Task 6; both defaults keep pre-existing callers valid.
+**Type consistency:** `redact_text(str) -> str`, `redact_fields(dict, Sequence[str]) -> dict` and `HANDOFF_TEXT_FIELDS` are defined once in Task 1 and consumed with those exact names in Tasks 1 and 2. `check_reply_grounding(str, list[dict]) -> list[str]`, `hedge_for(int) -> str` and `HEDGE_PHRASES` are defined in Task 3 and consumed with matching signatures in Task 6.
+
+**Hedge rotation source:** `hedge_for` is fed `session.tracker.consecutive_ungrounded_replies`, not a gate turn counter. At that point in `run_turn` the counter still holds the count from *before* this turn, because `check_escalation` (which increments it) runs afterwards — so a first flag yields `HEDGE_PHRASES[0]` and a second consecutive flag a different line. An earlier draft indexed on `session.gates.refunds.turn`, which coupled the hedge to the refunds confirmation gate for no reason; corrected. `sanitize_user_text(str) -> tuple[str, list[str]]` is defined in Task 4 and unpacked as two values in Task 6. `record_turn(..., ungrounded: bool = False)` and `check_escalation(..., ungrounded: bool = False, ...)` are defined in Task 5 and called with the keyword in Task 6; both defaults keep pre-existing callers valid.
 
 **Ordering risk checked:** Task 5 inserts `ungrounded` as the fourth positional parameter of `check_escalation`, *before* `client`. Every existing call site passes `client` by keyword or omits it (`agent/session.py`, `tests/test_text_cli.py`, `tests/test_escalation.py`), so no positional call breaks — Task 5's Step 4 full-file test run is what confirms this.
