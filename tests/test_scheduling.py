@@ -101,6 +101,27 @@ def test_book_appointment_confirms_in_a_later_turn(tmp_path, monkeypatch):
     assert state.pending is None
 
 
+def test_book_appointment_redacts_pii_in_reason_before_writing(tmp_path, monkeypatch):
+    """Phase 10a: appointments.reason is model-authored free text derived
+    from what the caller said — a storage boundary, so it's redacted before
+    the write (guardrails/pii.py), same as summary.py's log_ticket."""
+    _seed(tmp_path, monkeypatch)
+    state = PendingActionGate(turn=1)
+    reason = "call me back on 555-123-4567"
+    book_appointment("2026-08-25T09:00:00", reason, state=state, customer_id="CUST-1001")
+
+    state.turn = 2
+    result = book_appointment("2026-08-25T09:00:00", reason, state=state, customer_id="CUST-1001")
+
+    assert result["booked"] is True
+    with mock_db.get_connection() as conn:
+        stored_reason = conn.execute(
+            "SELECT reason FROM appointments WHERE scheduled_time = ?", ("2026-08-25T09:00:00",)
+        ).fetchone()["reason"]
+    assert "555-123-4567" not in stored_reason
+    assert "[redacted-phone]" in stored_reason
+
+
 def test_book_appointment_rejects_confirmation_attempted_in_the_same_turn(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
     state = PendingActionGate(turn=1)

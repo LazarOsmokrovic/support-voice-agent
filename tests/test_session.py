@@ -159,6 +159,84 @@ async def test_run_turn_speaks_a_hedge_instead_of_an_ungrounded_reply(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_run_turn_reconciles_history_after_a_hedged_reply(monkeypatch):
+    """After a flagged turn, the last assistant message in
+    session.agent.messages must no longer contain the ungrounded number and
+    must contain the hedge text instead — otherwise the hallucination
+    lingers in context for the model to build on next turn."""
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(
+        side_effect=[
+            _tool_use_response("search_policy", {"query": "returns"}),
+            _text_response("You have 90 days to return that."),
+        ]
+    )
+    monkeypatch.setattr(escalation, "classify_turn", AsyncMock(return_value=_calm_classification()))
+    session = create_session("CUST-1001", client=fake_client)
+    monkeypatch.setitem(
+        session.handlers,
+        "search_policy",
+        lambda query: {"found": True, "results": [{"text": "Returns accepted within 30 days."}]},
+    )
+
+    outcome = await run_turn(session, "How long do I have to return this?")
+
+    assert outcome.reply in HEDGE_PHRASES
+    last_assistant = [m for m in session.agent.messages if m["role"] == "assistant"][-1]
+    rendered = " ".join(
+        block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")
+        for block in last_assistant["content"]
+    )
+    assert "90" not in rendered
+    assert rendered == outcome.reply
+
+
+@pytest.mark.asyncio
+async def test_run_turn_keeps_the_real_reply_when_the_turn_proposed_a_confirmation(monkeypatch):
+    """A flagged reply that also proposed a refund/booking confirmation must
+    still be spoken in full — substituting a hedge would leave the
+    confirmation gate armed while the customer never heard what they'd be
+    confirming. The grounding findings are still surfaced as warnings."""
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(
+        side_effect=[
+            _tool_use_response("search_policy", {"query": "returns"}),
+            _tool_use_response(
+                "issue_refund",
+                {"order_id": "119-5647382-9182736", "condition": "unopened_or_unwanted", "reason": "changed mind"},
+            ),
+            _text_response("This order is eligible for a $999.99 refund. Should I go ahead?"),
+        ]
+    )
+    monkeypatch.setattr(escalation, "classify_turn", AsyncMock(return_value=_calm_classification()))
+    session = create_session("CUST-1001", client=fake_client)
+    monkeypatch.setitem(
+        session.handlers,
+        "search_policy",
+        lambda query: {"found": True, "results": [{"text": "Returns accepted within 30 days."}]},
+    )
+    monkeypatch.setitem(
+        session.handlers,
+        "issue_refund",
+        lambda **kw: {
+            "issued": False,
+            "status": "pending_confirmation",
+            # Deliberately does NOT contain 999.99 — the reply below claims a
+            # number no tool output this turn supports, so it would otherwise
+            # be flagged as ungrounded.
+            "amount": 34.99,
+            "message": "This order is eligible for a $34.99 refund. Should I go ahead?",
+        },
+    )
+
+    outcome = await run_turn(session, "Can I get a refund?")
+
+    assert outcome.reply == "This order is eligible for a $999.99 refund. Should I go ahead?"
+    assert outcome.reply not in HEDGE_PHRASES
+    assert any("999.99" in warning for warning in outcome.warnings)
+
+
+@pytest.mark.asyncio
 async def test_run_turn_leaves_a_grounded_reply_untouched(monkeypatch):
     fake_client = MagicMock()
     fake_client.messages.create = AsyncMock(

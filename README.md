@@ -668,12 +668,15 @@ construction (the replacement tokens contain no digits and no `@`), which matter
 `create_handoff_packet` redacts once and `notify_escalation` redacts again defensively —
 the second pass is a guaranteed no-op.
 
-**Applied at the two places free text actually gets written down**: `agent/tools/summary.py::log_ticket`
-(the `issue`/`resolution` fields, before the DB write) and
+**Applied at the four places free text actually gets written down**: `agent/tools/summary.py::log_ticket`
+(the `issue`/`resolution` fields, before the DB write),
 `agent/tools/escalation.py::create_handoff_packet` (`HANDOFF_TEXT_FIELDS` — `customer_intent`,
 `conversation_summary`, `verified_account_info`, `actions_taken` — redacted once, so the
 persisted row and the outbound webhook carry identical text rather than two independently
-redacted copies that could drift).
+redacted copies that could drift), `agent/tools/scheduling.py::book_appointment`
+(`appointments.reason`), and `agent/tools/refunds.py::issue_refund` (`refunds.reason`) — both
+of the latter two model-authored free text derived from what the caller said, redacted at the
+point of write the same way `log_ticket` does it.
 
 ### A scope correction: storage/egress, not "pre-LLM"
 

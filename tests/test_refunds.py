@@ -198,6 +198,26 @@ def test_confirms_in_a_later_turn_and_writes_refund_and_updates_order(tmp_path, 
     assert order_status == "Refunded"
 
 
+def test_redacts_pii_in_reason_before_writing(tmp_path, monkeypatch):
+    """Phase 10a: refunds.reason is the customer's own stated reason,
+    verbatim from the model — a storage boundary, so it's redacted before
+    the write (guardrails/pii.py), same as summary.py's log_ticket."""
+    _seed(tmp_path, monkeypatch)
+    state = PendingActionGate(turn=1)
+    reason = "call me back on 555-123-4567 if there's an issue"
+    issue_refund(LOW_VALUE_ORDER, "unopened_or_unwanted", reason, state=state, customer_id=LOW_VALUE_CUSTOMER, now=RECENT_NOW)
+
+    state.turn = 2
+    issue_refund(LOW_VALUE_ORDER, "unopened_or_unwanted", reason, state=state, customer_id=LOW_VALUE_CUSTOMER, now=RECENT_NOW)
+
+    with mock_db.get_connection() as conn:
+        stored_reason = conn.execute(
+            "SELECT reason FROM refunds WHERE order_id = ?", (LOW_VALUE_ORDER,)
+        ).fetchone()["reason"]
+    assert "555-123-4567" not in stored_reason
+    assert "[redacted-phone]" in stored_reason
+
+
 def test_rejects_double_refund_of_an_already_refunded_order(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
     state = PendingActionGate(turn=1)

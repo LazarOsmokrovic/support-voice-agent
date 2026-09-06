@@ -25,10 +25,19 @@ from typing import Any
 
 logger = logging.getLogger("guardrails.validators")
 
-# Tools whose output is the ground truth a reply is checked against. A turn
-# that called none of these isn't making a lookup-backed claim, so there is
-# nothing to check.
-GROUNDING_TOOLS = ("search_policy", "get_order_status")
+# Tools whose presence THIS turn triggers the check at all. Deliberately
+# policy-lookups only, not every lookup tool: this detector exists to catch
+# an invented *policy* claim (a return window, a fee) slipped past a real
+# search_policy result — the case where the model had the right document in
+# front of it and still misquoted it. A turn that merely ran get_order_status
+# is not making a policy claim just because it happens to also restate a
+# real order-status number (a price, a date) the model has seen earlier in
+# the conversation; gating on get_order_status too (the original behavior)
+# flagged that ordinary, correct behavior as if it were a hallucination. Tool
+# output is still fair grounding for a claim regardless of which tool
+# produced it — see _supported_numbers, which scans every call's output, not
+# just the ones named here.
+GROUNDING_TRIGGER_TOOLS = ("search_policy",)
 
 # A "claim" is a number wearing a policy-ish unit: a duration, a percentage,
 # or an amount of money. Bare numbers are deliberately ignored.
@@ -80,6 +89,14 @@ def _supported_numbers(tool_calls: list[dict[str, Any]]) -> set[str]:
         output = call.get("output")
         if output is None:
             continue
+        if isinstance(output, dict) and output.get("found") is False:
+            # A miss grounds nothing — but its own message text can look
+            # like it does. get_order_status's invalid_order_id message
+            # embeds the example ID "112-3487561-2938471" and the literal
+            # "3-7-7 digits", so a "7" from that error text would otherwise
+            # enter the supported set and silently ground an unrelated
+            # claim like "returns take 7 days" (see FIX 5).
+            continue
         try:
             blob = json.dumps(output, default=str)
         except (TypeError, ValueError):
@@ -101,7 +118,7 @@ def check_reply_grounding(reply: str, tool_calls: list[dict[str, Any]]) -> list[
     that can crash the turn it is meant to protect is worse than no guardrail.
     """
     try:
-        if not any(call.get("name") in GROUNDING_TOOLS for call in tool_calls):
+        if not any(call.get("name") in GROUNDING_TRIGGER_TOOLS for call in tool_calls):
             return []
 
         supported = _supported_numbers(tool_calls)

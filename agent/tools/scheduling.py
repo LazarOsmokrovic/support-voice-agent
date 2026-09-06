@@ -37,6 +37,7 @@ from typing import Any
 
 from agent.confirmation import PendingActionGate
 from data.mock_db import get_connection
+from guardrails.pii import redact_text
 
 BUSINESS_START_HOUR = 9
 BUSINESS_END_HOUR = 17  # last slot starts at 16:30
@@ -163,10 +164,13 @@ def book_appointment(slot_time: str, reason: str, state: PendingActionGate, cust
             "message": f"{slot_time} is available for '{reason}'. Should I go ahead and book it?",
         }
 
+    # appointments.reason is model-authored free text derived from what the
+    # caller said ("call me back on 555-123-4567") — a storage boundary, so
+    # it's redacted before the write, same as summary.py's log_ticket.
     with get_connection() as conn:
         cursor = conn.execute(
             "INSERT INTO appointments (customer_id, scheduled_time, reason, status) VALUES (?, ?, ?, 'scheduled')",
-            (customer_id, slot_time, reason),
+            (customer_id, slot_time, redact_text(reason)),
         )
         appointment_id = cursor.lastrowid
 

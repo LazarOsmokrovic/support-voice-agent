@@ -58,6 +58,51 @@ def test_non_claim_numbers_are_not_flagged():
     assert check_reply_grounding("I can help with that in 2 ways, and you have 30 days.", calls) == []
 
 
+def test_order_lookup_alone_does_not_trigger_the_check():
+    """FIX 4: a turn that only ran get_order_status is not making a policy
+    claim just because it restates a real order number — the check should
+    only trigger when search_policy ran this turn."""
+    calls = [
+        {"name": "get_order_status", "input": {}, "output": {"found": True, "estimated_delivery": "2026-08-13"}}
+    ]
+    assert check_reply_grounding("You have 30 days from delivery.", calls) == []
+
+
+def test_order_lookup_price_still_grounds_a_claim_once_policy_search_ran():
+    """The trigger narrows to search_policy, but any tool's output can still
+    ground a number once the check does run — an order lookup's price
+    legitimately grounds a number in the reply."""
+    calls = [
+        {"name": "get_order_status", "input": {}, "output": {"found": True, "price": 25.99, "quantity": 1}},
+        _policy_call(True, "unrelated policy text"),
+    ]
+    assert check_reply_grounding("That item was $25.99.", calls) == []
+
+
+def test_a_failed_lookups_own_error_text_does_not_ground_a_claim():
+    """FIX 5: get_order_status's invalid_order_id message embeds '3-7-7
+    digits' and the example order ID — those digits must not enter the
+    supported set just because the output happens to be a dict."""
+    calls = [
+        _policy_call(True, "Some unrelated policy text."),
+        {
+            "name": "get_order_status",
+            "input": {"order_id": "123"},
+            "output": {
+                "found": False,
+                "error": "invalid_order_id",
+                "message": (
+                    "'123' isn't a valid order ID format. Order IDs look "
+                    "like 112-3487561-2938471 (3-7-7 digits, hyphen-separated)."
+                ),
+            },
+        },
+    ]
+    findings = check_reply_grounding("Returns take 7 days to process.", calls)
+    assert findings
+    assert "7" in findings[0]
+
+
 def test_hedge_for_rotates_deterministically():
     assert hedge_for(0) == HEDGE_PHRASES[0]
     assert hedge_for(1) == HEDGE_PHRASES[1 % len(HEDGE_PHRASES)]

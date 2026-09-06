@@ -5,7 +5,7 @@ narrower version in Phase 11 for the outbound webhook.
 
 from __future__ import annotations
 
-from data.mock_db import ORDERS
+from data.mock_db import APPOINTMENTS, ORDERS
 from guardrails.pii import HANDOFF_TEXT_FIELDS, redact_fields, redact_text
 
 
@@ -28,6 +28,29 @@ def test_redact_text_masks_phone_number():
 def test_redact_text_preserves_a_real_order_id():
     order_id = ORDERS[0][0]
     sentence = f"Order {order_id} never arrived."
+    assert redact_text(sentence) == sentence
+
+
+def test_redact_text_preserves_seeded_order_and_delivery_dates():
+    # ORDERS rows are (order_id, customer_id, item, quantity, price, status,
+    # order_date, estimated_delivery, tracking_number) — see data/mock_db.py.
+    order = ORDERS[0]
+    order_date, estimated_delivery = order[6], order[7]
+    sentence = f"Delivered {order_date}, so the return window closes {estimated_delivery}."
+    assert redact_text(sentence) == sentence
+
+
+def test_redact_text_preserves_a_seeded_tracking_number():
+    order_id, tracking_number = ORDERS[0][0], ORDERS[0][8]
+    assert tracking_number, "seeded order must have a tracking number for this test to mean anything"
+    sentence = f"Gave the customer tracking number {tracking_number} for order {order_id}."
+    assert redact_text(sentence) == sentence
+
+
+def test_redact_text_preserves_a_seeded_appointment_datetime():
+    # APPOINTMENTS rows are (customer_id, scheduled_time, reason, status).
+    scheduled_time = APPOINTMENTS[0][1]
+    sentence = f"Callback booked for {scheduled_time}."
     assert redact_text(sentence) == sentence
 
 

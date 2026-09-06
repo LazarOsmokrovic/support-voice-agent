@@ -37,7 +37,13 @@ _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 # can't swallow a space/dash that belongs to the surrounding text. Still
 # matches runs of 13-19 digits: 1 leading digit + 12..18 more.
 _CARDLIKE_RE = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")
-_PHONE_RE = re.compile(r"\+?\d[\d\-\s]{7,}\d")
+# Boundary-guarded so a match can't start or end mid-token: without
+# (?<![\w-])/(?![\w-]), this matched into an alphanumeric tracking number
+# like "TBA123456789US" (the digit run between the letters looks exactly
+# like a phone number to this pattern). _CARDLIKE_RE doesn't need the same
+# guard — \b already refuses to sit between two word characters (a digit and
+# a letter are both \w), so it never fires mid-token to begin with.
+_PHONE_RE = re.compile(r"(?<![\w-])\+?\d[\d\-\s]{7,}\d(?![\w-])")
 
 # Free-text fields on a handoff packet (agent/tools/escalation.py's
 # HandoffFields) that can contain customer-supplied text. escalation_id,
@@ -49,30 +55,47 @@ HANDOFF_TEXT_FIELDS: tuple[str, ...] = (
     "actions_taken",
 )
 
+# An ISO-8601 date (order_date, estimated_delivery) or datetime
+# (appointments.scheduled_time) — digit runs this project writes constantly
+# in free text, and which are long enough (a date-with-time is 14 digits) to
+# otherwise be caught by _CARDLIKE_RE, or (a bare date, hyphen-separated) by
+# _PHONE_RE. Anchored so it only exempts a match that IS one of these shapes
+# start-to-end, not a substring inside something longer.
+_ISO_DATE_OR_DATETIME_RE = re.compile(r"^\d{4}-\d{2}-\d{2}(?:T\d{2}:\d{2}:\d{2})?$")
 
-def _mask_unless_order_id(replacement: str) -> Callable[[re.Match[str]], str]:
+# Digit-run shapes that are never PII in this project's own data, even
+# though they're long enough to match _CARDLIKE_RE or _PHONE_RE: this
+# project's own order-ID format, and ISO dates/datetimes. Both are checked
+# at both regex passes below — see _mask_unless_known_shape.
+_NON_PII_SHAPES: tuple[re.Pattern[str], ...] = (ORDER_ID_PATTERN, _ISO_DATE_OR_DATETIME_RE)
+
+
+def _mask_unless_known_shape(replacement: str) -> Callable[[re.Match[str]], str]:
     """Build a re.sub replacement function that masks a matched digit run
     with `replacement`, except when the match is exactly the shape of one of
-    this project's own order IDs (3-7-7 digits, hyphen-separated —
-    ORDER_ID_PATTERN). An order ID is not PII — it's the single most useful
-    identifier a human taking a handoff can be given.
+    _NON_PII_SHAPES (this project's own order IDs, or an ISO date/datetime).
+    Neither is PII — an order ID is the single most useful identifier a
+    human taking a handoff can be given, and a date is just a date.
 
     Used for both _CARDLIKE_RE and _PHONE_RE: an order ID (17 digits, 2
     separators) is exactly card-length, so it's also long enough to match the
-    looser phone pattern. If only the card-like pass exempted it, the
-    phone-like pass running right after would still catch and mask the very
-    same digits — this needs to hold at both stages, not just the first.
+    looser phone pattern; a date-with-time is 14 digits, also card-length.
+    If only the card-like pass exempted these shapes, the phone-like pass
+    running right after would still catch and mask the very same digits —
+    this needs to hold at both stages, not just the first.
     """
 
     def _mask(match: re.Match[str]) -> str:
         text = match.group()
-        return text if ORDER_ID_PATTERN.match(text) else replacement
+        if any(pattern.match(text) for pattern in _NON_PII_SHAPES):
+            return text
+        return replacement
 
     return _mask
 
 
-_mask_cardlike = _mask_unless_order_id("[redacted-number]")
-_mask_phonelike = _mask_unless_order_id("[redacted-phone]")
+_mask_cardlike = _mask_unless_known_shape("[redacted-number]")
+_mask_phonelike = _mask_unless_known_shape("[redacted-phone]")
 
 
 def redact_text(text: str) -> str:

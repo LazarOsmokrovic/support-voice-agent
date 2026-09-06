@@ -106,6 +106,60 @@ def should_end_session(tool_calls: list[dict]) -> bool:
     return any(call["name"] == "end_conversation" for call in tool_calls)
 
 
+def _turn_proposed_a_confirmation(tool_calls: list[dict]) -> bool:
+    """True if any tool call this turn was the *proposal* half of
+    propose-then-confirm (agent/confirmation.py's PendingActionGate,
+    used by issue_refund, book_appointment, cancel_appointment) — i.e. its
+    output is a dict carrying status == "pending_confirmation".
+
+    Used to keep a hedge substitution from stranding an armed confirmation
+    gate: if the customer never hears the proposal ("This order is eligible
+    for a $34.99 refund...") because a hedge was spoken instead, their next
+    "okay" would commit the action on an uninformed confirmation.
+    """
+    return any(
+        isinstance(call.get("output"), dict) and call["output"].get("status") == "pending_confirmation"
+        for call in tool_calls
+    )
+
+
+def _substitute_hedge_in_history(messages: list[dict[str, Any]], hedge: str) -> str | None:
+    """Overwrite the content of the last assistant message with `hedge`, so
+    agent/core.py's conversation history matches what the customer actually
+    heard, not the ungrounded reply that was suppressed. Without this, the
+    model's real (flagged) reply lingers in `session.agent.messages`
+    even though the hedge is what got spoken — so a later turn can restate
+    the same claim, find it sitting right there in its own prior turn, and
+    have the grounding check wrongly treat it as already-established.
+
+    Safe specifically because this is only called after a turn that ended
+    with stop_reason != "tool_use" (agent/core.py), so the final assistant
+    message should hold nothing but text content blocks. Written
+    defensively anyway: if that message isn't found, or its content isn't a
+    list of text-only blocks, this leaves history untouched and returns a
+    warning string instead of guessing. Never raises — a guardrail must
+    never corrupt the very state it's trying to protect.
+    """
+    try:
+        for message in reversed(messages):
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list) or not content:
+                return "Could not reconcile hedged reply in history: unexpected assistant message shape."
+            block_types = {
+                block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+                for block in content
+            }
+            if block_types != {"text"}:
+                return "Could not reconcile hedged reply in history: assistant message wasn't text-only."
+            message["content"] = [{"type": "text", "text": hedge}]
+            return None
+        return "Could not reconcile hedged reply in history: no assistant message found."
+    except Exception as exc:  # noqa: BLE001 — a guardrail must never corrupt history or crash the turn
+        return f"Could not reconcile hedged reply in history: {exc}"
+
+
 @dataclass
 class Session:
     """Everything one conversation needs, assembled once via create_session()."""
@@ -178,12 +232,25 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
         warnings.append(f"Could not check reply grounding this turn: {exc}")
     if findings:
         warnings.extend(findings)
-        # Rotate on how many consecutive ungrounded replies preceded this one.
-        # The tracker's counter is still the PREVIOUS count here — it is
-        # incremented inside check_escalation below — so a first flag gets
-        # HEDGE_PHRASES[0] and a second consecutive flag gets a different
-        # line, which is exactly the point of varying it.
-        reply = hedge_for(session.tracker.consecutive_ungrounded_replies)
+        # Never substitute the hedge when this turn proposed a confirmation
+        # (issue_refund / book_appointment / cancel_appointment's first,
+        # proposing call) — the customer must hear the real proposal text, or
+        # their next "okay" commits an action they were never told about.
+        # Detection and the escalation counter still run either way (below);
+        # only the substitution is skipped.
+        if not _turn_proposed_a_confirmation(result.tool_calls):
+            # Rotate on how many consecutive ungrounded replies preceded this
+            # one. The tracker's counter is still the PREVIOUS count here —
+            # it is incremented inside check_escalation below — so a first
+            # flag gets HEDGE_PHRASES[0] and a second consecutive flag gets a
+            # different line, which is exactly the point of varying it.
+            reply = hedge_for(session.tracker.consecutive_ungrounded_replies)
+            # Keep session.agent.messages in sync with what the customer
+            # actually heard — otherwise the suppressed reply lingers in
+            # history for the model to build on next turn.
+            reconcile_warning = _substitute_hedge_in_history(session.agent.messages, reply)
+            if reconcile_warning:
+                warnings.append(reconcile_warning)
 
     # Check escalation before should_end_session — a trigger here always
     # outranks the model deciding on its own the chat is naturally over.
