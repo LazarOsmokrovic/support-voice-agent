@@ -9,11 +9,12 @@ ESCALATION_WEBHOOK_URL unset means a silent no-op, the same
 optional-by-default convention as TTS_BACKEND/EMBEDDING_BACKEND
 (transport/tts.py, agent/tools/policy_rag.py).
 
-Redaction here is deliberately narrow: it only has to protect this one
-outbound payload before it leaves the system, not implement Phase 10's real
-PII pipeline (guardrails/pii.py, still an untouched stub). Not a substitute
-for that work — just enough to not ship a customer's email, phone, or
-card-like number to a third-party webhook by default.
+Redaction of the packet before it leaves the system uses guardrails.pii's
+canonical redactor (Phase 10a) — this module started with a private copy of
+it in Phase 11, since promoted there once database writes needed the same
+thing too. redact_packet() below stays a thin, named wrapper: which fields a
+handoff packet redacts is this module's concern, even though how to redact
+text is not.
 
 Signing (X-Signature-256, HMAC-SHA256) is the outbound mirror of
 transport/telephony.py's inbound X-Twilio-Signature verification.
@@ -27,78 +28,22 @@ import hmac
 import json
 import logging
 import os
-import re
-from typing import Any, Callable
+from typing import Any
 
 import httpx
 
-from agent.tools.orders import ORDER_ID_PATTERN
-
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
-# Separator only ever appears *between* digits (never trailing), so a match
-# can't swallow a space/dash that belongs to the surrounding text. Still
-# matches runs of 13-19 digits: 1 leading digit + 12..18 more.
-_CARDLIKE_RE = re.compile(r"\b\d(?:[ -]?\d){12,18}\b")
-_PHONE_RE = re.compile(r"\+?\d[\d\-\s]{7,}\d")
-
-# Free-text fields on a handoff packet (see agent/tools/escalation.py's
-# HandoffFields) that can contain customer-supplied text, and so need
-# redaction before leaving the system. escalation_id/reason/sentiment are
-# short and structured, never PII, and are left untouched.
-_REDACTED_FIELDS = ("customer_intent", "conversation_summary", "verified_account_info", "actions_taken")
-
-
-def _mask_unless_order_id(replacement: str) -> Callable[[re.Match[str]], str]:
-    """Build a re.sub replacement function that masks a matched digit run
-    with `replacement`, except when the match is exactly the shape of one of
-    this project's own order IDs (3-7-7 digits, hyphen-separated —
-    ORDER_ID_PATTERN). An order ID is not PII — it's the single most useful
-    identifier a human taking a handoff can be given.
-
-    Used for both _CARDLIKE_RE and _PHONE_RE: an order ID (17 digits, 2
-    separators) is exactly card-length, so it's also long enough to match
-    the looser phone pattern. If only the card-like pass exempted it, the
-    phone-like pass running right after would still catch and mask the very
-    same digits — this needs to hold at both stages, not just the first.
-    """
-
-    def _mask(match: re.Match[str]) -> str:
-        text = match.group()
-        return text if ORDER_ID_PATTERN.match(text) else replacement
-
-    return _mask
-
-
-_mask_cardlike = _mask_unless_order_id("[redacted-number]")
-_mask_phonelike = _mask_unless_order_id("[redacted-phone]")
-
-
-def _redact(text: str) -> str:
-    """Mask emails, card-like digit runs, and phone-like digit runs.
-
-    Card-like sequences (13-19 digits) are masked before the looser phone
-    pattern. This is not required for full coverage — _PHONE_RE's {7,}
-    quantifier would consume a card-length digit run just as completely if
-    it ran first — but running card detection first means a card-length run
-    gets labelled [redacted-number] rather than the less accurate
-    [redacted-phone].
-    """
-    text = _EMAIL_RE.sub("[redacted-email]", text)
-    text = _CARDLIKE_RE.sub(_mask_cardlike, text)
-    text = _PHONE_RE.sub(_mask_phonelike, text)
-    return text
+from guardrails.pii import HANDOFF_TEXT_FIELDS, redact_fields
 
 
 def redact_packet(packet: dict[str, Any]) -> dict[str, Any]:
     """Return a copy of `packet` with its free-text fields redacted.
-    Fields not present are left absent; non-string values pass through
-    untouched (defensive — every real caller passes strings here).
+
+    Thin wrapper over guardrails.pii — kept as a named function because
+    notify_escalation and tests/test_notifications.py both call it, and
+    because the choice of WHICH fields a handoff packet redacts is this
+    module's concern even though HOW to redact is not.
     """
-    redacted = dict(packet)
-    for field in _REDACTED_FIELDS:
-        if field in redacted and isinstance(redacted[field], str):
-            redacted[field] = _redact(redacted[field])
-    return redacted
+    return redact_fields(packet, HANDOFF_TEXT_FIELDS)
 
 
 def sign_payload(body: bytes, secret: str) -> str:
