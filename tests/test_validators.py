@@ -66,3 +66,33 @@ def test_hedge_for_rotates_deterministically():
 
 def test_hedge_phrases_are_all_non_empty():
     assert HEDGE_PHRASES and all(phrase.strip() for phrase in HEDGE_PHRASES)
+
+
+class _HostileStr:
+    """A tool output value whose __str__ itself raises.
+
+    Simulates the kind of buggy object a tool could hand back that survives
+    neither json.dumps nor the str() fallback — the detector must still fail
+    open rather than crash the turn it's meant to protect.
+    """
+
+    def __str__(self):
+        raise RuntimeError("boom")
+
+
+def test_never_raises_on_a_tool_output_whose_str_itself_raises(caplog):
+    calls = [{"name": "search_policy", "input": {}, "output": _HostileStr()}]
+    with caplog.at_level("WARNING", logger="guardrails.validators"):
+        # Deliberately unguarded: an escaping exception must fail this test.
+        result = check_reply_grounding("There's a 15% restocking fee on that.", calls)
+    assert result == []
+    assert "grounding check failed" in caplog.text
+
+
+def test_never_raises_on_a_non_dict_tool_call_entry(caplog):
+    calls = ["not-a-dict"]
+    with caplog.at_level("WARNING", logger="guardrails.validators"):
+        # Deliberately unguarded: an escaping exception must fail this test.
+        result = check_reply_grounding("There's a 15% restocking fee on that.", calls)
+    assert result == []
+    assert "grounding check failed" in caplog.text

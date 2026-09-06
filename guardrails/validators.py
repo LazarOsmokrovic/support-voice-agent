@@ -19,8 +19,11 @@ threshold from eight hand-labeled questions instead of intuition.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
+
+logger = logging.getLogger("guardrails.validators")
 
 # Tools whose output is the ground truth a reply is checked against. A turn
 # that called none of these isn't making a lookup-backed claim, so there is
@@ -110,5 +113,6 @@ def check_reply_grounding(reply: str, tool_calls: list[dict[str, Any]]) -> list[
             + ", ".join(sorted(set(unsupported)))
             + " which appears nowhere in this turn's tool output (possible hallucinated policy detail)"
         ]
-    except Exception:
+    except Exception as exc:
+        logger.warning("grounding check failed, returning no findings: %s", exc)
         return []
