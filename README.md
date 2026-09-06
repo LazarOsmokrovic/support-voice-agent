@@ -556,14 +556,21 @@ code review after the initial checkpoint fixed six findings — order-ID-shaped 
 surviving redaction, the notification retry loop's total time budget, `mark_notified`
 failures no longer discarding an already-persisted escalation, a stray real webhook call
 from the test suite, and a scheme-less URL burning all 3 retry attempts — accounting for
-the 4 additional passing tests above the original 21.) The manual
-checkpoint — actually running n8n locally, wiring it to Slack (or console) output, and
-confirming a real escalation notification arrives with a legible, redacted payload — has
-**not** been performed in this environment: no n8n instance was run, no webhook request
-left this machine, and every test above exercises `notify_escalation` offline against a
-mocked HTTP layer. Same honest-limitation convention as Phase 7-9's real-mic/real-call
-checks: the automated half is fully verified here; the hands-on half needs a real n8n
-instance running, which is yours to do.
+the 4 additional passing tests above the original 21.)
+
+The manual checkpoint has since been **performed and passed**: n8n was run locally, a
+Webhook node received a real escalation fired from a live conversation, a Code node
+verified the `X-Signature-256` HMAC, and a Slack node delivered the message — the full
+chain, not just the sender side. The payload was inspected rather than glanced at, and
+the order ID arrived **intact and readable** rather than masked as `[redacted-number]`.
+
+That last detail is worth recording, because it is the check that the automated suite
+could not make. The order-ID redaction bug found in the whole-branch review survived five
+task-level code reviews precisely because every redaction test used invented card numbers
+(`4111 1111 1111 1111`) instead of a value this system actually produces. Reading one real
+payload would have caught it in seconds. Synthetic fixtures that don't resemble real
+domain data will pass while the feature is broken — which is the durable lesson from this
+phase, more than anything in the delivery code itself.
 
 ---
 
