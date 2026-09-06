@@ -29,6 +29,8 @@ from agent.core import Agent
 from agent.prompts import SYSTEM_PROMPT
 from agent.tools import escalation, orders, policy_rag, refunds, scheduling, summary
 from agent.tools.summary import SessionSummary
+from guardrails.injection import sanitize_user_text
+from guardrails.validators import check_reply_grounding, hedge_for
 
 TOOLS = [
     orders.TOOL_SCHEMA,
@@ -148,22 +150,50 @@ class TurnOutcome:
 
 async def run_turn(session: Session, user_text: str) -> TurnOutcome:
     """Send one user turn through the agent and run the same per-turn
-    orchestration every transport needs: advance the confirmation gates,
-    time the LLM call, check escalation, maybe hand off, check whether the
-    model ended the conversation. Identical to what
-    transport/text_cli.py's loop did inline through Phase 6.
+    orchestration every transport needs: sanitize the caller's text, advance
+    the confirmation gates, time the LLM call, check the reply is grounded in
+    what the tools actually returned, check escalation, maybe hand off, check
+    whether the model ended the conversation.
+
+    Phase 10a adds the guardrails (guardrails/), all of them at this single
+    point so no transport and nothing in agent/core.py had to change.
     """
     session.gates.advance_turn()
+
+    clean_text, warnings = sanitize_user_text(user_text)
+
     start = time.perf_counter()
-    result = await session.agent.send(user_text)
+    result = await session.agent.send(clean_text)
     llm_latency = time.perf_counter() - start
 
-    warnings: list[str] = []
+    # Grounding: a flagged reply is never spoken — the customer hears a hedge
+    # instead, and a second consecutive flag hands off to a human
+    # (EscalationTracker). The "retry" is simply the customer's next turn, so
+    # this costs no extra LLM round-trip and no dead air on a live call.
+    reply = result.reply
+    try:
+        findings = check_reply_grounding(reply, result.tool_calls)
+    except Exception as exc:  # noqa: BLE001 — a guardrail must never break a turn
+        findings = []
+        warnings.append(f"Could not check reply grounding this turn: {exc}")
+    if findings:
+        warnings.extend(findings)
+        # Rotate on how many consecutive ungrounded replies preceded this one.
+        # The tracker's counter is still the PREVIOUS count here — it is
+        # incremented inside check_escalation below — so a first flag gets
+        # HEDGE_PHRASES[0] and a second consecutive flag gets a different
+        # line, which is exactly the point of varying it.
+        reply = hedge_for(session.tracker.consecutive_ungrounded_replies)
 
     # Check escalation before should_end_session — a trigger here always
     # outranks the model deciding on its own the chat is naturally over.
     try:
-        reason = await escalation.check_escalation(session.tracker, session.agent.messages, result.tool_calls)
+        reason = await escalation.check_escalation(
+            session.tracker,
+            session.agent.messages,
+            result.tool_calls,
+            ungrounded=bool(findings),
+        )
     except Exception as exc:  # noqa: BLE001 — a classifier hiccup must not crash the turn
         reason = None
         warnings.append(f"Could not run triage classification this turn: {exc}")
@@ -176,7 +206,7 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
             notice = None
             warnings.append(f"Escalation triggered ({reason}) but the handoff packet couldn't be logged: {exc}")
         return TurnOutcome(
-            reply=result.reply,
+            reply=reply,
             ended=True,
             end_reason="escalated",
             notice=notice,
@@ -186,10 +216,10 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
 
     if should_end_session(result.tool_calls):
         return TurnOutcome(
-            reply=result.reply, ended=True, end_reason="model_ended", llm_latency_seconds=llm_latency, warnings=warnings
+            reply=reply, ended=True, end_reason="model_ended", llm_latency_seconds=llm_latency, warnings=warnings
         )
 
-    return TurnOutcome(reply=result.reply, llm_latency_seconds=llm_latency, warnings=warnings)
+    return TurnOutcome(reply=reply, llm_latency_seconds=llm_latency, warnings=warnings)
 
 
 @dataclass
