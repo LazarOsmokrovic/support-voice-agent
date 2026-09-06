@@ -378,6 +378,8 @@ Once both API keys were working again, a live run over real speech surfaced two 
 1. **An empty reply could reach TTS.** `agent/core.py`'s `_extract_text` can in principle return `""` for a turn (no text blocks in the final response), and `ClaudeTurnProcessor` was pushing that straight to `DeepgramTTSService` regardless. Deepgram would open a TTS context, produce no audio, and the service's own 3-second pause-watchdog would log `"no BotStartedSpeakingFrame ... force-resuming"` — a real, if rare, edge case. **Fixed**: `_handle_final_transcript` now skips pushing a `TextFrame` when the reply is empty/whitespace-only, printing a note instead. Every turn also now prints `[reply] N chars: '...'` so this is visible, not silent, if it recurs. Locked in by `test_claude_turn_processor_skips_tts_for_an_empty_reply`.
 2. **Self-interruption from mic/speaker echo.** The bot's voice would cut off mid-sentence and need several attempts to get a full sentence out. Tracing Deepgram Flux's `should_interrupt=True` default (which calls `broadcast_interruption()` the instant Flux detects speech start) against `DeepgramTTSService`'s interruption handler (which resets `_turn_context_id = None`, matching a `"no context ID provided"` log line seen at the same moment) pointed at the real cause: with a laptop's built-in mic and speakers and no acoustic echo cancellation, the mic picks up the bot's *own* voice, Flux reads it as the caller barging in, and the bot interrupts itself — repeatedly. **Not fixed in code**: real AEC needs the exact reference signal correlated against the mic input (what a WebRTC-based transport — Daily, LiveKit, or Phase 9's Twilio — provides automatically; raw local PyAudio I/O doesn't). The only fix available in code — muting the mic while the bot talks (mirroring Pipecat's own `AlwaysUserMuteStrategy`) — would also disable genuine barge-in during exactly the window this phase is supposed to demonstrate it in, so it wasn't worth trading away for local testing. **Deferred**: test real interruption with headphones, which sidesteps the echo entirely.
 
+**Revisited later and fixed, opt-in** (`MicMuteGate`, `transport/pipecat_processors.py`). The tradeoff above is real and unchanged — muting still costs genuine barge-in for as long as the bot is speaking — but scoping it to an opt-in flag makes it acceptable: `build_pipeline(..., mute_mic_during_tts=True)` defaults to **off**, `transport/pipeline.py` (local mic) turns it on, and `transport/telephony.py` deliberately does not, since a real phone call has no local-speaker-into-local-mic loop and muting would cost a caller their barge-in for no benefit. The gate sits between `transport.input()` and the STT service, watching the upstream `BotStartedSpeaking`/`BotStoppedSpeakingFrame` pair and pushing `STTMuteFrame` downstream so Deepgram drops audio while the bot talks — the mic hardware stays on, only what reaches the STT service is gated. Three tests cover it (mute on start, unmute on stop, unrelated frames pass through untouched).
+
 ### Checkpoint result
 
 All 8 of `tests/test_pipeline.py`'s tests pass (mocked, no audio/network — including the empty-reply fix above), and the rest of the suite is unaffected. Live-tested by hand over real speech: order status, refunds, and escalation all worked correctly end to end. **Accepted as Done on explicit sign-off**, noted honestly rather than silently assumed: the literal checkpoint — "stress-test with rapid interruptions and overlapping speech" — needs headphones to test genuine barge-in without the self-echo issue above, and that hands-on stress test is deferred to a future session rather than completed here.
@@ -562,3 +564,65 @@ left this machine, and every test above exercises `notify_escalation` offline ag
 mocked HTTP layer. Same honest-limitation convention as Phase 7-9's real-mic/real-call
 checks: the automated half is fully verified here; the hands-on half needs a real n8n
 instance running, which is yours to do.
+
+---
+
+## Conversation polish — greeting and acknowledgment (Done)
+
+Not a phase: two gaps found by actually talking to the agent rather than by any test,
+fixed together because both are about how the conversation *feels* rather than what it
+can do.
+
+### The agent never said hello
+
+Every transport waited for the customer to speak first. In the text CLI that's merely
+odd; on a **phone call it reads as a dead line** — the caller answers, hears nothing, and
+starts wondering whether the call connected at all.
+
+`GREETING` in `agent/prompts.py` is now spoken the instant a session opens. It is
+deliberately a **constant, not a model-generated line**, for two reasons: a greeting is
+entirely predictable, which is CLAUDE.md rule 7's territory (deterministic code for
+predictable steps), and generating one would mean an API round-trip *precisely* while the
+caller sits in silence waiting — the same dead-air problem Phase 11 hit on the escalation
+webhook, in the one place it would be most obvious.
+
+It is **not** seeded into `Agent.messages`: the Messages API requires the first message in
+a conversation to be the user's, so an assistant-first turn would be rejected outright.
+`SYSTEM_PROMPT` instead tells the model it has already greeted the customer, so it doesn't
+open its first real reply with a second "Hello, how can I help?".
+
+Rendered per transport, keeping `agent/` I/O-agnostic (rule 5): `transport/text_cli.py`
+prints it, `transport/voice_local.py` speaks it through TTS before the first listen, and
+`ClaudeTurnProcessor` pushes it on `StartFrame` — which covers the local Pipecat pipeline
+and Twilio at once. The `StartFrame` is forwarded downstream *first*, so the TTS service is
+initialized by the time the greeting text reaches it.
+
+### The agent had no sympathy
+
+Asked about a wrong or damaged order, it went straight to "what's your order ID?". The
+old tone instruction was partly to blame — it asked for "concise, and to the point", with
+nothing about acknowledgment.
+
+`SYSTEM_PROMPT` now requires one short sentence acknowledging the problem *before*
+anything else, and explicitly forbids opening with a request for an order number when the
+customer has just reported something going wrong. Capped at **one** sentence, stated
+plainly in the prompt: on a spoken call, repeated or effusive apologies sound insincere
+and waste the caller's time.
+
+### Tests
+
+`tests/test_pipecat_processors.py` gains two: the greeting is pushed on `StartFrame`
+(after `StartFrame` itself is forwarded, in the right order), and it costs **no model
+call** — the whole point of the constant.
+
+The empathy half is a prompt change, so no test can assert it; it is probabilistic by
+nature. That is stated here rather than papered over with a test that would only be
+checking the model's mood on one lucky run.
+
+### Checkpoint result
+
+All tests pass (127 total, up from 125; the 13 pre-existing API-key-gated live-test
+failures are unchanged and unrelated). Both halves were **verified live**: the greeting
+plays cleanly on a real Twilio call with no clipping — the one risk flagged during design,
+since pushing at `StartFrame` could in principle beat the media path being ready — and the
+agent acknowledges a reported problem before asking for details.
