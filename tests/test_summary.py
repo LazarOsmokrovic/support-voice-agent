@@ -71,6 +71,27 @@ def test_log_ticket_writes_row_to_tickets_table(tmp_path, monkeypatch):
     assert row["follow_up_needed"] == 0
 
 
+def test_log_ticket_redacts_pii_before_writing(tmp_path, monkeypatch):
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_redacted_ticket.db")
+    mock_db.reset_and_seed()
+    customer_id = mock_db.CUSTOMERS[0][0]
+    summary = SessionSummary(
+        issue="Customer emailed jane.doe@example.com about a late order.",
+        resolution="Called them back on 555-123-4567 and resolved it.",
+        sentiment="neutral",
+        follow_up_needed=False,
+    )
+
+    ticket_id = log_ticket(customer_id, summary)
+
+    with mock_db.get_connection() as conn:
+        row = conn.execute("SELECT issue, resolution FROM tickets WHERE ticket_id = ?", (ticket_id,)).fetchone()
+    assert "jane.doe@example.com" not in row["issue"]
+    assert "[redacted-email]" in row["issue"]
+    assert "555-123-4567" not in row["resolution"]
+    assert "[redacted-phone]" in row["resolution"]
+
+
 @pytest.mark.asyncio
 async def test_summarize_session_returns_parsed_summary_from_mocked_client():
     fake_summary = SessionSummary(

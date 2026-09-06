@@ -46,6 +46,7 @@ from agent.prompts import CLASSIFICATION_PROMPT, HANDOFF_PROMPT
 from agent.tools.notifications import notify_escalation
 from agent.tools.summary import format_transcript
 from data.mock_db import get_connection
+from guardrails.pii import HANDOFF_TEXT_FIELDS, redact_fields
 
 logger = logging.getLogger("agent.tools.escalation")
 
@@ -56,6 +57,14 @@ logger = logging.getLogger("agent.tools.escalation")
 # tests/test_text_cli.py, not just picked arbitrarily.
 NEGATIVE_SENTIMENT_ESCALATION_THRESHOLD = 2
 FAILED_LOOKUP_ESCALATION_THRESHOLD = 2
+
+# Phase 10a: how many consecutive replies the grounding detector
+# (guardrails/validators.py) may flag before handing off. Matched to the two
+# thresholds above for consistency, but deliberately a starting value — a
+# hallucination is weaker evidence of trouble than two consecutively angry
+# messages, so 3 is arguable. Sub-phase 10c's eval suite should settle it
+# from measurement rather than intuition.
+UNGROUNDED_REPLY_ESCALATION_THRESHOLD = 2
 
 
 class TurnClassification(BaseModel):
@@ -125,8 +134,14 @@ class EscalationTracker:
 
     consecutive_negative_turns: int = 0
     consecutive_failed_lookups: int = 0
+    consecutive_ungrounded_replies: int = 0
 
-    def record_turn(self, classification: TurnClassification, tool_calls: list[dict[str, Any]]) -> str | None:
+    def record_turn(
+        self,
+        classification: TurnClassification,
+        tool_calls: list[dict[str, Any]],
+        ungrounded: bool = False,
+    ) -> str | None:
         """Update counters from this turn; return an escalation reason the
         moment a trigger fires, else None.
 
@@ -134,6 +149,10 @@ class EscalationTracker:
         explicit human request, or a policy-restricted topic) short-circuit
         without touching the streak counters — nothing else matters once
         one fires.
+
+        ungrounded — whether guardrails/validators.py flagged this turn's
+        reply as unsupported by tool output; two consecutive flags hand off
+        to a human.
         """
         tool_escalation = _tool_signaled_escalation(tool_calls)
         if tool_escalation:
@@ -159,6 +178,13 @@ class EscalationTracker:
         if self.consecutive_failed_lookups >= FAILED_LOOKUP_ESCALATION_THRESHOLD:
             return "repeated failed lookups"
 
+        if ungrounded:
+            self.consecutive_ungrounded_replies += 1
+        else:
+            self.consecutive_ungrounded_replies = 0
+        if self.consecutive_ungrounded_replies >= UNGROUNDED_REPLY_ESCALATION_THRESHOLD:
+            return "repeated ungrounded replies"
+
         return None
 
 
@@ -166,6 +192,7 @@ async def check_escalation(
     tracker: EscalationTracker,
     messages: list[dict[str, Any]],
     tool_calls: list[dict[str, Any]],
+    ungrounded: bool = False,
     client: anthropic.AsyncAnthropic | None = None,
 ) -> str | None:
     """classify_turn + tracker.record_turn in one call — shared by
@@ -173,7 +200,7 @@ async def check_escalation(
     apart from each other.
     """
     classification = await classify_turn(messages, client=client)
-    return tracker.record_turn(classification, tool_calls)
+    return tracker.record_turn(classification, tool_calls, ungrounded=ungrounded)
 
 
 class HandoffFields(BaseModel):
@@ -258,7 +285,11 @@ async def create_handoff_packet(
     affects this return value — persisting the packet must not depend on
     whether anyone was actually told about it.
     """
-    fields = await _infer_handoff_fields(customer_id, messages, client=client)
+    inferred = await _infer_handoff_fields(customer_id, messages, client=client)
+    # Redact ONCE, here, so the DB row and the outbound webhook carry
+    # identical text. notify_escalation redacts again defensively for any
+    # future caller; redaction is idempotent, so that second pass is a no-op.
+    fields = HandoffFields(**redact_fields(inferred.model_dump(), HANDOFF_TEXT_FIELDS))
     escalation_id = log_escalation(customer_id, reason, fields)
     packet = {"escalation_id": escalation_id, "reason": reason, **fields.model_dump()}
 

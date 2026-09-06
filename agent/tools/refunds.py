@@ -30,6 +30,7 @@ from agent.confirmation import PendingActionGate
 from agent.tools.orders import ORDER_ID_PATTERN
 from agent.tools.policy_rag import search_policy
 from data.mock_db import get_connection
+from guardrails.pii import redact_text
 
 # Both windows are counted from the order's estimated_delivery date, the
 # closest thing the mock schema has to an actual delivery date. Kept as
@@ -198,13 +199,15 @@ def issue_refund(
             "policy_reference": policy_reference,
         }
 
-    # 6. Issue.
+    # 6. Issue. refunds.reason is the customer's own stated reason, verbatim
+    # from the model — a storage boundary, so it's redacted before the
+    # write, same as summary.py's log_ticket.
     issued_at = datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
         cursor = conn.execute(
             "INSERT INTO refunds (order_id, customer_id, amount, item_condition, reason, issued_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (order_id, customer_id, amount, condition, reason, issued_at),
+            (order_id, customer_id, amount, condition, redact_text(reason), issued_at),
         )
         refund_id = cursor.lastrowid
         conn.execute("UPDATE orders SET status = 'Refunded' WHERE order_id = ?", (order_id,))
