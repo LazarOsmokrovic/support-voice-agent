@@ -33,6 +33,7 @@ from pydantic import BaseModel
 from agent.core import DEFAULT_MODEL
 from agent.prompts import SUMMARY_PROMPT
 from data.mock_db import get_connection
+from guardrails.pii import redact_text
 
 END_CONVERSATION_SCHEMA: dict[str, Any] = {
     "name": "end_conversation",
@@ -128,6 +129,9 @@ def log_ticket(customer_id: str, summary: SessionSummary, created_at: str | None
     `customer_id` must already exist in the customers table — tickets has a
     foreign-key constraint on it (enforced via PRAGMA foreign_keys = ON in
     data/mock_db.py's get_connection()).
+
+    Free-text fields are redacted before the write (guardrails/pii.py) — the
+    tickets table is a storage boundary.
     """
     created_at = created_at or datetime.now(timezone.utc).isoformat()
     with get_connection() as conn:
@@ -137,8 +141,8 @@ def log_ticket(customer_id: str, summary: SessionSummary, created_at: str | None
             "VALUES (?, ?, ?, ?, ?, ?)",
             (
                 customer_id,
-                summary.issue,
-                summary.resolution,
+                redact_text(summary.issue),
+                redact_text(summary.resolution),
                 summary.sentiment,
                 int(summary.follow_up_needed),
                 created_at,

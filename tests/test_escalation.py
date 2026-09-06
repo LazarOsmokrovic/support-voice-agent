@@ -311,6 +311,47 @@ async def test_create_handoff_packet_still_returns_and_logs_when_mark_notified_r
     assert row["customer_id"] == customer_id
 
 
+@pytest.mark.asyncio
+async def test_create_handoff_packet_redacts_pii_in_packet_and_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_handoff_redaction.db")
+    mock_db.reset_and_seed()
+    customer_id = mock_db.CUSTOMERS[0][0]
+    order_id = mock_db.ORDERS[0][0]
+
+    fake_fields = HandoffFields(
+        customer_intent=f"Refund for order {order_id}, contact jane.doe@example.com",
+        conversation_summary="Customer called from 555-123-4567 about a refund.",
+        verified_account_info=f"Customer ID {customer_id}",
+        actions_taken="Looked up the order.",
+        sentiment="negative",
+    )
+    fake_response = MagicMock()
+    fake_response.parsed_output = fake_fields
+    fake_client = MagicMock()
+    fake_client.messages.parse = AsyncMock(return_value=fake_response)
+    monkeypatch.setattr(escalation, "notify_escalation", AsyncMock(return_value=True))
+
+    packet = await create_handoff_packet(
+        customer_id, [{"role": "user", "content": "refund please"}], "explicit request for a human", client=fake_client
+    )
+
+    # PII gone from both the returned packet and the persisted row...
+    assert "jane.doe@example.com" not in packet["customer_intent"]
+    assert "555-123-4567" not in packet["conversation_summary"]
+    # ...but the order ID, which is not PII and is the most useful thing a
+    # human taking this handoff can be given, survives intact.
+    assert order_id in packet["customer_intent"]
+
+    with mock_db.get_connection() as conn:
+        row = conn.execute(
+            "SELECT customer_intent, conversation_summary FROM escalations WHERE escalation_id = ?",
+            (packet["escalation_id"],),
+        ).fetchone()
+    assert "jane.doe@example.com" not in row["customer_intent"]
+    assert "555-123-4567" not in row["conversation_summary"]
+    assert order_id in row["customer_intent"]
+
+
 # --- classify_turn: live checks that the model's judgment actually matches intent ---
 
 

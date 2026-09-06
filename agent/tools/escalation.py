@@ -46,6 +46,7 @@ from agent.prompts import CLASSIFICATION_PROMPT, HANDOFF_PROMPT
 from agent.tools.notifications import notify_escalation
 from agent.tools.summary import format_transcript
 from data.mock_db import get_connection
+from guardrails.pii import HANDOFF_TEXT_FIELDS, redact_fields
 
 logger = logging.getLogger("agent.tools.escalation")
 
@@ -258,7 +259,11 @@ async def create_handoff_packet(
     affects this return value — persisting the packet must not depend on
     whether anyone was actually told about it.
     """
-    fields = await _infer_handoff_fields(customer_id, messages, client=client)
+    inferred = await _infer_handoff_fields(customer_id, messages, client=client)
+    # Redact ONCE, here, so the DB row and the outbound webhook carry
+    # identical text. notify_escalation redacts again defensively for any
+    # future caller; redaction is idempotent, so that second pass is a no-op.
+    fields = HandoffFields(**redact_fields(inferred.model_dump(), HANDOFF_TEXT_FIELDS))
     escalation_id = log_escalation(customer_id, reason, fields)
     packet = {"escalation_id": escalation_id, "reason": reason, **fields.model_dump()}
 
