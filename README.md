@@ -703,12 +703,19 @@ the proper column instead.
 `check_reply_grounding(reply, tool_calls) -> list[str]` is one pure function, no I/O, no
 LLM call. Its docstring says plainly what it is **not**: it does not verify entailment,
 and a reply it passes is not thereby proven correct — overstating that would be worse than
-the gap itself. What it actually does: if the turn called `search_policy` or
-`get_order_status`, every policy-shaped number in the reply (a dollar amount, a
-percentage, a day/week/month count) is checked against every number that appears anywhere
-in that turn's tool output (serialized to text — tool outputs are heterogeneous dicts, so
-walking their shape isn't worth it when any number anywhere in them is legitimate
-grounding). A number attached to none of those units — the classic "in 2 ways" — is
+the gap itself. What it actually does: only a turn that called `search_policy` triggers the
+check at all (`GROUNDING_TRIGGER_TOOLS = ("search_policy",)`). `get_order_status` used to be
+a trigger too, but that gated on the wrong signal — an order-lookup turn that restates a real
+policy number already established earlier in the conversation ("you have 30 days from
+delivery") is ordinary correct behavior, not a hallucination, and flagging it there produced
+exactly that false positive. The distinction that still holds: once triggered, every
+policy-shaped number in the reply (a dollar amount, a percentage, a day/week/month count) is
+checked against every number that appears anywhere in *that turn's* tool output (serialized
+to text — tool outputs are heterogeneous dicts, so walking their shape isn't worth it when
+any number anywhere in them is legitimate grounding), regardless of which tool produced that
+output — a number grounded by `get_order_status`'s own result still counts; only the trigger
+condition narrowed, not what counts as grounding. A number attached to none of those units —
+the classic "in 2 ways" — is
 deliberately never checked; under the ladder below, a false positive costs the customer an
 actual interaction, so the detector starts conservative on purpose. It never raises: a
 malformed tool call or an unserializable output logs via
@@ -725,6 +732,15 @@ identical robotic line) live here too, since they're this module's concern.
 | Reply is an honest abstention ("I don't have that information") | Nothing happens — it asserts no unsupported fact, so it can't trip the detector |
 | First ungrounded reply | Suppressed; a hedge is spoken instead. Streak increments. |
 | Second **consecutive** ungrounded reply | Escalates to a human via the existing handoff path |
+
+One exception to that first row: if the turn's flagged tool call was the *proposing* half
+of confirm-then-act (`issue_refund`, `book_appointment`, or `cancel_appointment`'s first
+call, whose output carries `status == "pending_confirmation"`), the real reply is spoken
+instead of a hedge. Suppressing "This order is eligible for a $34.99 refund. Should I go
+ahead?" would leave the confirmation gate armed while the customer never heard the
+question, so their next "okay" would commit an action on a confirmation they were never
+told about. The finding is still recorded and still counts toward the escalation streak —
+only the substitution is skipped.
 
 Two properties worth calling out: **zero added latency** — the "second chance" is simply
 the customer's next turn, not a synchronous regeneration, so there's no extra LLM
@@ -773,11 +789,17 @@ to a measured value (0.55) off eight hand-labeled questions.
 
 ### `agent/session.py::run_turn` — the single wiring point
 
-One function gained four new steps, in order: sanitize the caller's text; send the
-sanitized text (unchanged `Agent.send`); check the reply's grounding, and substitute a
-hedge if flagged; pass `ungrounded=bool(findings)` into `check_escalation`. Findings and
-sanitizer warnings both ride the existing `TurnOutcome.warnings` field, so no transport
-needed a code change and nothing under `transport/` was touched. `check_reply_grounding`
+One function gained six new steps, in order: sanitize the caller's text; send the
+sanitized text (unchanged `Agent.send`); check the reply's grounding; substitute a hedge if
+flagged — *unless* this turn proposed a confirmation, the carve-out described in the ladder
+above, which keeps a hedge from stranding an armed `PendingActionGate`; when a hedge is
+substituted, overwrite the final assistant message in `session.agent.messages` with the
+hedge text (`_substitute_hedge_in_history`) so the model's own conversation history matches
+what the customer actually heard — without this, the model believes it already gave the
+(suppressed) answer, and the hedge's promise to "double-check" is never kept on a later
+turn; and pass `ungrounded=bool(findings)` into `check_escalation`. Findings and sanitizer
+warnings both ride the existing `TurnOutcome.warnings` field, so no transport needed a code
+change and nothing under `transport/` was touched. `check_reply_grounding`
 and `check_escalation` are each wrapped in their own `try`/`except` — same discipline
 `run_turn` already used for classification failures, since a guardrail must never break
 the turn it's meant to protect. `sanitize_user_text` is called bare, with no wrapping: it
@@ -786,21 +808,26 @@ for a `try`/`except` to guard against.
 
 ### Tests
 
-- `tests/test_pii.py` (new, 10 tests) — email/card/phone masking, the order-ID exemption at
+- `tests/test_pii.py` (new, 13 tests) — email/card/phone masking, the order-ID exemption at
   both the card-like and phone-like stage, idempotence, `redact_fields` on absent and
   non-string fields.
-- `tests/test_validators.py` (new, 11 tests) — a number absent from retrieved chunks
-  flagged, a number present left clean, an honest abstention left clean, `hedge_for`
-  rotation deterministic, a malformed tool call caught rather than raising.
+- `tests/test_validators.py` (new, 14 tests) — a number absent from retrieved chunks
+  flagged, a number present left clean, an honest abstention left clean, a number grounded
+  in a different tool's output accepted, `get_order_status` alone confirmed not to trigger
+  the check while still able to ground a claim once a policy search also ran that turn,
+  `hedge_for` rotation deterministic, a malformed tool call caught rather than raising.
 - `tests/test_injection.py` (new, 7 tests) — role-marker spoofing neutralized,
   instruction-override phrasing flagged but left verbatim, ordinary speech untouched.
 - `tests/test_escalation.py` — 5 new tests: a single ungrounded reply does not escalate,
   two consecutive ones do, one ungrounded then one grounded reply resets the streak, the
   new parameter's default doesn't disturb existing callers, and `create_handoff_packet`
   redacts PII in both the persisted row and the packet handed to the webhook.
-- `tests/test_session.py` — 3 new tests: a hedge is spoken and the ungrounded number never
-  leaks into the reply, a grounded reply is left byte-for-byte untouched, and an injection
-  attempt is flagged and neutralized before it reaches `Agent.send`.
+- `tests/test_session.py` — 5 new tests: a hedge is spoken and the ungrounded number never
+  leaks into the reply; the hedge is reconciled back into `session.agent.messages` so the
+  model's history matches what the customer actually heard; a turn that proposed a
+  confirmation keeps the real reply instead of substituting a hedge; a grounded reply is
+  left byte-for-byte untouched; and an injection attempt is flagged and neutralized before
+  it reaches `Agent.send`.
 - `tests/test_summary.py` — 1 new test: `log_ticket` redacts before the write.
 - `tests/test_notifications.py` — **unmodified**, passing as-is, the proof the `pii.py`
   extraction preserved Phase 11's behavior exactly.
@@ -810,8 +837,8 @@ in this project.
 
 ### Checkpoint result
 
-37 new tests across the six files above, all passing. Full suite: `python -m pytest -q`
-reports **164 passed, 13 failed** — the same 13 pre-existing, API-key-gated live-test
+45 new tests across the six files above, all passing. Full suite: `python -m pytest -q`
+reports **174 passed, 13 failed** — the same 13 pre-existing, API-key-gated live-test
 failures called out in every phase back through Phase 7 (stale/invalid Anthropic/Deepgram
 credentials in this environment), none of them in Phase 10a's own files.
 
