@@ -35,11 +35,14 @@ import time
 
 from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     EndFrame,
     Frame,
     InputDTMFFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    STTMuteFrame,
     TextFrame,
     TranscriptionFrame,
     TTSAudioRawFrame,
@@ -166,6 +169,41 @@ class ClaudeTurnProcessor(FrameProcessor):
             await self.push_frame(EndFrame())
 
 
+class MicMuteGate(FrameProcessor):
+    """Mutes the STT service for the duration the bot is speaking, so the
+    local mic never sends the bot's own voice back to Deepgram as if it were
+    the caller talking over it.
+
+    This is the fix PROGRESS.md's Phase 8 entry considered and deliberately
+    did *not* apply, because it trades away genuine barge-in along with the
+    self-echo it stops: there's no way to tell "the speaker playing the bot's
+    voice" apart from "the caller actually interrupting" without real
+    acoustic echo cancellation, so muting stops both for as long as the bot
+    is talking. Revisited and accepted as a conscious tradeoff for local
+    mic/speaker testing without headphones.
+
+    Sits between transport.input() and the STT service. BotStartedSpeaking/
+    BotStoppedSpeakingFrame are emitted by BaseOutputTransport and travel
+    upstream all the way back from transport.output() to transport.input(),
+    passing through this processor on the way — so no extra wiring is needed
+    to observe them. On each one, this pushes an STTMuteFrame *downstream*
+    (STTService.process_frame() handles it regardless of the direction it
+    arrives from) to actually toggle the STT service's own `_muted` flag,
+    which makes it drop incoming audio without transcribing it — the mic
+    hardware itself stays on, only what reaches Deepgram is gated.
+    """
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, BotStartedSpeakingFrame):
+            await self.push_frame(STTMuteFrame(mute=True), FrameDirection.DOWNSTREAM)
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            await self.push_frame(STTMuteFrame(mute=False), FrameDirection.DOWNSTREAM)
+
+        await self.push_frame(frame, direction)
+
+
 class LatencyLogger(FrameProcessor):
     """Sits right before transport.output(). Every processor forwards frames
     it doesn't act on, so both UserStoppedSpeakingFrame (end of the caller's
@@ -221,26 +259,37 @@ def get_pipecat_tts_service():
     )
 
 
-def build_pipeline(transport: BaseTransport, session: Session) -> Pipeline:
+def build_pipeline(
+    transport: BaseTransport, session: Session, *, mute_mic_during_tts: bool = False
+) -> Pipeline:
     """Assemble the one pipeline shape both transports share:
 
-        transport.input() -> DeepgramFluxSTTService -> ClaudeTurnProcessor
-            -> TTS service -> LatencyLogger -> transport.output()
+        transport.input() -> [MicMuteGate] -> DeepgramFluxSTTService
+            -> ClaudeTurnProcessor -> TTS service -> LatencyLogger
+            -> transport.output()
 
     `transport` is the only thing that differs between transport/pipeline.py
     (LocalAudioTransport) and transport/telephony.py (FastAPIWebsocketTransport
     + TwilioFrameSerializer) — everything downstream of "raw audio in" is
     identical, which is the whole point of extracting it here.
+
+    `mute_mic_during_tts` is opt-in and defaults off, so telephony.py's call
+    (which doesn't pass it) is unaffected: a real caller's phone has no local
+    speaker feeding back into a local mic, so there's no self-echo problem to
+    fix there, and muting would only cost a real caller their barge-in for no
+    benefit. transport/pipeline.py (local mic/speaker) opts in — see
+    MicMuteGate's own docstring for the barge-in tradeoff that comes with it.
     """
     stt = DeepgramFluxSTTService(api_key=os.getenv("DEEPGRAM_API_KEY"))
     tts = get_pipecat_tts_service()
-    return Pipeline(
-        [
-            transport.input(),
-            stt,
-            ClaudeTurnProcessor(session=session),
-            tts,
-            LatencyLogger(),
-            transport.output(),
-        ]
-    )
+    stages = [transport.input()]
+    if mute_mic_during_tts:
+        stages.append(MicMuteGate())
+    stages += [
+        stt,
+        ClaudeTurnProcessor(session=session),
+        tts,
+        LatencyLogger(),
+        transport.output(),
+    ]
+    return Pipeline(stages)

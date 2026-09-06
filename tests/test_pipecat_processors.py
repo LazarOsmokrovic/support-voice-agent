@@ -40,11 +40,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
+    BotStartedSpeakingFrame,
+    BotStoppedSpeakingFrame,
     EndFrame,
     Frame,
     InputDTMFFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    STTMuteFrame,
     StartFrame,
     TextFrame,
     TranscriptionFrame,
@@ -56,7 +59,7 @@ from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from agent.session import create_session
 from agent.tools import escalation
 from agent.tools.escalation import TurnClassification
-from transport.pipecat_processors import ClaudeTurnProcessor, LatencyLogger
+from transport.pipecat_processors import ClaudeTurnProcessor, LatencyLogger, MicMuteGate
 
 
 class _CapturingSink(FrameProcessor):
@@ -84,6 +87,22 @@ async def _started(processor: FrameProcessor) -> _CapturingSink:
     await processor.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
     sink.frames.clear()
     return sink
+
+
+async def _started_both_ways(processor: FrameProcessor) -> tuple[_CapturingSink, _CapturingSink]:
+    """Like _started(), but also links a sink upstream (processor._prev) so
+    tests can inspect what a processor pushes with FrameDirection.UPSTREAM —
+    MicMuteGate needs this since it forwards Bot*SpeakingFrame upstream (back
+    toward transport.input()) while pushing STTMuteFrame downstream (toward
+    the STT service). Returns (upstream_sink, downstream_sink).
+    """
+    upstream_sink = _CapturingSink(enable_direct_mode=True)
+    downstream_sink = _CapturingSink(enable_direct_mode=True)
+    upstream_sink.link(processor)
+    processor.link(downstream_sink)
+    await processor.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+    downstream_sink.frames.clear()
+    return upstream_sink, downstream_sink
 
 
 def _transcript(text: str) -> TranscriptionFrame:
@@ -340,3 +359,46 @@ async def test_latency_logger_forwards_every_frame(capsys):
 
     assert audio_frame in sink.frames
     assert any(isinstance(f, UserStoppedSpeakingFrame) for f in sink.frames)
+
+
+@pytest.mark.asyncio
+async def test_mic_mute_gate_mutes_stt_when_the_bot_starts_speaking():
+    processor = MicMuteGate(enable_direct_mode=True)
+    upstream_sink, downstream_sink = await _started_both_ways(processor)
+
+    frame = BotStartedSpeakingFrame()
+    await processor.process_frame(frame, FrameDirection.UPSTREAM)
+
+    # STTMuteFrame goes downstream (toward the STT service sitting right
+    # after this gate in the real pipeline); the original frame keeps
+    # travelling upstream (toward transport.input()) unmodified.
+    assert [type(f) for f in downstream_sink.frames] == [STTMuteFrame]
+    assert downstream_sink.frames[0].mute is True
+    assert upstream_sink.frames == [frame]
+
+
+@pytest.mark.asyncio
+async def test_mic_mute_gate_unmutes_stt_when_the_bot_stops_speaking():
+    processor = MicMuteGate(enable_direct_mode=True)
+    upstream_sink, downstream_sink = await _started_both_ways(processor)
+
+    frame = BotStoppedSpeakingFrame()
+    await processor.process_frame(frame, FrameDirection.UPSTREAM)
+
+    assert [type(f) for f in downstream_sink.frames] == [STTMuteFrame]
+    assert downstream_sink.frames[0].mute is False
+    assert upstream_sink.frames == [frame]
+
+
+@pytest.mark.asyncio
+async def test_mic_mute_gate_passes_through_unrelated_frames_untouched():
+    processor = MicMuteGate(enable_direct_mode=True)
+    upstream_sink, downstream_sink = await _started_both_ways(processor)
+
+    downstream_frame = TextFrame(text="irrelevant")
+    await processor.process_frame(downstream_frame, FrameDirection.DOWNSTREAM)
+
+    # No STTMuteFrame synthesized, and the frame keeps going the direction it
+    # was already travelling.
+    assert downstream_sink.frames == [downstream_frame]
+    assert upstream_sink.frames == []

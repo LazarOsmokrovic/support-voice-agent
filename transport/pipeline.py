@@ -35,7 +35,13 @@ async def main() -> None:
     session = create_session(customer_id)
 
     transport = LocalAudioTransport(LocalAudioTransportParams(audio_in_enabled=True, audio_out_enabled=True))
-    pipeline = build_pipeline(transport, session)
+    # mute_mic_during_tts=True: local mic/speaker have no acoustic echo
+    # cancellation, so without headphones the mic picks up the bot's own
+    # voice and Flux reads it as the caller barging in (PROGRESS.md's Phase 8
+    # note). Muting the STT service while the bot talks stops that at the
+    # cost of real barge-in during that window too — see MicMuteGate's
+    # docstring in transport/pipecat_processors.py for the full tradeoff.
+    pipeline = build_pipeline(transport, session, mute_mic_during_tts=True)
 
     worker = PipelineWorker(pipeline, params=PipelineParams(enable_metrics=True))
     runner = WorkerRunner()
@@ -43,7 +49,8 @@ async def main() -> None:
 
     print(
         f"\nVoice session started for {customer_id} (real-time). Speak naturally — "
-        "you can interrupt the bot at any time by talking over it. Ctrl+C to abort.\n"
+        "note the mic is muted while the bot is talking (mute_mic_during_tts), so wait "
+        "for it to finish before replying. Ctrl+C to abort.\n"
     )
 
     await runner.run()
