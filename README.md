@@ -646,8 +646,11 @@ full breakdown and `docs/superpowers/specs/2026-09-05-phase-10a-model-boundary-g
 for the full design rationale). 10a is the first slice: PII redaction, post-LLM grounding,
 and injection defense — three small, single-responsibility modules under `guardrails/`,
 wired at the one function that already orchestrates a turn. `agent/core.py` needed zero
-changes, still untouched since Phase 0 — the project's best evidence that the I/O
-decoupling (CLAUDE.md rule 5) actually held.
+changes, and stays **unchanged since Phase 4** (its last edit added the `output` key to
+`TurnResult.tool_calls`, which the escalation tracker reads) — surviving local voice
+(Phase 7), the Pipecat pipeline (Phase 8), Twilio telephony (Phase 9), the notification
+work (Phase 11), and now these guardrails without a single further edit. That's the
+project's best evidence that the I/O decoupling (CLAUDE.md rule 5) actually held.
 
 ### `guardrails/pii.py` (new) — canonical redaction, extracted on the second use case
 
@@ -753,7 +756,7 @@ sanitized version ever reaches `Agent.send`.
 
 ### `agent/tools/escalation.py` — one new trigger
 
-`EscalationTracker` gains a fourth trigger of the same shape as the two existing
+`EscalationTracker` gains a new trigger, the same shape as the two existing
 consecutive-streak ones: `consecutive_ungrounded_replies` and
 `UNGROUNDED_REPLY_ESCALATION_THRESHOLD = 2`. Two consecutive ungrounded turns escalate; any
 grounded turn resets the streak. `record_turn` and `check_escalation` both grow an
@@ -771,9 +774,12 @@ One function gained four new steps, in order: sanitize the caller's text; send t
 sanitized text (unchanged `Agent.send`); check the reply's grounding, and substitute a
 hedge if flagged; pass `ungrounded=bool(findings)` into `check_escalation`. Findings and
 sanitizer warnings both ride the existing `TurnOutcome.warnings` field, so no transport
-needed a code change and nothing under `transport/` was touched. Every guardrail call is
-wrapped in its own `try`/`except`, same discipline `run_turn` already used for
-classification failures — a guardrail must never break the turn it's meant to protect.
+needed a code change and nothing under `transport/` was touched. `check_reply_grounding`
+and `check_escalation` are each wrapped in their own `try`/`except` — same discipline
+`run_turn` already used for classification failures, since a guardrail must never break
+the turn it's meant to protect. `sanitize_user_text` is called bare, with no wrapping: it
+is a pure function documented never to raise on ordinary input, so there's nothing there
+for a `try`/`except` to guard against.
 
 ### Tests
 
@@ -785,10 +791,10 @@ classification failures — a guardrail must never break the turn it's meant to 
   rotation deterministic, a malformed tool call caught rather than raising.
 - `tests/test_injection.py` (new, 7 tests) — role-marker spoofing neutralized,
   instruction-override phrasing flagged but left verbatim, ordinary speech untouched.
-- `tests/test_escalation.py` — 5 new tests: two consecutive ungrounded replies escalate,
-  one ungrounded then one grounded reply resets the streak, the new parameter's default
-  doesn't disturb existing callers, and `create_handoff_packet` redacts PII in both the
-  persisted row and the packet handed to the webhook.
+- `tests/test_escalation.py` — 5 new tests: a single ungrounded reply does not escalate,
+  two consecutive ones do, one ungrounded then one grounded reply resets the streak, the
+  new parameter's default doesn't disturb existing callers, and `create_handoff_packet`
+  redacts PII in both the persisted row and the packet handed to the webhook.
 - `tests/test_session.py` — 3 new tests: a hedge is spoken and the ungrounded number never
   leaks into the reply, a grounded reply is left byte-for-byte untouched, and an injection
   attempt is flagged and neutralized before it reaches `Agent.send`.
