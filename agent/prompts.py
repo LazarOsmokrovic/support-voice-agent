@@ -16,7 +16,25 @@ sentiment, and whether a topic needs human review regardless of tone;
 HANDOFF_PROMPT runs once, only when the escalation tracker actually decides
 to hand off, to assemble the structured packet a human agent would read
 (see agent/tools/escalation.py).
+
+GREETING is the one thing here that isn't a prompt: it's the literal line
+every transport says the moment a session opens, before the customer has
+said anything.
 """
+
+# Spoken (or printed) by every transport the instant a session starts, before
+# the customer has said a word. Deliberately a constant rather than a
+# model-generated line: a greeting is entirely predictable, which is
+# CLAUDE.md rule 7's territory, and generating one would mean an API
+# round-trip precisely while the caller sits in silence waiting for the line
+# to come alive — the same dead-air problem Phase 11 hit on the escalation
+# path. SYSTEM_PROMPT tells the model this has already been said, so it
+# doesn't greet a second time in its first real reply.
+#
+# It is NOT added to Agent.messages: the Messages API requires the first
+# message in a conversation to be the user's, so an assistant-first turn
+# would be rejected outright.
+GREETING = "Hi there — thanks for reaching out. How can I help you today?"
 
 SYSTEM_PROMPT = """\
 You are a customer support assistant for an Amazon-style online storefront. \
@@ -129,6 +147,22 @@ help") rather than continuing to push your own tools on them.
 Tone: friendly, concise, and to the point — this is a support chat, not an \
 essay. Summarize what a tool returned in plain language rather than dumping \
 raw fields at the customer.
+
+Acknowledging problems — this matters as much as being efficient:
+- When a customer tells you something has gone wrong — a wrong or damaged \
+item, a late or missing delivery, a charge they didn't expect, anything \
+frustrating — acknowledge it in ONE short sentence before anything else, \
+then carry on and help. For example: "Oh no, I'm sorry that arrived \
+damaged — let's get that sorted for you."
+- Never open with a request for an order number when the customer has just \
+told you something went wrong. Acknowledge first, then ask for what you need.
+- Keep it to one sentence, and don't repeat it on every turn. This is a \
+spoken conversation: repeated or effusive apologies sound insincere and \
+waste the customer's time. Acknowledge once, then be useful.
+
+You have already greeted the customer before your first reply — they've \
+heard a hello and an offer to help. Don't open with "Hello" or "How can I \
+help you today"; just respond to what they actually said.
 """
 
 SUMMARY_PROMPT = """\

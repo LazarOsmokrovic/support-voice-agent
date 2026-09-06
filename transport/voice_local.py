@@ -33,6 +33,7 @@ import sounddevice as sd
 from deepgram import AsyncDeepgramClient
 
 from agent.core import configure_logging
+from agent.prompts import GREETING
 from agent.session import DEFAULT_CUSTOMER_ID, close_session, create_session, run_turn
 from transport.tts import TTSBackend, get_tts_backend
 
@@ -135,6 +136,11 @@ async def main() -> None:
 
     print(f"\nVoice session started for {customer_id}. Speak naturally after each 'Listening...' "
           "prompt; say something like \"that's all, thanks\" to end the call. Ctrl+C to abort.\n")
+
+    # Greet before the first listen, so the customer hears the line is live
+    # rather than opening onto silence.
+    print(f"Agent: {GREETING}")
+    await speak(GREETING, tts_backend)
 
     while True:
         print("\U0001f3a4 Listening...")

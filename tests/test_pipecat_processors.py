@@ -56,6 +56,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
+from agent.prompts import GREETING
 from agent.session import create_session
 from agent.tools import escalation
 from agent.tools.escalation import TurnClassification
@@ -133,6 +134,49 @@ def _tool_use_response(name: str, tool_input: dict):
 
 def _calm_classification():
     return TurnClassification(intent="chitchat", sentiment="neutral", policy_restricted=False)
+
+
+@pytest.mark.asyncio
+async def test_claude_turn_processor_greets_when_the_pipeline_starts():
+    """The bot speaks first. On a phone call the alternative is the caller
+    hearing silence until they say something, which reads as a dead line.
+
+    Deliberately does NOT use _started(), since that helper clears exactly
+    the frames under test here.
+    """
+    session = create_session("CUST-1001")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = _CapturingSink(enable_direct_mode=True)
+    processor.link(sink)
+
+    await processor.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+
+    assert any(isinstance(f, TextFrame) and f.text == GREETING for f in sink.frames)
+    # StartFrame must still reach the services downstream — they need it to
+    # initialize, and it has to arrive before the greeting text does.
+    assert isinstance(sink.frames[0], StartFrame)
+    assert [type(f) for f in sink.frames] == [
+        StartFrame,
+        LLMFullResponseStartFrame,
+        TextFrame,
+        LLMFullResponseEndFrame,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_greeting_needs_no_model_call():
+    """Answering a call must not wait on an API round-trip — the whole reason
+    GREETING is a constant rather than a generated line."""
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(return_value=_text_response("should never be called"))
+    session = create_session("CUST-1001", client=fake_client)
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = _CapturingSink(enable_direct_mode=True)
+    processor.link(sink)
+
+    await processor.process_frame(StartFrame(), FrameDirection.DOWNSTREAM)
+
+    fake_client.messages.create.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -42,6 +42,7 @@ from pipecat.frames.frames import (
     InputDTMFFrame,
     LLMFullResponseEndFrame,
     LLMFullResponseStartFrame,
+    StartFrame,
     STTMuteFrame,
     TextFrame,
     TranscriptionFrame,
@@ -55,6 +56,7 @@ from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.transports.base_transport import BaseTransport
 
+from agent.prompts import GREETING
 from agent.session import Session, run_turn
 from agent.tools import escalation
 from transport.tts import (
@@ -110,6 +112,15 @@ class ClaudeTurnProcessor(FrameProcessor):
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
 
+        if isinstance(frame, StartFrame):
+            # Forward StartFrame FIRST, so the TTS service downstream is
+            # initialized by the time the greeting text reaches it, then
+            # speak. Without this the caller hears nothing until they talk
+            # first, which on a phone line reads as a dead connection.
+            await self.push_frame(frame, direction)
+            await self._speak_greeting()
+            return
+
         if isinstance(frame, InputDTMFFrame):
             if frame.button == KeypadEntry.ZERO:
                 await self._handle_dtmf_escalation()
@@ -121,6 +132,21 @@ class ClaudeTurnProcessor(FrameProcessor):
             return
 
         await self.push_frame(frame, direction)
+
+    async def _speak_greeting(self) -> None:
+        """Say hello the moment the pipeline starts, before the caller has
+        said anything.
+
+        Bracketed with LLMFullResponseStart/EndFrame for the same reason
+        every reply is: the TTS service keys its per-turn audio-context
+        tracking off that pair, so an unbracketed TextFrame would arrive
+        outside any context. GREETING is a constant (agent/prompts.py) —
+        no model call, so this adds no latency to answering the call.
+        """
+        print(f"[greeting] {GREETING}")
+        await self.push_frame(LLMFullResponseStartFrame())
+        await self.push_frame(TextFrame(text=GREETING))
+        await self.push_frame(LLMFullResponseEndFrame())
 
     async def _handle_dtmf_escalation(self) -> None:
         try:

@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 
 from agent.core import configure_logging
+from agent.prompts import GREETING
 from agent.session import DEFAULT_CUSTOMER_ID, close_session, create_session, run_turn
 
 
@@ -23,6 +24,11 @@ async def main() -> None:
     session = create_session(customer_id)
 
     print("\nSupport chat — type 'quit' or 'exit' to leave.\n")
+    # The agent speaks first, before the customer types anything — see
+    # agent/prompts.py's GREETING for why this is a constant, not a
+    # model-generated line.
+    print(f"Agent: {GREETING}\n")
+
     while True:
         try:
             user_text = input("You: ").strip()
