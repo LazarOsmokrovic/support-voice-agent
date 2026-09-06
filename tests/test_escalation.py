@@ -132,6 +132,32 @@ def test_turns_without_lookups_do_not_affect_the_failure_streak():
     assert reason == "repeated failed lookups"  # streak was NOT reset by the chitchat turn
 
 
+def test_single_ungrounded_reply_does_not_escalate():
+    tracker = EscalationTracker()
+    assert tracker.record_turn(_classification(), [], ungrounded=True) is None
+
+
+def test_two_consecutive_ungrounded_replies_escalates():
+    tracker = EscalationTracker()
+    assert tracker.record_turn(_classification(), [], ungrounded=True) is None
+    assert tracker.record_turn(_classification(), [], ungrounded=True) == "repeated ungrounded replies"
+
+
+def test_a_grounded_reply_resets_the_ungrounded_streak():
+    tracker = EscalationTracker()
+    assert tracker.record_turn(_classification(), [], ungrounded=True) is None
+    assert tracker.record_turn(_classification(), [], ungrounded=False) is None
+    assert tracker.record_turn(_classification(), [], ungrounded=True) is None
+
+
+def test_ungrounded_defaults_to_false_for_existing_callers():
+    """Every pre-Phase-10a caller passes two arguments; that must still mean
+    'this reply was fine'."""
+    tracker = EscalationTracker()
+    assert tracker.record_turn(_classification(), []) is None
+    assert tracker.record_turn(_classification(), []) is None
+
+
 # --- log_escalation / create_handoff_packet ---
 
 
