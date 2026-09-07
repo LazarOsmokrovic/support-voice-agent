@@ -20,6 +20,7 @@ whether that input came from a keyboard or a microphone.
 from __future__ import annotations
 
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -31,6 +32,7 @@ from agent.tools import escalation, orders, policy_rag, refunds, scheduling, sum
 from agent.tools.summary import SessionSummary
 from guardrails.injection import sanitize_user_text
 from guardrails.validators import check_reply_grounding, hedge_for
+from observability.turn_log import TurnRecord, log_turn
 
 TOOLS = [
     orders.TOOL_SCHEMA,
@@ -165,21 +167,31 @@ class Session:
     """Everything one conversation needs, assembled once via create_session()."""
 
     customer_id: str
+    session_id: str
+    transport: str
     agent: Agent
     tracker: escalation.EscalationTracker
     gates: SessionGates
     handlers: dict[str, Callable[..., Any]]
 
 
-def create_session(customer_id: str, client: Any | None = None) -> Session:
+def create_session(customer_id: str, client: Any | None = None, transport: str = "unknown") -> Session:
     """`client` is only for tests — real callers never pass it, and Agent
     creates its own anthropic.AsyncAnthropic() by default, same as every
     other place in this project that accepts an injectable client.
+
+    `transport` labels which I/O layer is driving this conversation, purely
+    so per-turn records (observability/turn_log.py) say which channel a turn
+    came from. run_turn cannot infer it, and once telephony and CLI turns
+    share one log file it is the difference between a readable record and an
+    ambiguous one. It is a label, not behavior — nothing branches on it.
     """
     dispatch_tool, handlers, gates = build_dispatch_tool(customer_id)
     agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool, client=client)
     return Session(
         customer_id=customer_id,
+        session_id=uuid.uuid4().hex,
+        transport=transport,
         agent=agent,
         tracker=escalation.EscalationTracker(),
         gates=gates,
@@ -272,7 +284,7 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
         except Exception as exc:  # noqa: BLE001 — exit path must never crash on this
             notice = None
             warnings.append(f"Escalation triggered ({reason}) but the handoff packet couldn't be logged: {exc}")
-        return TurnOutcome(
+        outcome = TurnOutcome(
             reply=reply,
             ended=True,
             end_reason="escalated",
@@ -280,13 +292,40 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
             llm_latency_seconds=llm_latency,
             warnings=warnings,
         )
-
-    if should_end_session(result.tool_calls):
-        return TurnOutcome(
+    elif should_end_session(result.tool_calls):
+        outcome = TurnOutcome(
             reply=reply, ended=True, end_reason="model_ended", llm_latency_seconds=llm_latency, warnings=warnings
         )
+    else:
+        outcome = TurnOutcome(reply=reply, llm_latency_seconds=llm_latency, warnings=warnings)
 
-    return TurnOutcome(reply=reply, llm_latency_seconds=llm_latency, warnings=warnings)
+    # One emit point, at the single exit. log_turn already guarantees it never
+    # raises; this wrapper is belt-and-suspenders on top of that, the same
+    # precedent create_handoff_packet sets for notify_escalation — telemetry
+    # must never be the thing that breaks a live call.
+    try:
+        log_turn(
+            TurnRecord(
+                session_id=session.session_id,
+                customer_id=session.customer_id,
+                transport=session.transport,
+                turn=session.gates.refunds.turn,
+                user_text=user_text,
+                reply=outcome.reply,
+                hedged=bool(findings),
+                tool_calls=result.tool_calls,
+                llm_latency_seconds=llm_latency,
+                warnings=outcome.warnings,
+                escalated=outcome.end_reason == "escalated",
+                escalation_reason=reason,
+                ended=outcome.ended,
+                end_reason=outcome.end_reason,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — telemetry must never break a turn
+        outcome.warnings.append(f"Could not write the turn log this turn: {exc}")
+
+    return outcome
 
 
 @dataclass

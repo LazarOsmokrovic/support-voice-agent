@@ -11,10 +11,12 @@ fabricated classifications without a real call.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from agent import session as session_module
 from agent.session import create_session, run_turn
 from agent.tools import escalation
 from agent.tools.escalation import TurnClassification
@@ -271,3 +273,50 @@ async def test_run_turn_flags_and_neutralizes_an_injection_attempt(monkeypatch):
     assert any("role marker" in warning for warning in outcome.warnings)
     sent_text = session.agent.messages[0]["content"]
     assert not sent_text.lstrip().lower().startswith("assistant:")
+
+
+def test_create_session_assigns_a_unique_session_id_and_transport():
+    first = create_session("CUST-1001", transport="text_cli")
+    second = create_session("CUST-1001", transport="text_cli")
+
+    assert first.session_id and second.session_id
+    assert first.session_id != second.session_id
+    assert first.transport == "text_cli"
+
+
+def test_create_session_defaults_the_transport_label():
+    assert create_session("CUST-1001").transport == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_emits_exactly_one_turn_record(tmp_path, monkeypatch):
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(return_value=_text_response("Happy to help!"))
+    monkeypatch.setattr(escalation, "classify_turn", AsyncMock(return_value=_calm_classification()))
+    session = create_session("CUST-1001", client=fake_client, transport="text_cli")
+
+    await run_turn(session, "Hi there")
+
+    lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0]["session_id"] == session.session_id
+    assert lines[0]["transport"] == "text_cli"
+    assert lines[0]["hedged"] is False
+    assert lines[0]["escalated"] is False
+    assert lines[0]["end_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_turn_log_failure_becomes_a_warning_and_does_not_break_the_turn(monkeypatch):
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(return_value=_text_response("Happy to help!"))
+    monkeypatch.setattr(escalation, "classify_turn", AsyncMock(return_value=_calm_classification()))
+    monkeypatch.setattr(session_module, "log_turn", MagicMock(side_effect=RuntimeError("disk on fire")))
+    session = create_session("CUST-1001", client=fake_client)
+
+    outcome = await run_turn(session, "Hi there")
+
+    assert outcome.reply == "Happy to help!"
+    assert any("disk on fire" in warning for warning in outcome.warnings)
