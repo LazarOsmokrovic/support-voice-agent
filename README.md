@@ -842,11 +842,18 @@ reports **174 passed, 13 failed** — the same 13 pre-existing, API-key-gated li
 failures called out in every phase back through Phase 7 (stale/invalid Anthropic/Deepgram
 credentials in this environment), none of them in Phase 10a's own files.
 
-**The manual checkpoint has not been performed.** No scripted conversation was run through
-`transport/text_cli.py` attempting the injection phrasing, and none was run pushing the
-agent toward inventing a policy number to confirm the hedge is spoken and a second
-consecutive violation escalates. Every guardrail claim above — the ladder firing correctly,
-the injection neutralization surviving a real model turn, the hedge actually sounding right
-in context — is verified only by offline, mocked tests. This is stated here plainly rather
-than implied otherwise, the same way Phase 7 documented what no automated test could cover
-and Phase 8 documented its deferred barge-in stress test.
+**The manual checkpoint has since been performed and passed.** Scripted conversations were
+run through `transport/text_cli.py`: the injection phrasing was neutralized rather than
+entering the transcript, and pushing the agent toward inventing a policy number produced
+the hedge, with a second consecutive violation escalating to a handoff. That run is what
+exercised the conversation-history reconciliation against real SDK content blocks rather
+than the mocked ones the test suite uses — the one path no offline test could reach.
+
+Worth recording why that mattered: this phase's whole-branch review found that the redactor
+was destroying the project's own ISO dates and `TBA…US` tracking numbers at the two storage
+boundaries the phase had just wired, so a "where is my package" handoff would have persisted
+with its delivery date gone. It survived all seven task-level reviews because every
+redaction test used invented values (`4111 1111 1111 1111`) instead of values this system
+actually produces. Reading one real persisted row would have caught it immediately — the
+same lesson Phase 11's order-ID bug taught, arriving a second time in a different costume.
+The redaction tests now import their fixtures from `data/mock_db.py`.
