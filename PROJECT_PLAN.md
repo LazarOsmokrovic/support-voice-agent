@@ -346,8 +346,9 @@ final run). Manual — run a real conversation through `transport/text_cli.py`, 
 turn that escalates, then read the resulting `logs/turns.jsonl` and confirm the records are
 legible, the conversation is reconstructable from them, PII is masked, and the order ID and
 dates are still readable — the check this project has twice learned to do by having shipped
-a redactor that destroyed its own identifiers. **The manual half has not been run** — every
-test above is offline; nobody has yet read a real `logs/turns.jsonl`.
+a redactor that destroyed its own identifiers. **Both halves have now passed** — a real
+conversation was run and its `logs/turns.jsonl` read: the records are legible, the
+conversation reconstructable, PII masked, and the order ID and dates intact.
 
 ---
 

@@ -1064,12 +1064,17 @@ reports **197 passed, 13 failed** — the same 13 pre-existing, API-key-gated li
 failures called out in every phase back through Phase 7 (stale/invalid Anthropic/Deepgram
 credentials in this environment), none of them in any file this phase touched.
 
-**The manual checkpoint has NOT been performed.** Nobody has yet run a real conversation
-through `transport/text_cli.py` and read the resulting `logs/turns.jsonl` — every test
-above is offline, exercising `log_turn` and `run_turn` against fakes and `tmp_path`, never
-against a real live call. That check matters for the same reason it mattered twice already
-in this project: Phase 11's order-ID bug and 10a's date-destruction bug both survived every
-automated review and would have been obvious in one glance at a real record. Until someone
-runs a scripted conversation — including one turn that escalates — and reads the actual
-`logs/turns.jsonl` it produces, this phase's record-legibility claim is verified by test
-fixtures, not by a real log.
+**The manual checkpoint has since been performed and passed.** A real conversation was run
+through `transport/text_cli.py` and the resulting `logs/turns.jsonl` read: the records are
+legible, the conversation reconstructable from them, PII masked, and the order ID and dates
+intact.
+
+That run mattered for a specific reason, and it is the reason worth remembering. Every test
+in this phase is offline, exercising `log_turn` and `run_turn` against fakes and `tmp_path`
+— which means until the real call, `llm_latency_ms` had only ever been `0`, and the SDK's
+actual `block.input` type (a dict-*like* object rather than a plain dict) had never been
+through `redact_structure` and `json.dumps`. The shape you test against is not always the
+shape you get. Phase 11's order-ID bug and 10a's date-destruction bug both survived every
+automated review and would have been obvious in one glance at a real record; this is the
+third phase in a row where reading one real artifact was the check that actually settled
+it.
