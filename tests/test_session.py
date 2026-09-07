@@ -320,3 +320,76 @@ async def test_a_turn_log_failure_becomes_a_warning_and_does_not_break_the_turn(
 
     assert outcome.reply == "Happy to help!"
     assert any("disk on fire" in warning for warning in outcome.warnings)
+
+
+@pytest.mark.asyncio
+async def test_run_turn_records_hedged_true_for_an_ungrounded_reply(tmp_path, monkeypatch):
+    """The next sub-phase (eval) exists to measure the grounding detector's
+    false-positive rate off the `hedged` field, so it needs its own direct
+    test rather than relying on `hedged` being correct "by construction".
+    Also pins `reply` to the hedge that was actually spoken, not the
+    suppressed ungrounded text — a regression in either shows up here."""
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(
+        side_effect=[
+            _tool_use_response("search_policy", {"query": "returns"}),
+            _text_response("You have 90 days to return that."),
+        ]
+    )
+    monkeypatch.setattr(escalation, "classify_turn", AsyncMock(return_value=_calm_classification()))
+    session = create_session("CUST-1001", client=fake_client, transport="text_cli")
+    monkeypatch.setitem(
+        session.handlers,
+        "search_policy",
+        lambda query: {"found": True, "results": [{"text": "Returns accepted within 30 days."}]},
+    )
+
+    outcome = await run_turn(session, "How long do I have to return this?")
+
+    lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    assert len(lines) == 1
+    assert lines[0]["hedged"] is True
+    assert lines[0]["reply"] == outcome.reply
+    assert lines[0]["reply"] in HEDGE_PHRASES
+    assert "90" not in lines[0]["reply"]
+
+
+@pytest.mark.asyncio
+async def test_run_turn_records_escalated_status_correctly(tmp_path, monkeypatch):
+    """A field that is always True is as useless as one that is always
+    False — only the pair of assertions (escalated turn vs. calm turn)
+    proves `escalated` actually discriminates."""
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_session.db")
+    mock_db.reset_and_seed()
+
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(return_value=_text_response("Sure, one moment."))
+    monkeypatch.setattr(
+        escalation, "classify_turn",
+        AsyncMock(return_value=TurnClassification(intent="request_human", sentiment="neutral", policy_restricted=False)),
+    )
+    monkeypatch.setattr(
+        escalation, "create_handoff_packet",
+        AsyncMock(return_value={"escalation_id": 42, "reason": "explicit request for a human"}),
+    )
+    session = create_session("CUST-1001", client=fake_client)
+
+    await run_turn(session, "I want to talk to a human")
+
+    fake_client2 = MagicMock()
+    fake_client2.messages.create = AsyncMock(return_value=_text_response("Happy to help!"))
+    monkeypatch.setattr(escalation, "classify_turn", AsyncMock(return_value=_calm_classification()))
+    session2 = create_session("CUST-1001", client=fake_client2)
+
+    await run_turn(session2, "Hi there")
+
+    lines = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert lines[0]["escalated"] is True
+    assert lines[0]["end_reason"] == "escalated"
+    assert lines[0]["escalation_reason"]
+    assert lines[1]["escalated"] is False
