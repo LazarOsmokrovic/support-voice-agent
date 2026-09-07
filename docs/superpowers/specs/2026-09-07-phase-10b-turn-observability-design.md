@@ -158,6 +158,49 @@ observability — particularly once telephony and CLI turns share one file.
 
 `logs/` — turn records contain redacted customer conversations and must never be committed.
 
+### `tests/conftest.py` — test isolation (found by pre-implementation review)
+
+The autouse fixture added in 10a strips `ESCALATION_WEBHOOK_URL`/`_SECRET` so no test can
+fire a real webhook. It must also set `TURN_LOG_PATH=""`.
+
+Without it, this phase reproduces 10a's finding #4 exactly: the default path is **relative**
+(`logs/turns.jsonl`), and every test that calls `run_turn` — across `test_session.py`,
+`test_text_cli.py` and `test_pipecat_processors.py` — would append real records to the
+repository's own log file. Test data polluting an operational log, silently, on every run.
+Tests that want logging set the path explicitly with `monkeypatch.setenv`, which runs after
+the fixture, exactly as the webhook tests already do.
+
+### `transport/pipecat_processors.py` — the DTMF escalation path (found by pre-implementation review)
+
+`_handle_dtmf_escalation` calls `create_handoff_packet` **directly**, bypassing `run_turn`
+entirely — that is deliberate, and dates from Phase 9: pressing 0 is a deterministic safety
+net that must work even when the model or the pipeline is misbehaving, so it runs no
+`classify_turn` and no `run_turn`.
+
+The consequence for this phase is that a "press 0 for a human" escalation would produce **no
+record at all** — an observability hole precisely at the event most worth observing. This is
+the same class of mistake as 10a's "redaction is applied at the two places" claim when there
+were four: a path not enumerated.
+
+So the DTMF handler emits a record too: `user_text="[DTMF] 0"`, `escalated=True`,
+`escalation_reason="caller pressed 0 for a human"`, `hedged=False`, no tool calls, zero LLM
+latency. One schema, one file, and a keypress escalation is legible alongside spoken ones.
+This is the single exception to "transports change by one argument each", and it is
+telemetry for a transport-level event rather than business logic, so CLAUDE.md rule 5 is
+unaffected.
+
+## Raw versus sanitized caller text
+
+`user_text` in the record is the caller's **raw** text, not the sanitized string the model
+received. This is deliberate: the log should show what the caller actually said, because
+that is what an injection attempt looks like, and 10a's sanitizer neutralizes markers in a
+way that would hide the attack from the record.
+
+The transformation is not lost — when the sanitizer fires it appends a warning, and
+`warnings` is part of the record, so a reader sees both that an attempt was made and that it
+was neutralized. Logging both forms was considered and rejected as duplication for a case
+the warnings already cover.
+
 ## What is deliberately NOT included
 
 - **STT and TTS latency.** Both are measured in the voice transports, but TTS latency is not

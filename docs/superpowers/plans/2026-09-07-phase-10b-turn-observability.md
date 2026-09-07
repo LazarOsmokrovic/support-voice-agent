@@ -13,7 +13,8 @@
 ## Global Constraints
 
 - **`agent/core.py` must NOT change.** Its last edit was Phase 4; it has since survived local voice, Pipecat, Twilio, notifications and the 10a guardrails untouched. That is the project's evidence its I/O decoupling held.
-- **Transports change by exactly one argument each** — a `transport=` label on their existing `create_session(...)` call. That is configuration, not business logic. No other transport edit is in scope.
+- **Transports change by exactly one argument each** — a `transport=` label on their existing `create_session(...)` call — **with one deliberate exception**: `transport/pipecat_processors.py`'s DTMF handler bypasses `run_turn` by design and so needs its own emit (Task 4, Step 1b). That is telemetry for a transport-level event, not business logic; CLAUDE.md rule 5 is unaffected.
+- **The test suite must never write to the repository's own log.** The default path is relative, so `tests/conftest.py`'s autouse fixture must disable turn logging (Task 4, Step 0). This is the same defect class as 10a's finding that the suite fired real webhooks — caught here before implementation rather than by a reviewer afterwards.
 - **Logging must never break a call.** `log_turn` never raises; `run_turn` wraps it anyway (the precedent `create_handoff_packet` sets for `notify_escalation`). Never catch `BaseException` — `asyncio.CancelledError` must keep propagating or Pipecat barge-in breaks.
 - **Redaction is not optional and not the caller's job.** It happens inside `log_turn`.
 - **`TurnOutcome`'s shape does not change.** No new fields.
@@ -632,15 +633,40 @@ Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
 
 ---
 
-### Task 4: Transport labels and gitignore
+### Task 4: Test isolation, transport labels, the DTMF gap, and gitignore
 
 **Files:**
+- Modify: `tests/conftest.py`
 - Modify: `transport/text_cli.py:24`, `transport/voice_local.py:133`, `transport/pipeline.py:35`, `transport/telephony.py:130` — one argument each
+- Modify: `transport/pipecat_processors.py` (`_handle_dtmf_escalation`)
+- Test: `tests/test_pipecat_processors.py`
 - Modify: `.gitignore`
 
 **Interfaces:**
-- Consumes: `create_session(..., transport=...)` (Task 3).
+- Consumes: `create_session(..., transport=...)` (Task 3), `TurnRecord`/`log_turn` (Task 2).
 - Produces: nothing.
+
+- [ ] **Step 0: Stop the test suite writing to the repository's own log**
+
+**Do this first — before any transport is labelled — or every subsequent test run pollutes `logs/turns.jsonl`.**
+
+The default log path is *relative*, so any test that reaches `run_turn` without an explicit `TURN_LOG_PATH` appends to the real file. `tests/conftest.py` already has an autouse fixture stripping the escalation webhook vars for exactly this reason; extend it:
+
+```python
+@pytest.fixture(autouse=True)
+def _no_real_escalation_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ESCALATION_WEBHOOK_URL", raising=False)
+    monkeypatch.delenv("ESCALATION_WEBHOOK_SECRET", raising=False)
+    # Phase 10b: turn logging defaults ON to a relative path, so without this
+    # every test touching run_turn would append to the repo's own
+    # logs/turns.jsonl. Tests that want logging set the path explicitly with
+    # monkeypatch.setenv, which runs after this fixture.
+    monkeypatch.setenv("TURN_LOG_PATH", "")
+```
+
+Rename the fixture and update its docstring to cover both concerns, since it is no longer only about webhooks.
+
+Verify: `python -m pytest -q` then `git status --short` — `logs/` must not appear.
 
 - [ ] **Step 1: Label each transport**
 
@@ -652,6 +678,76 @@ One argument per call site, nothing else in these files changes:
 | `transport/voice_local.py:133` | `create_session(customer_id, transport="voice_local")` |
 | `transport/pipeline.py:35` | `create_session(customer_id, transport="pipeline")` |
 | `transport/telephony.py:130` | `create_session(DEFAULT_CUSTOMER_ID, transport="telephony")` |
+
+- [ ] **Step 1b: Close the DTMF observability hole**
+
+`transport/pipecat_processors.py::_handle_dtmf_escalation` calls `create_handoff_packet` **directly**, bypassing `run_turn` — deliberate since Phase 9, because "press 0 for a human" must work even when the model or pipeline is misbehaving. The consequence for this phase is that a keypress escalation would produce **no record at all**, a hole exactly at the event most worth recording.
+
+Write the failing test first, in `tests/test_pipecat_processors.py`:
+
+```python
+@pytest.mark.asyncio
+async def test_dtmf_escalation_emits_a_turn_record(tmp_path, monkeypatch):
+    """Pressing 0 bypasses run_turn by design, so it needs its own record —
+    otherwise the single most important escalation leaves no trace."""
+    import json
+
+    from data import mock_db
+
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_dtmf_log.db")
+    mock_db.reset_and_seed()
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+    monkeypatch.setattr(
+        escalation, "create_handoff_packet",
+        AsyncMock(return_value={"escalation_id": 7, "reason": "caller pressed 0 for a human"}),
+    )
+    session = create_session("CUST-1001", transport="telephony")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    await _started(processor)
+
+    await processor.process_frame(InputDTMFFrame(KeypadEntry.ZERO), FrameDirection.DOWNSTREAM)
+
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    assert len(records) == 1
+    assert records[0]["escalated"] is True
+    assert records[0]["transport"] == "telephony"
+    assert "DTMF" in records[0]["user_text"]
+```
+
+Run it, confirm it fails (no record written), then add the emit to `_handle_dtmf_escalation` after the notice is built and before the frames are pushed:
+
+```python
+        # Pressing 0 bypasses run_turn entirely (Phase 9's deterministic safety
+        # net), so it would otherwise leave no trace in the turn log — a hole at
+        # exactly the event most worth recording. Same schema as a spoken turn,
+        # so keypress and spoken escalations read alike in one file.
+        try:
+            log_turn(
+                TurnRecord(
+                    session_id=self._session.session_id,
+                    customer_id=self._session.customer_id,
+                    transport=self._session.transport,
+                    turn=self._session.gates.refunds.turn,
+                    user_text="[DTMF] 0",
+                    reply=notice,
+                    hedged=False,
+                    tool_calls=[],
+                    llm_latency_seconds=0.0,
+                    warnings=[],
+                    escalated=True,
+                    escalation_reason="caller pressed 0 for a human",
+                    ended=True,
+                    end_reason="escalated",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry must never break the fallback
+            print(f"(turn log write failed for the DTMF escalation: {exc})")
+```
+
+with `from observability.turn_log import TurnRecord, log_turn` added to the imports.
+
+This is the one exception to "transports change by one argument each": it is telemetry for a transport-level event, not business logic, so CLAUDE.md rule 5 is unaffected.
 
 - [ ] **Step 2: Ignore the log directory**
 
