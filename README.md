@@ -857,3 +857,200 @@ redaction test used invented values (`4111 1111 1111 1111`) instead of values th
 actually produces. Reading one real persisted row would have caught it immediately — the
 same lesson Phase 11's order-ID bug taught, arriving a second time in a different costume.
 The redaction tests now import their fixtures from `data/mock_db.py`.
+
+---
+
+## Phase 10b — Structured per-turn observability (Done)
+
+Before this phase, real per-turn signal — `llm_latency_seconds`, `warnings`, `end_reason`,
+10a's new `hedged` — was computed inside `run_turn` and then **discarded at the transport
+boundary**: four ad-hoc loggers (`agent.core`, `agent.tools.escalation`,
+`agent.tools.notifications`, `guardrails.validators`) emitting prose at WARNING/INFO, and
+the voice transports printing STT/LLM/TTS latency with `print()` and throwing it away.
+Nothing was queryable, nothing was machine-readable, and nothing survived the process. See
+`docs/superpowers/specs/2026-09-07-phase-10b-turn-observability-design.md` for the full
+design rationale (alternatives considered — a `logging.Handler`, a decorator around
+`run_turn` — and why both were rejected).
+
+**This phase mostly exists to serve 10c.** The eval suite can't measure what the grounding
+detector actually does — its false-positive rate is unknown, and 10a's
+`UNGROUNDED_REPLY_ESCALATION_THRESHOLD = 2` is admittedly a guess whose own code comment
+argues 3 might be better. `hedged` and `warnings`, once they're in a durable per-turn
+record, are the instrument that turns that argument into a measurement — the same way
+eight hand-labelled questions fixed Phase 3's RAG threshold instead of intuition.
+
+### `observability/turn_log.py` (new) — the record and the writer
+
+A new top-level package, mirroring the existing `guardrails/` and `eval/` layout. One
+dataclass, `TurnRecord`, carrying `session_id`, `customer_id`, `transport`, `turn`,
+`user_text`, `reply`, `hedged`, `tool_calls`, `llm_latency_seconds`, `warnings`,
+`escalated`, `escalation_reason`, `ended`, `end_reason` — fourteen fields, and the dataclass
+**is** the schema, worth documenting in code rather than prose. `log_turn(record)` appends
+one JSON line to `logs/turns.jsonl`:
+
+- **Redaction happens inside `log_turn`, not at the four call sites**, so a caller cannot
+  forget it. `user_text`/`reply` go through the existing `redact_text`; `tool_calls` — the
+  new `redact_structure` (below) — before serialization. `llm_latency_ms`, rounded to an
+  integer, replaces the raw `llm_latency_seconds` float in the written record —
+  milliseconds read better in a log than a float; a `ts` field
+  (`datetime.now(timezone.utc).isoformat()`) is added at write time.
+- **A module-level `threading.Lock` guards the append.** The telephony transport handles
+  multiple simultaneous calls in one process, and a record carrying tool output can exceed
+  the size at which a POSIX append is atomic — without the lock, two interleaved calls
+  could corrupt the file with a half-written line from each.
+- **Never raises.** An unwritable path, a full disk, or anything else that goes wrong while
+  serializing or writing is caught, logged once via
+  `logging.getLogger("observability.turn_log")`, and swallowed — the same discipline
+  `guardrails/validators.py` already follows, for the same reason: telemetry must never be
+  the thing that breaks a live call.
+- **Disabled (`TURN_LOG_PATH=""`) is a fast no-op** — the function returns before any
+  redaction or serialization happens at all.
+
+**On by default**, to `logs/turns.jsonl` (gitignored) — a deliberate break from this
+project's optional-by-default convention. `ESCALATION_WEBHOOK_URL`, `TTS_BACKEND`, and
+`EMBEDDING_BACKEND` are all silent no-ops unless configured; this is the opposite choice,
+made on purpose: observability that is off by default observes nothing, and the turns worth
+having a record of are precisely the ones nobody anticipated — a hallucination, an injection
+attempt, an escalation that fired wrongly. A default-off telemetry system is reliably
+enabled only after the interesting event has already been lost.
+
+**`user_text` is logged raw**, not the sanitized string the model actually received —
+deliberately, not an oversight. An injection attempt is invisible in the record if only the
+neutralized form survives, and 10a's sanitizer already appends a warning to `warnings`
+whenever it fires, so a reader sees both what the caller actually said and that it was
+neutralized before reaching the model. Logging both the raw and sanitized forms was
+considered and rejected as duplicating what `warnings` already covers.
+
+### `guardrails/pii.py` — `redact_structure`, and why `redact_fields` was the wrong shape
+
+`redact_fields(data, fields)` (Phase 10a) redacts named fields of a flat mapping — the
+right tool for a handoff packet, whose shape is fixed and known in advance. Tool output
+(`get_order_status`'s row, `search_policy`'s retrieved chunks, `find_available_slots`'
+slot list) is arbitrary nested dicts and lists with no fixed field names, so logging it
+needed something else: `redact_structure(value) -> Any`, which walks dicts, lists, and
+tuples recursively, redacting every string it finds via `redact_text`. Dict **keys** are
+deliberately left alone — they're field names chosen by this codebase, never
+customer-supplied, and redacting them would make a log record unreadable. Non-string
+scalars (numbers, booleans, `None`) pass through untouched. It returns a copy and never
+mutates its input, because the caller is handing it live tool output still in use elsewhere
+on the same turn. Both functions stay in `pii.py` so there remains exactly one definition
+of what redaction means in this codebase.
+
+Redaction was checked against **real seeded tool output**, not invented values, before the
+design was finalized — this project has now twice shipped a redactor that destroyed its own
+identifiers (10a's whole-branch review found the same class of bug in `redact_text`/`redact_fields`).
+A real `get_order_status` result's `order_id`, `order_date`, `estimated_delivery`, and
+`TBA…US` tracking number all survive `redact_structure` intact, as do
+`find_available_slots`' ISO datetime slots — confirmed by
+`test_redact_structure_preserves_real_seeded_identifiers` in `tests/test_pii.py`, which
+imports its fixtures from `data/mock_db.py` the same way 10a's redaction tests do.
+
+### `agent/session.py` — session identity and the single emit point
+
+- **`Session` gains `session_id` and `transport`.** There was no session identifier before
+  this phase, and without one a JSONL file becomes unreadable the moment two conversations
+  interleave — which telephony does by design, handling multiple simultaneous calls in one
+  process. `create_session(customer_id, client=None, transport="unknown")` generates the
+  `session_id` as a `uuid4` hex; `transport` is a plain label (`"text_cli"`,
+  `"voice_local"`, `"pipeline"`, `"telephony"`) — configuration, not behavior, so nothing
+  branches on it and CLAUDE.md rule 5 is unaffected.
+- **`run_turn` was restructured to a single exit.** It previously had three separate
+  `return TurnOutcome(...)` sites (escalated, model-ended, normal-reply). Each branch now
+  assigns `outcome` instead of returning directly, and exactly one `log_turn` call sits at
+  the tail, after all three. This is what keeps the emit point from being duplicated three
+  ways — or, worse, silently missed on some future fourth branch. The restructure was
+  verified branch-by-branch as a genuine no-op: all three branches construct the identical
+  `TurnOutcome` they did before this phase: `hedged` is `bool(findings)`; `escalated` is
+  `outcome.end_reason == "escalated"`.
+- The `log_turn` call itself is wrapped in its own `try`/`except` — belt-and-suspenders on
+  top of `log_turn`'s own guarantee that it never raises, the same precedent
+  `create_handoff_packet` already sets for `notify_escalation`: a telemetry failure
+  surfaces as an appended warning on `outcome.warnings`, never an exception that could break
+  a live call.
+
+### The four transports — one line each, and the DTMF gap closed
+
+`transport/text_cli.py`, `transport/voice_local.py`, `transport/pipeline.py`, and
+`transport/telephony.py` each now pass their own label at `create_session(...,
+transport="text_cli" | "voice_local" | "pipeline" | "telephony")` — a one-line,
+configuration-only change per file. `run_turn` cannot infer which channel a turn came in
+on, and once telephony and CLI turns can share one log file, "which channel was this" is
+basic observability.
+
+**`transport/pipecat_processors.py`'s `_handle_dtmf_escalation`** is the one exception to
+"one line each." It calls `create_handoff_packet` directly, bypassing `run_turn`
+entirely — a deliberate Phase 9 decision: pressing 0 is a deterministic safety net that
+must keep working even when the model or the pipeline itself is misbehaving, so it never
+runs `classify_turn` or `run_turn`. Left alone, that means a "press 0 for a human" call
+would produce **no record at all** — a hole at exactly the event most worth observing. This
+is the same class of mistake as 10a's "redaction is applied at the two places" claim when
+there were actually four: a path not enumerated. So the DTMF handler now emits its own
+`TurnRecord` too (`user_text="[DTMF] 0"`, `escalated=True`,
+`escalation_reason="caller pressed 0 for a human"`, `hedged=False`, no tool calls, zero LLM
+latency) — one schema, one file, so a keypress escalation reads alongside spoken ones
+rather than vanishing.
+
+### Two gaps found by a pre-implementation review, before any code was written
+
+Both are the same shape as defects 10a's whole-branch review caught only after the fact —
+found here earlier, by design, rather than discovered late a second time:
+
+- **Test isolation.** Turn logging defaults ON to a *relative* path (`logs/turns.jsonl`).
+  Without a fixture change, every offline test reaching `run_turn` — across
+  `tests/test_session.py`, `tests/test_text_cli.py`, and `tests/test_pipecat_processors.py`
+  — would have silently appended real records to the repository's own log file on every
+  test run. Same defect class as 10a's tests being able to fire a real webhook at a live
+  Slack channel. `tests/conftest.py`'s autouse fixture (renamed `_no_real_side_effects`) now
+  blanks `TURN_LOG_PATH` in addition to stripping the webhook env vars; tests that
+  deliberately want logging set the path explicitly via `monkeypatch.setenv`, which runs
+  after the fixture and wins, the same pattern the webhook tests already used.
+- **The DTMF observability hole**, described above.
+
+### What is deliberately not in the record
+
+**STT/TTS latency.** Both are measured today in the voice transports, but TTS latency isn't
+known until *after* `run_turn` has already returned, so folding it into `TurnRecord` would
+mean either logging from all four transports — duplicating the single emit point this
+design exists to centralize — or a second record type keyed by turn id. Neither earns its
+complexity yet. The audio-stage timings continue to print exactly as they do today; nothing
+about the interactive experience changed. If 10c ends up needing them, a second record type
+is the clean addition, not a retrofit of this one.
+
+### Tests
+
+- `tests/test_turn_log.py` (new, 10 tests) — a call to `log_turn` writes exactly one
+  parseable JSON line; every schema field is present; `user_text`/`reply`/`tool_calls` are
+  redacted while a real seeded order ID survives; `TURN_LOG_PATH=""` writes nothing at all;
+  an unwritable path and an unserializable value don't raise; two calls append rather than
+  overwrite; a missing parent directory is created; `llm_latency_ms` is an integer.
+- `tests/test_pii.py` — 6 new tests for `redact_structure`: strings nested in dicts and
+  lists redacted, non-string scalars untouched, dict keys untouched, the input not mutated,
+  a bare string/scalar handled, and real seeded identifiers preserved.
+- `tests/test_session.py` — 6 new tests: `create_session` assigns a unique `session_id` and
+  stores the transport label (including the `"unknown"` default); a turn emits exactly one
+  `TurnRecord`; a `log_turn` failure surfaces as a warning rather than crashing the turn;
+  `hedged`/`escalated` land correctly in the record for an ungrounded reply and for an
+  escalating turn respectively.
+- `tests/test_pipecat_processors.py` — 1 new test: the DTMF escalation path emits its own
+  turn record.
+
+All offline; no network, no API keys. Test isolation for the log file uses `tmp_path`,
+matching the `monkeypatch.setattr(mock_db, "DB_PATH", …)` convention already used
+throughout this project.
+
+### Checkpoint result
+
+23 new tests across the four files above, all passing. Full suite: `python -m pytest -q`
+reports **197 passed, 13 failed** — the same 13 pre-existing, API-key-gated live-test
+failures called out in every phase back through Phase 7 (stale/invalid Anthropic/Deepgram
+credentials in this environment), none of them in any file this phase touched.
+
+**The manual checkpoint has NOT been performed.** Nobody has yet run a real conversation
+through `transport/text_cli.py` and read the resulting `logs/turns.jsonl` — every test
+above is offline, exercising `log_turn` and `run_turn` against fakes and `tmp_path`, never
+against a real live call. That check matters for the same reason it mattered twice already
+in this project: Phase 11's order-ID bug and 10a's date-destruction bug both survived every
+automated review and would have been obvious in one glance at a real record. Until someone
+runs a scripted conversation — including one turn that escalates — and reads the actual
+`logs/turns.jsonl` it produces, this phase's record-legibility claim is verified by test
+fixtures, not by a real log.
