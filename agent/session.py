@@ -173,6 +173,15 @@ class Session:
     tracker: escalation.EscalationTracker
     gates: SessionGates
     handlers: dict[str, Callable[..., Any]]
+    # Telemetry's own turn index (observability/turn_log.py) — deliberately
+    # separate from gates.refunds.turn / gates.scheduling.turn, which belong
+    # to PendingActionGate (the confirmation mechanism) and would silently
+    # change telemetry's meaning if that subsystem ever changes. Incremented
+    # in run_turn, alongside gates.advance_turn() but not by it; the DTMF
+    # handler (transport/pipecat_processors.py) advances it too, since that
+    # path bypasses run_turn entirely and would otherwise collide with the
+    # preceding spoken turn's number.
+    turn: int = 0
 
 
 def create_session(customer_id: str, client: Any | None = None, transport: str = "unknown") -> Session:
@@ -225,11 +234,49 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
     point so no transport and nothing in agent/core.py had to change.
     """
     session.gates.advance_turn()
+    session.turn += 1
 
     clean_text, warnings = sanitize_user_text(user_text)
 
     start = time.perf_counter()
-    result = await session.agent.send(clean_text)
+    try:
+        result = await session.agent.send(clean_text)
+    except Exception as exc:
+        # The one call in this function with a real chance of raising: a live
+        # API error (e.g. a 529) or agent/core.py's runaway-tool-loop
+        # RuntimeError. Without this, the turn counter has already advanced
+        # above but no record explains the gap — the next record would jump
+        # straight from turn N-1 to turn N+1. Record what's known (empty
+        # reply, no tool calls) and then let the exception propagate
+        # unchanged: callers depend on it, and telemetry must never be the
+        # thing that swallows a real failure. `except Exception`, never
+        # BaseException — asyncio.CancelledError must keep propagating
+        # untouched or Pipecat barge-in breaks.
+        try:
+            log_turn(
+                TurnRecord(
+                    session_id=session.session_id,
+                    customer_id=session.customer_id,
+                    transport=session.transport,
+                    turn=session.turn,
+                    user_text=user_text,
+                    reply="",
+                    original_reply=None,
+                    grounding_flagged=False,
+                    hedge_spoken=False,
+                    tool_calls=[],
+                    llm_latency_seconds=time.perf_counter() - start,
+                    warnings=[f"Turn failed before a reply was produced: {exc}"],
+                    escalated=False,
+                    escalation_reason=None,
+                    escalation_id=None,
+                    ended=True,
+                    end_reason="error",
+                )
+            )
+        except Exception:  # noqa: BLE001 — telemetry must never mask the real failure
+            pass
+        raise
     llm_latency = time.perf_counter() - start
 
     # Grounding: a flagged reply is never spoken — the customer hears a hedge
@@ -237,11 +284,14 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
     # (EscalationTracker). The "retry" is simply the customer's next turn, so
     # this costs no extra LLM round-trip and no dead air on a live call.
     reply = result.reply
+    original_reply: str | None = None
+    hedge_spoken = False
     try:
         findings = check_reply_grounding(reply, result.tool_calls)
     except Exception as exc:  # noqa: BLE001 — a guardrail must never break a turn
         findings = []
         warnings.append(f"Could not check reply grounding this turn: {exc}")
+    grounding_flagged = bool(findings)
     if findings:
         warnings.extend(findings)
         # Never substitute the hedge when this turn proposed a confirmation
@@ -249,14 +299,18 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
         # proposing call) — the customer must hear the real proposal text, or
         # their next "okay" commits an action they were never told about.
         # Detection and the escalation counter still run either way (below);
-        # only the substitution is skipped.
+        # only the substitution is skipped. This is exactly why
+        # grounding_flagged and hedge_spoken are two separate telemetry
+        # fields, not one: this branch can flag without ever substituting.
         if not _turn_proposed_a_confirmation(result.tool_calls):
             # Rotate on how many consecutive ungrounded replies preceded this
             # one. The tracker's counter is still the PREVIOUS count here —
             # it is incremented inside check_escalation below — so a first
             # flag gets HEDGE_PHRASES[0] and a second consecutive flag gets a
             # different line, which is exactly the point of varying it.
+            original_reply = reply
             reply = hedge_for(session.tracker.consecutive_ungrounded_replies)
+            hedge_spoken = True
             # Keep session.agent.messages in sync with what the customer
             # actually heard — otherwise the suppressed reply lingers in
             # history for the model to build on next turn.
@@ -271,16 +325,18 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
             session.tracker,
             session.agent.messages,
             result.tool_calls,
-            ungrounded=bool(findings),
+            ungrounded=grounding_flagged,
         )
     except Exception as exc:  # noqa: BLE001 — a classifier hiccup must not crash the turn
         reason = None
         warnings.append(f"Could not run triage classification this turn: {exc}")
 
+    escalation_id: int | None = None
     if reason:
         try:
             packet = await escalation.create_handoff_packet(session.customer_id, session.agent.messages, reason)
-            notice = f"I'm connecting you with a human agent — {reason}. (handoff #{packet['escalation_id']})"
+            escalation_id = packet["escalation_id"]
+            notice = f"I'm connecting you with a human agent — {reason}. (handoff #{escalation_id})"
         except Exception as exc:  # noqa: BLE001 — exit path must never crash on this
             notice = None
             warnings.append(f"Escalation triggered ({reason}) but the handoff packet couldn't be logged: {exc}")
@@ -309,15 +365,18 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
                 session_id=session.session_id,
                 customer_id=session.customer_id,
                 transport=session.transport,
-                turn=session.gates.refunds.turn,
+                turn=session.turn,
                 user_text=user_text,
                 reply=outcome.reply,
-                hedged=bool(findings),
+                original_reply=original_reply,
+                grounding_flagged=grounding_flagged,
+                hedge_spoken=hedge_spoken,
                 tool_calls=result.tool_calls,
                 llm_latency_seconds=llm_latency,
                 warnings=outcome.warnings,
                 escalated=outcome.end_reason == "escalated",
                 escalation_reason=reason,
+                escalation_id=escalation_id,
                 ended=outcome.ended,
                 end_reason=outcome.end_reason,
             )

@@ -402,6 +402,45 @@ async def test_dtmf_escalation_emits_a_turn_record(tmp_path, monkeypatch):
     assert records[0]["escalated"] is True
     assert records[0]["transport"] == "telephony"
     assert "DTMF" in records[0]["user_text"]
+    assert records[0]["grounding_flagged"] is False
+    assert records[0]["hedge_spoken"] is False
+    assert records[0]["escalation_id"] == 7
+    assert records[0]["turn"] == 1
+
+
+@pytest.mark.asyncio
+async def test_dtmf_escalation_does_not_duplicate_the_preceding_spoken_turn_number(monkeypatch, tmp_path):
+    """The DTMF handler bypasses run_turn entirely, so it advances
+    session.turn itself — without that, its record would carry the SAME
+    turn number as the spoken turn immediately before it, colliding at the
+    one event this phase went out of its way to cover."""
+    import json
+
+    from data import mock_db
+
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_dtmf_dedup.db")
+    mock_db.reset_and_seed()
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(return_value=_text_response("Happy to help!"))
+    monkeypatch.setattr(escalation, "classify_turn", AsyncMock(return_value=_calm_classification()))
+    monkeypatch.setattr(
+        escalation, "create_handoff_packet",
+        AsyncMock(return_value={"escalation_id": 7, "reason": "caller pressed 0 for a human"}),
+    )
+    session = create_session("CUST-1001", client=fake_client, transport="telephony")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    await _started(processor)
+
+    await processor.process_frame(_transcript("Hi there"), FrameDirection.DOWNSTREAM)
+    await processor.process_frame(InputDTMFFrame(KeypadEntry.ZERO), FrameDirection.DOWNSTREAM)
+
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    assert len(records) == 2
+    spoken_turn, dtmf_turn = records[0]["turn"], records[1]["turn"]
+    assert dtmf_turn != spoken_turn
+    assert dtmf_turn > spoken_turn
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,7 @@ import json
 import logging
 import os
 import threading
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,10 +39,13 @@ logger = logging.getLogger("observability.turn_log")
 
 DEFAULT_TURN_LOG_PATH = "logs/turns.jsonl"
 
-# The telephony transport handles multiple simultaneous calls in one process,
-# and a record carrying tool output can exceed the size at which a POSIX
-# append is atomic — without this, two concurrent calls can interleave
-# half-lines and corrupt the file.
+# log_turn() contains no `await`, so within one event loop a single call to it
+# already runs start-to-finish without yielding — it cannot itself be
+# interleaved with another call to log_turn(). This lock is insurance for the
+# case that guarantee doesn't cover: multiple OS threads or worker processes
+# (e.g. telephony handling several concurrent calls) appending to the same
+# file, where a record carrying tool output can exceed the size at which a
+# POSIX append is atomic.
 _write_lock = threading.Lock()
 
 
@@ -58,12 +61,15 @@ class TurnRecord:
     turn: int
     user_text: str
     reply: str
-    hedged: bool
+    original_reply: str | None
+    grounding_flagged: bool
+    hedge_spoken: bool
     tool_calls: list[dict[str, Any]]
     llm_latency_seconds: float
     warnings: list[str]
     escalated: bool
     escalation_reason: str | None
+    escalation_id: int | None
     ended: bool
     end_reason: str | None
 
@@ -75,7 +81,12 @@ def _log_path() -> Path | None:
 
 
 def _serialize(record: TurnRecord) -> str:
-    fields = asdict(record)
+    # vars() (a shallow copy of the instance's own __dict__), not asdict():
+    # asdict() deep-copies every field, and copy.deepcopy chokes on values
+    # like a threading.Lock ("cannot pickle") that a tool output could
+    # legitimately be carrying — losing the whole record where a shallow copy
+    # plus the redacting `default=` below would have coped.
+    fields = dict(vars(record))
     latency = fields.pop("llm_latency_seconds")
     return json.dumps(
         {
@@ -83,10 +94,19 @@ def _serialize(record: TurnRecord) -> str:
             **fields,
             "user_text": redact_text(record.user_text),
             "reply": redact_text(record.reply),
+            "original_reply": redact_text(record.original_reply) if record.original_reply is not None else None,
             "tool_calls": redact_structure(record.tool_calls),
+            "warnings": redact_structure(record.warnings),
+            "escalation_reason": redact_text(record.escalation_reason)
+            if record.escalation_reason is not None
+            else None,
             "llm_latency_ms": round(latency * 1000),
         },
-        default=str,
+        # Anything json can't serialize natively falls back to str(obj) — and
+        # an object's own __str__ can just as easily contain PII as any other
+        # string reaching this file, so redact that fallback too rather than
+        # writing it verbatim.
+        default=lambda o: redact_text(str(o)),
     )
 
 
@@ -104,8 +124,16 @@ def log_turn(record: TurnRecord) -> None:
     try:
         line = _serialize(record)
         with _write_lock:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
+            try:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except FileNotFoundError:
+                # The common case is an already-existing parent directory, so
+                # mkdir only runs on the (rare) miss instead of every call —
+                # one retry; if that also fails it falls into the same
+                # catch-log-swallow path as any other failure below.
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
     except Exception as exc:  # noqa: BLE001 — telemetry must never break a call
         logger.warning("turn log write failed, dropping this record: %s", exc)

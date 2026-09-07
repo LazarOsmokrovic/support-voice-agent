@@ -150,14 +150,23 @@ class ClaudeTurnProcessor(FrameProcessor):
         await self.push_frame(LLMFullResponseEndFrame())
 
     async def _handle_dtmf_escalation(self) -> None:
+        escalation_id: int | None = None
         try:
             packet = await escalation.create_handoff_packet(
                 self._session.customer_id, self._session.agent.messages, "caller pressed 0 for a human"
             )
-            notice = f"Connecting you with a human agent. (handoff #{packet['escalation_id']})"
+            escalation_id = packet["escalation_id"]
+            notice = f"Connecting you with a human agent. (handoff #{escalation_id})"
         except Exception as exc:  # noqa: BLE001 — the fallback must never crash the call
             notice = "Connecting you with a human agent."
             print(f"(DTMF escalation triggered, but the handoff packet couldn't be logged: {exc})")
+
+        # This path bypasses run_turn entirely, so it advances the session's
+        # own turn counter itself (agent/session.py's Session.turn) — without
+        # this, its record would carry the SAME turn number as the spoken
+        # turn immediately before it (or turn=0 if 0 is pressed before anyone
+        # speaks), colliding at the one event this phase exists to cover.
+        self._session.turn += 1
 
         # Pressing 0 bypasses run_turn entirely (Phase 9's deterministic safety
         # net), so it would otherwise leave no trace in the turn log — a hole at
@@ -169,15 +178,18 @@ class ClaudeTurnProcessor(FrameProcessor):
                     session_id=self._session.session_id,
                     customer_id=self._session.customer_id,
                     transport=self._session.transport,
-                    turn=self._session.gates.refunds.turn,
+                    turn=self._session.turn,
                     user_text="[DTMF] 0",
                     reply=notice,
-                    hedged=False,
+                    original_reply=None,
+                    grounding_flagged=False,
+                    hedge_spoken=False,
                     tool_calls=[],
                     llm_latency_seconds=0.0,
                     warnings=[],
                     escalated=True,
                     escalation_reason="caller pressed 0 for a human",
+                    escalation_id=escalation_id,
                     ended=True,
                     end_reason="escalated",
                 )

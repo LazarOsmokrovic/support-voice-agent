@@ -7,6 +7,7 @@ the DB tests isolate mock_db.DB_PATH.
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -22,12 +23,15 @@ def _record(**overrides) -> TurnRecord:
         turn=3,
         user_text="Where is my order?",
         reply="It ships tomorrow.",
-        hedged=False,
+        original_reply=None,
+        grounding_flagged=False,
+        hedge_spoken=False,
         tool_calls=[],
         llm_latency_seconds=1.8404,
         warnings=[],
         escalated=False,
         escalation_reason=None,
+        escalation_id=None,
         ended=False,
         end_reason=None,
     )
@@ -61,8 +65,8 @@ def test_record_carries_every_schema_field(tmp_path, monkeypatch):
     record = _read_lines(path)[0]
     for field in (
         "ts", "session_id", "customer_id", "transport", "turn", "user_text", "reply",
-        "hedged", "tool_calls", "llm_latency_ms", "warnings", "escalated",
-        "escalation_reason", "ended", "end_reason",
+        "original_reply", "grounding_flagged", "hedge_spoken", "tool_calls", "llm_latency_ms",
+        "warnings", "escalated", "escalation_reason", "escalation_id", "ended", "end_reason",
     ):
         assert field in record, field
 
@@ -153,3 +157,97 @@ def test_an_unserializable_value_does_not_raise(tmp_path, monkeypatch):
     monkeypatch.setenv("TURN_LOG_PATH", str(path))
 
     log_turn(_record(tool_calls=[{"name": "x", "input": {}, "output": object()}]))
+
+
+def test_pii_is_redacted_in_original_reply(tmp_path, monkeypatch):
+    """original_reply carries the suppressed sentence a hedge replaced — it
+    needs the same redaction as reply/user_text, not a free pass."""
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+
+    log_turn(_record(original_reply="I'll call you back on 555-123-4567."))
+
+    record = _read_lines(path)[0]
+    assert "555-123-4567" not in record["original_reply"]
+    assert record["original_reply"] is not None
+
+
+def test_none_original_reply_stays_none(tmp_path, monkeypatch):
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+
+    log_turn(_record(original_reply=None))
+
+    assert _read_lines(path)[0]["original_reply"] is None
+
+
+def test_pii_is_redacted_in_warnings(tmp_path, monkeypatch):
+    """warnings carries interpolated exception text — the field most likely
+    to accumulate unpredictable content, so redaction must not be
+    forgettable at the call site."""
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+
+    log_turn(_record(warnings=["contact the customer at jane@example.com about this"]))
+
+    record = _read_lines(path)[0]
+    assert "jane@example.com" not in json.dumps(record["warnings"])
+
+
+def test_pii_is_redacted_in_escalation_reason(tmp_path, monkeypatch):
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+
+    log_turn(_record(escalation_reason="caller's callback number is 555-123-4567"))
+
+    record = _read_lines(path)[0]
+    assert "555-123-4567" not in record["escalation_reason"]
+
+
+def test_none_escalation_reason_stays_none(tmp_path, monkeypatch):
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+
+    log_turn(_record(escalation_reason=None))
+
+    assert _read_lines(path)[0]["escalation_reason"] is None
+
+
+def test_a_genuinely_unpicklable_value_does_not_drop_the_record(tmp_path, monkeypatch):
+    """The old `object()`-based unserializable-value test deep-copies fine
+    under asdict(), so it never exercised this: a value like a
+    threading.Lock raises inside copy.deepcopy itself ('cannot pickle'),
+    which would previously lose the whole record. vars() instead of
+    asdict() must sidestep the deep copy entirely."""
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+
+    log_turn(_record(tool_calls=[{"name": "x", "input": {}, "output": {"lock": threading.Lock()}}]))
+
+    assert len(_read_lines(path)) == 1
+
+
+def test_the_default_json_fallback_is_also_redacted(tmp_path, monkeypatch):
+    """default=str would write an object's raw __str__ into the log
+    verbatim; the fallback must run it through redact_text too."""
+
+    class _LeakyRepr:
+        def __str__(self):
+            return "contact jane@example.com"
+
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+
+    log_turn(_record(tool_calls=[{"name": "x", "input": {}, "output": _LeakyRepr()}]))
+
+    blob = json.dumps(_read_lines(path)[0])
+    assert "jane@example.com" not in blob
+
+
+def test_escalation_id_field_round_trips(tmp_path, monkeypatch):
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+
+    log_turn(_record(escalation_id=42))
+
+    assert _read_lines(path)[0]["escalation_id"] == 42
