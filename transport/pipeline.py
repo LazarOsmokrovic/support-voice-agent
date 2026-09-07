@@ -32,7 +32,7 @@ from transport.pipecat_processors import build_pipeline
 async def main() -> None:
     configure_logging()
     customer_id = input(f"Customer ID [{DEFAULT_CUSTOMER_ID}]: ").strip() or DEFAULT_CUSTOMER_ID
-    session = create_session(customer_id)
+    session = create_session(customer_id, transport="pipeline")
 
     transport = LocalAudioTransport(LocalAudioTransportParams(audio_in_enabled=True, audio_out_enabled=True))
     # mute_mic_during_tts=True: local mic/speaker have no acoustic echo

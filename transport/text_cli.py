@@ -21,7 +21,7 @@ from agent.session import DEFAULT_CUSTOMER_ID, close_session, create_session, ru
 async def main() -> None:
     configure_logging()
     customer_id = input(f"Customer ID [{DEFAULT_CUSTOMER_ID}]: ").strip() or DEFAULT_CUSTOMER_ID
-    session = create_session(customer_id)
+    session = create_session(customer_id, transport="text_cli")
 
     print("\nSupport chat — type 'quit' or 'exit' to leave.\n")
     # The agent speaks first, before the customer types anything — see
