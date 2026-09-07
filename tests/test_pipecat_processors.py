@@ -376,6 +376,35 @@ async def test_claude_turn_processor_dtmf_escalation_survives_a_handoff_packet_f
 
 
 @pytest.mark.asyncio
+async def test_dtmf_escalation_emits_a_turn_record(tmp_path, monkeypatch):
+    """Pressing 0 bypasses run_turn by design, so it needs its own record —
+    otherwise the single most important escalation leaves no trace."""
+    import json
+
+    from data import mock_db
+
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_dtmf_log.db")
+    mock_db.reset_and_seed()
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+    monkeypatch.setattr(
+        escalation, "create_handoff_packet",
+        AsyncMock(return_value={"escalation_id": 7, "reason": "caller pressed 0 for a human"}),
+    )
+    session = create_session("CUST-1001", transport="telephony")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    await _started(processor)
+
+    await processor.process_frame(InputDTMFFrame(KeypadEntry.ZERO), FrameDirection.DOWNSTREAM)
+
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    assert len(records) == 1
+    assert records[0]["escalated"] is True
+    assert records[0]["transport"] == "telephony"
+    assert "DTMF" in records[0]["user_text"]
+
+
+@pytest.mark.asyncio
 async def test_latency_logger_logs_the_round_trip_once_per_turn(capsys):
     processor = LatencyLogger(enable_direct_mode=True)
     await _started(processor)

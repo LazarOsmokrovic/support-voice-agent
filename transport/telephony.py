@@ -127,7 +127,7 @@ async def media_stream(websocket: WebSocket) -> None:
         params=FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True, serializer=serializer),
     )
 
-    session = create_session(DEFAULT_CUSTOMER_ID)
+    session = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
     pipeline = build_pipeline(transport, session)
     worker = PipelineWorker(pipeline, params=PipelineParams(enable_metrics=True))
     runner = WorkerRunner()

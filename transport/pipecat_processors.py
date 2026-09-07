@@ -59,6 +59,7 @@ from pipecat.transports.base_transport import BaseTransport
 from agent.prompts import GREETING
 from agent.session import Session, run_turn
 from agent.tools import escalation
+from observability.turn_log import TurnRecord, log_turn
 from transport.tts import (
     DEFAULT_CARTESIA_MODEL,
     DEFAULT_CARTESIA_VOICE,
@@ -157,6 +158,32 @@ class ClaudeTurnProcessor(FrameProcessor):
         except Exception as exc:  # noqa: BLE001 — the fallback must never crash the call
             notice = "Connecting you with a human agent."
             print(f"(DTMF escalation triggered, but the handoff packet couldn't be logged: {exc})")
+
+        # Pressing 0 bypasses run_turn entirely (Phase 9's deterministic safety
+        # net), so it would otherwise leave no trace in the turn log — a hole at
+        # exactly the event most worth recording. Same schema as a spoken turn,
+        # so keypress and spoken escalations read alike in one file.
+        try:
+            log_turn(
+                TurnRecord(
+                    session_id=self._session.session_id,
+                    customer_id=self._session.customer_id,
+                    transport=self._session.transport,
+                    turn=self._session.gates.refunds.turn,
+                    user_text="[DTMF] 0",
+                    reply=notice,
+                    hedged=False,
+                    tool_calls=[],
+                    llm_latency_seconds=0.0,
+                    warnings=[],
+                    escalated=True,
+                    escalation_reason="caller pressed 0 for a human",
+                    ended=True,
+                    end_reason="escalated",
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — telemetry must never break the fallback
+            print(f"(turn log write failed for the DTMF escalation: {exc})")
 
         print(notice)
         await self.push_frame(LLMFullResponseStartFrame())

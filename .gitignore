@@ -5,6 +5,7 @@ __pycache__/
 *.db
 .DS_Store
 data/chroma_db/
+logs/
 .ruff_cache/
 .scratch/
 .worktrees/

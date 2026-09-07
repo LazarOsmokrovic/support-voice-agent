@@ -130,7 +130,7 @@ async def speak(text: str, backend: TTSBackend) -> float:
 async def main() -> None:
     configure_logging()
     customer_id = input(f"Customer ID [{DEFAULT_CUSTOMER_ID}]: ").strip() or DEFAULT_CUSTOMER_ID
-    session = create_session(customer_id)
+    session = create_session(customer_id, transport="voice_local")
     tts_backend = get_tts_backend()
     deepgram_client = AsyncDeepgramClient(api_key=os.getenv("DEEPGRAM_API_KEY"))
 
