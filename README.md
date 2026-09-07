@@ -863,8 +863,8 @@ The redaction tests now import their fixtures from `data/mock_db.py`.
 ## Phase 10b — Structured per-turn observability (Done)
 
 Before this phase, real per-turn signal — `llm_latency_seconds`, `warnings`, `end_reason`,
-10a's new `hedged` — was computed inside `run_turn` and then **discarded at the transport
-boundary**: four ad-hoc loggers (`agent.core`, `agent.tools.escalation`,
+10a's new `hedged` (later split into `grounding_flagged`/`hedge_spoken`, see below) — was
+computed inside `run_turn` and then **discarded at the transport boundary**: four ad-hoc loggers (`agent.core`, `agent.tools.escalation`,
 `agent.tools.notifications`, `guardrails.validators`) emitting prose at WARNING/INFO, and
 the voice transports printing STT/LLM/TTS latency with `print()` and throwing it away.
 Nothing was queryable, nothing was machine-readable, and nothing survived the process. See
@@ -875,18 +875,25 @@ design rationale (alternatives considered — a `logging.Handler`, a decorator a
 **This phase mostly exists to serve 10c.** The eval suite can't measure what the grounding
 detector actually does — its false-positive rate is unknown, and 10a's
 `UNGROUNDED_REPLY_ESCALATION_THRESHOLD = 2` is admittedly a guess whose own code comment
-argues 3 might be better. `hedged` and `warnings`, once they're in a durable per-turn
-record, are the instrument that turns that argument into a measurement — the same way
-eight hand-labelled questions fixed Phase 3's RAG threshold instead of intuition.
+argues 3 might be better. `grounding_flagged`, `hedge_spoken`, and `warnings`, once
+they're in a durable per-turn record, are the instrument that turns that argument into a
+measurement — the same way eight hand-labelled questions fixed Phase 3's RAG threshold
+instead of intuition.
 
 ### `observability/turn_log.py` (new) — the record and the writer
 
 A new top-level package, mirroring the existing `guardrails/` and `eval/` layout. One
 dataclass, `TurnRecord`, carrying `session_id`, `customer_id`, `transport`, `turn`,
-`user_text`, `reply`, `hedged`, `tool_calls`, `llm_latency_seconds`, `warnings`,
-`escalated`, `escalation_reason`, `ended`, `end_reason` — fourteen fields, and the dataclass
-**is** the schema, worth documenting in code rather than prose. `log_turn(record)` appends
-one JSON line to `logs/turns.jsonl`:
+`user_text`, `reply`, `grounding_flagged`, `hedge_spoken`, `tool_calls`,
+`llm_latency_seconds`, `warnings`, `escalated`, `escalation_reason`, `ended`, `end_reason`
+— fifteen fields, and the dataclass **is** the schema, worth documenting in code rather
+than prose. `grounding_flagged` and `hedge_spoken` started life as a single `hedged`
+field; they were split because detection and action are different events — a turn that
+proposes a refund/booking confirmation still gets flagged (`grounding_flagged=True`) but
+deliberately keeps its real reply instead of the canned hedge (`hedge_spoken=False`), so a
+reader (and 10c's eval suite) can tell "the detector fired" apart from "we actually said
+the hedge" rather than the two always moving together. `log_turn(record)` appends one JSON
+line to `logs/turns.jsonl`:
 
 - **Redaction happens inside `log_turn`, not at the two call sites**, so a caller cannot
   forget it. `user_text`/`reply` go through the existing `redact_text`; `tool_calls` — the
@@ -960,8 +967,11 @@ imports its fixtures from `data/mock_db.py` the same way 10a's redaction tests d
   the tail, after all three. This is what keeps the emit point from being duplicated three
   ways — or, worse, silently missed on some future fourth branch. The restructure was
   verified branch-by-branch as a genuine no-op: all three branches construct the identical
-  `TurnOutcome` they did before this phase: `hedged` is `bool(findings)`; `escalated` is
-  `outcome.end_reason == "escalated"`.
+  `TurnOutcome` they did before this phase. A later fix wave split what was one field,
+  `hedged`, into two: `grounding_flagged` is `bool(findings)` — the detector fired — and
+  `hedge_spoken` is whether the canned hedge was actually substituted for the reply, which
+  is skipped when the turn proposed a refund/booking confirmation (the customer must still
+  hear that proposal). `escalated` is `outcome.end_reason == "escalated"`.
 - The `log_turn` call itself is wrapped in its own `try`/`except` — belt-and-suspenders on
   top of `log_turn`'s own guarantee that it never raises, the same precedent
   `create_handoff_packet` already sets around its own call to `notify_escalation`: wrap a
@@ -988,8 +998,9 @@ would produce **no record at all** — a hole at exactly the event most worth ob
 is the same class of mistake as 10a's "redaction is applied at the two places" claim when
 there were actually four: a path not enumerated. So the DTMF handler now emits its own
 `TurnRecord` too (`user_text="[DTMF] 0"`, `escalated=True`,
-`escalation_reason="caller pressed 0 for a human"`, `hedged=False`, `ended=True`,
-`end_reason="escalated"`, no tool calls, zero LLM latency) — one schema, one file, so a
+`escalation_reason="caller pressed 0 for a human"`, `grounding_flagged=False`,
+`hedge_spoken=False`, `ended=True`, `end_reason="escalated"`, no tool calls, zero LLM
+latency) — one schema, one file, so a
 keypress escalation reads alongside spoken ones rather than vanishing. The `log_turn` call
 sits in its own `try`/`except` **after** the block that creates the handoff packet, not
 inside it — deliberately, so a record is still written (with a generic fallback notice)
@@ -1035,8 +1046,10 @@ is the clean addition, not a retrofit of this one.
 - `tests/test_session.py` — 6 new tests: `create_session` assigns a unique `session_id` and
   stores the transport label (including the `"unknown"` default); a turn emits exactly one
   `TurnRecord`; a `log_turn` failure surfaces as a warning rather than crashing the turn;
-  `hedged`/`escalated` land correctly in the record for an ungrounded reply and for an
-  escalating turn respectively.
+  `grounding_flagged`/`hedge_spoken`/`escalated` land correctly in the record for an
+  ungrounded reply and for an escalating turn respectively — including the case where a
+  turn is flagged but the confirmation it proposed is spoken anyway, proving the two
+  fields are genuinely distinguishable rather than always moving together.
 - `tests/test_pipecat_processors.py` — 1 new test: the DTMF escalation path emits its own
   turn record.
 

@@ -9,8 +9,18 @@ machine-readable and nothing survived the process.
 This mostly exists to serve Phase 10c. The eval suite cannot measure what the
 grounding detector actually does — its false-positive rate is unknown, and
 10a's UNGROUNDED_REPLY_ESCALATION_THRESHOLD is admittedly a guess. The
-`hedged` and `warnings` fields are the instrument that turns that argument
-into a measurement.
+`grounding_flagged`, `hedge_spoken`, and `warnings` fields are the instrument
+that turns that argument into a measurement.
+
+`grounding_flagged` and `hedge_spoken` used to be one field, `hedged`. They
+were split because detection and action are genuinely different events: a
+turn that proposed a refund/booking confirmation is still flagged by the
+detector (`grounding_flagged=True`) but the hedge is deliberately NOT
+substituted for it (`hedge_spoken=False`), because swapping out the real
+reply would silently drop the confirmation the caller needs to act on. A
+single `hedged` field would have conflated "the detector fired" with "we
+said the canned hedge instead", which would have made 10c overcount how
+often the detector actually changes what gets spoken.
 
 Deliberately ON by default (logs/turns.jsonl), unlike every other optional
 integration in this project. Observability that is off by default observes

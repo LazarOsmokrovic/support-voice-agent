@@ -279,10 +279,16 @@ survived the process. See
 design rationale.
 
 **New `observability/turn_log.py`** — one `TurnRecord` dataclass (`session_id`,
-`customer_id`, `transport`, `turn`, `user_text`, `reply`, `hedged`, `tool_calls`,
-`llm_latency_seconds`, `warnings`, `escalated`, `escalation_reason`, `ended`,
-`end_reason`) and `log_turn(record)`, which appends one redacted, JSON-serialized line to
-`logs/turns.jsonl`. The dataclass **is** the schema — worth having in code, not prose.
+`customer_id`, `transport`, `turn`, `user_text`, `reply`, `grounding_flagged`,
+`hedge_spoken`, `tool_calls`, `llm_latency_seconds`, `warnings`, `escalated`,
+`escalation_reason`, `ended`, `end_reason`) and `log_turn(record)`, which appends one
+redacted, JSON-serialized line to `logs/turns.jsonl`. The dataclass **is** the schema —
+worth having in code, not prose. `grounding_flagged`/`hedge_spoken` replace 10a's single
+`hedged` field: `grounding_flagged` records whether the detector fired, `hedge_spoken`
+records whether the canned hedge was actually substituted for the reply. They diverge on
+a turn that proposed a refund/booking confirmation — flagged, but the real reply is kept
+so the confirmation still reaches the caller — which is exactly the distinction 10c needs
+to measure the detector without overcounting hedges.
 
 - **Redaction happens inside `log_turn`, not at the call site.** `user_text`/`reply` pass
   through `guardrails/pii.py`'s existing `redact_text`; `tool_calls` — arbitrary nested

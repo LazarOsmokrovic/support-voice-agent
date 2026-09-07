@@ -266,7 +266,7 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
                     hedge_spoken=False,
                     tool_calls=[],
                     llm_latency_seconds=time.perf_counter() - start,
-                    warnings=[f"Turn failed before a reply was produced: {exc}"],
+                    warnings=[*warnings, f"Turn failed before a reply was produced: {exc}"],
                     escalated=False,
                     escalation_reason=None,
                     escalation_id=None,
