@@ -888,7 +888,7 @@ dataclass, `TurnRecord`, carrying `session_id`, `customer_id`, `transport`, `tur
 **is** the schema, worth documenting in code rather than prose. `log_turn(record)` appends
 one JSON line to `logs/turns.jsonl`:
 
-- **Redaction happens inside `log_turn`, not at the four call sites**, so a caller cannot
+- **Redaction happens inside `log_turn`, not at the two call sites**, so a caller cannot
   forget it. `user_text`/`reply` go through the existing `redact_text`; `tool_calls` — the
   new `redact_structure` (below) — before serialization. `llm_latency_ms`, rounded to an
   integer, replaces the raw `llm_latency_seconds` float in the written record —
@@ -964,9 +964,11 @@ imports its fixtures from `data/mock_db.py` the same way 10a's redaction tests d
   `outcome.end_reason == "escalated"`.
 - The `log_turn` call itself is wrapped in its own `try`/`except` — belt-and-suspenders on
   top of `log_turn`'s own guarantee that it never raises, the same precedent
-  `create_handoff_packet` already sets for `notify_escalation`: a telemetry failure
-  surfaces as an appended warning on `outcome.warnings`, never an exception that could break
-  a live call.
+  `create_handoff_packet` already sets around its own call to `notify_escalation`: wrap a
+  telemetry/notification call so its failure can never propagate and break the thing it's
+  reporting on. The specific handling differs — `run_turn` appends a warning to
+  `outcome.warnings`, while `create_handoff_packet` logs via `logger.exception` and marks
+  the delivery as failed — but the shared principle is the same.
 
 ### The four transports — one line each, and the DTMF gap closed
 
@@ -986,9 +988,13 @@ would produce **no record at all** — a hole at exactly the event most worth ob
 is the same class of mistake as 10a's "redaction is applied at the two places" claim when
 there were actually four: a path not enumerated. So the DTMF handler now emits its own
 `TurnRecord` too (`user_text="[DTMF] 0"`, `escalated=True`,
-`escalation_reason="caller pressed 0 for a human"`, `hedged=False`, no tool calls, zero LLM
-latency) — one schema, one file, so a keypress escalation reads alongside spoken ones
-rather than vanishing.
+`escalation_reason="caller pressed 0 for a human"`, `hedged=False`, `ended=True`,
+`end_reason="escalated"`, no tool calls, zero LLM latency) — one schema, one file, so a
+keypress escalation reads alongside spoken ones rather than vanishing. The `log_turn` call
+sits in its own `try`/`except` **after** the block that creates the handoff packet, not
+inside it — deliberately, so a record is still written (with a generic fallback notice)
+even when `create_handoff_packet` itself fails: the escalation happened and the caller
+still heard a notice, so it should still be recorded either way.
 
 ### Two gaps found by a pre-implementation review, before any code was written
 

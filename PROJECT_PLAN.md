@@ -288,8 +288,8 @@ design rationale.
   through `guardrails/pii.py`'s existing `redact_text`; `tool_calls` — arbitrary nested
   dicts and lists (policy chunks, order rows, refund results) — through a new
   `redact_structure`, added to `pii.py` so there stays one definition of what redaction
-  means in this codebase. Doing this inside the writer, rather than trusting each of four
-  call sites to redact before calling it, means a caller cannot forget it.
+  means in this codebase. Doing this inside the writer, rather than trusting each of the
+  two call sites to redact before calling it, means a caller cannot forget it.
 - **On by default**, to `logs/turns.jsonl` (gitignored) — a deliberate break from this
   project's optional-by-default convention (`ESCALATION_WEBHOOK_URL`, `TTS_BACKEND`,
   `EMBEDDING_BACKEND` are all silent no-ops unless configured). Observability that is off
