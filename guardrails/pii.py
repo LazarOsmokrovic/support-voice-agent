@@ -124,3 +124,27 @@ def redact_fields(data: dict[str, Any], fields: Sequence[str]) -> dict[str, Any]
         if field in redacted and isinstance(redacted[field], str):
             redacted[field] = redact_text(redacted[field])
     return redacted
+
+
+def redact_structure(value: Any) -> Any:
+    """Recursively redact every string inside a nested structure.
+
+    `redact_fields` handles a flat mapping's named fields, which is the right
+    shape for a handoff packet. Tool outputs are arbitrary nested dicts and
+    lists (policy chunks, order rows, refund results), so anything logged from
+    them needs this instead — see observability/turn_log.py.
+
+    Dict KEYS are deliberately left alone: they are field names chosen by this
+    codebase, never customer-supplied, and redacting them would make a log
+    record unreadable. Non-string scalars pass through untouched.
+
+    Returns a copy; never mutates the input, because callers hand us live tool
+    output that is still in use elsewhere on the turn.
+    """
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, dict):
+        return {key: redact_structure(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_structure(item) for item in value]
+    return value

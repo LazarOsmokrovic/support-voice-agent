@@ -6,7 +6,7 @@ narrower version in Phase 11 for the outbound webhook.
 from __future__ import annotations
 
 from data.mock_db import APPOINTMENTS, ORDERS
-from guardrails.pii import HANDOFF_TEXT_FIELDS, redact_fields, redact_text
+from guardrails.pii import HANDOFF_TEXT_FIELDS, redact_fields, redact_structure, redact_text
 
 
 def test_redact_text_masks_email():
@@ -95,3 +95,41 @@ def test_handoff_text_fields_matches_the_handoff_packet_shape():
         "verified_account_info",
         "actions_taken",
     )
+
+
+def test_redact_structure_redacts_strings_nested_in_dicts_and_lists():
+    value = {
+        "message": "Email jane@example.com",
+        "items": ["call 555-123-4567", {"note": "card 4111 1111 1111 1111"}],
+    }
+    result = redact_structure(value)
+    assert "[redacted-email]" in result["message"]
+    assert "[redacted-phone]" in result["items"][0]
+    assert "[redacted-number]" in result["items"][1]["note"]
+
+
+def test_redact_structure_leaves_non_strings_untouched():
+    value = {"found": True, "price": 34.99, "quantity": 1, "tracking": None}
+    assert redact_structure(value) == value
+
+
+def test_redact_structure_leaves_dict_keys_untouched():
+    value = {"jane@example.com": "ordinary text"}
+    assert list(redact_structure(value).keys()) == ["jane@example.com"]
+
+
+def test_redact_structure_does_not_mutate_its_input():
+    value = {"message": "Email jane@example.com"}
+    redact_structure(value)
+    assert value["message"] == "Email jane@example.com"
+
+
+def test_redact_structure_preserves_real_seeded_identifiers():
+    order_id, delivery, tracking = ORDERS[0][0], ORDERS[0][7], ORDERS[0][8]
+    value = {"order_id": order_id, "estimated_delivery": delivery, "tracking_number": tracking}
+    assert redact_structure(value) == value
+
+
+def test_redact_structure_handles_a_bare_string_and_a_bare_scalar():
+    assert redact_structure("Email jane@example.com") == "Email [redacted-email]"
+    assert redact_structure(42) == 42
