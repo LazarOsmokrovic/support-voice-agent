@@ -572,3 +572,87 @@ async def test_run_scenario_reports_an_exhausted_recording_as_an_error_rather_th
     assert "short_demo" in result.error
     assert "create #2" in result.error
     assert result.replies == ["Happy to help!"]
+
+
+@pytest.mark.asyncio
+async def test_recording_client_captures_creates_and_parses_while_delegating(tmp_path):
+    """Built and tested against a fake inner client on purpose — nothing in
+    this plan ever calls the real API."""
+    from agent.tools.escalation import TurnClassification
+
+    from eval.record import RecordingAnthropicClient
+    from eval.replay import FakeAnthropicClient
+
+    inner = FakeAnthropicClient("inner", [_message_payload()], [_calm_parse_entry()])
+    wrapper = RecordingAnthropicClient(inner)
+
+    message = await wrapper.messages.create(model="m", max_tokens=1, messages=[])
+    parsed = await wrapper.messages.parse(
+        model="m", max_tokens=1, messages=[], output_format=TurnClassification
+    )
+
+    assert message.stop_reason == "end_turn"
+    assert parsed.parsed_output.intent == "chitchat"
+    assert len(wrapper.creates) == 1
+    assert wrapper.creates[0]["content"][0]["text"] == "Happy to help!"
+    assert wrapper.parses == [
+        {
+            "output_format": "TurnClassification",
+            "parsed_output": {"intent": "chitchat", "sentiment": "neutral", "policy_restricted": False},
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_record_scenario_builds_a_recording_with_current_hashes(tmp_path, monkeypatch):
+    from eval import recording as recording_module
+    from eval.record import record_scenario
+    from eval.recording import current_hashes
+    from eval.replay import FakeAnthropicClient
+
+    monkeypatch.setattr(recording_module, "RECORDINGS_DIR", tmp_path / "recordings")
+    scenario = _minimal_scenario(name="record_demo", turns=("Hi",), grounding_truth=("not_applicable",))
+
+    def factory():
+        return FakeAnthropicClient("record_demo", [_message_payload()], [_calm_parse_entry()])
+
+    recording, result = await record_scenario(scenario, tmp_path / "work", factory)
+
+    assert result.error is None
+    assert recording.scenario == "record_demo"
+    assert len(recording.creates) == 1
+    assert len(recording.parses) == 1
+    assert len(recording.observed) == 1
+    for name, value in current_hashes().items():
+        assert getattr(recording, name) == value
+    datetime.fromisoformat(recording.recorded_at)  # parses, i.e. is a usable frozen clock
+
+
+def test_grounding_worksheet_emits_a_paste_ready_block_with_one_label_per_turn():
+    from eval.harness import HarnessResult, ObservedTurn
+    from eval.record import grounding_worksheet
+
+    scenario = _minimal_scenario(name="ws_demo", turns=("a", "b"), grounding_truth=())
+    result = HarnessResult(
+        scenario="ws_demo",
+        replies=["You have 30 days.", "Anything else?"],
+        observed=[
+            ObservedTurn(1, [{"name": "search_policy", "input": {}, "output": {"found": True, "results": []}}], True, True, None, None, "dict"),
+            ObservedTurn(2, [], False, False, None, "model_ended", None),
+        ],
+    )
+
+    text = grounding_worksheet(scenario, result)
+
+    assert "grounding_truth=(" in text
+    assert text.count('"not_applicable"') == 2
+    assert "grounding_flagged=True" in text
+    assert "You have 30 days." in text
+
+
+def test_record_main_exits_clearly_when_there_is_no_api_key(monkeypatch, capsys):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    from eval.record import main
+
+    assert main(["--all"]) == 2
+    assert "ANTHROPIC_API_KEY" in capsys.readouterr().out
