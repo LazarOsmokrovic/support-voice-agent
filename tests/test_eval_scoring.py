@@ -352,3 +352,103 @@ def test_combine_counts_sums_every_field_across_scenarios():
     assert total.ladder_fired == 1
     assert total.labeled_turns == 6
     assert combine_counts([]) == EMPTY_COUNTS
+
+
+def _report(*scenarios):
+    from eval.report import EvalReport
+
+    return EvalReport(scenarios=list(scenarios))
+
+
+def _scenario_report(name, outcome, capability="refunds", turns=2, details=None):
+    from eval.report import ScenarioReport
+
+    return ScenarioReport(name=name, capability=capability, turns=turns, outcome=outcome, details=details or [])
+
+
+def test_exit_code_is_zero_only_when_everything_passed():
+    from eval.report import exit_code
+
+    assert exit_code(_report(_scenario_report("a", "PASS"), _scenario_report("b", "PASS"))) == 0
+
+
+def test_exit_code_one_for_a_behavioural_failure_and_two_for_stale_fixtures():
+    """Three codes because CI should go red on a regression and go red
+    DIFFERENTLY on 'your fixtures need refreshing' — the fixes differ, and
+    conflating them trains people to ignore the signal."""
+    from eval.report import exit_code
+
+    assert exit_code(_report(_scenario_report("a", "FAIL"), _scenario_report("b", "STALE"))) == 1
+    assert exit_code(_report(_scenario_report("a", "PASS"), _scenario_report("b", "STALE"))) == 2
+    assert exit_code(_report(_scenario_report("a", "MISSING"))) == 2
+    assert exit_code(_report(_scenario_report("a", "DRIFT"))) == 2
+    assert exit_code(_report(_scenario_report("a", "ERROR"))) == 2
+
+
+def test_strict_collapses_the_fixture_code_into_the_failure_code():
+    from eval.report import exit_code
+
+    report = _report(_scenario_report("a", "PASS"), _scenario_report("b", "STALE"))
+    assert exit_code(report, strict=True) == 1
+    assert exit_code(_report(_scenario_report("a", "PASS")), strict=True) == 0
+
+
+def test_render_shows_every_outcome_the_capability_tally_and_the_grounding_block():
+    from eval.report import render
+    from eval.scoring import GroundingCounts
+
+    report = _report(
+        _scenario_report("order_status_delivered", "PASS", capability="order_status", turns=3),
+        _scenario_report("refund_low_value_propose_then_confirm", "FAIL", details=["db: expected 1 row, found 0"]),
+        _scenario_report("scheduling_book_then_reschedule", "STALE", capability="scheduling", turns=6),
+    )
+    report.grounding = GroundingCounts(
+        grounded=9, ungrounded=2, flagged=3, true_positive=2, false_positive=1,
+        true_negative=8, false_negative=0, hedged=2, unreachable_claims=4, ladder_fired=1, labeled_turns=11,
+    )
+    report.pii_leaks = 0
+    report.stored_records = {"turn_log": 68, "tickets": 4, "escalations": 4}
+
+    text = render(report)
+
+    assert "PASS   order_status_delivered" in text
+    assert "FAIL   refund_low_value_propose_then_confirm" in text
+    assert "db: expected 1 row, found 0" in text
+    assert "1 passed · 1 failed · 1 stale" in text
+    assert "capability coverage" in text
+    assert "false positives       1/9" in text
+    assert "unreachable claims      4" in text
+    assert "pii: 0 leaks across 76 stored records" in text
+
+
+def test_render_never_crashes_on_an_empty_or_all_not_applicable_report():
+    """Spec §9 test 11. A report that dies on the degenerate case is a report
+    nobody can trust on the interesting one."""
+    from eval.report import render
+    from eval.scoring import EMPTY_COUNTS
+
+    empty = _report()
+    empty.grounding = EMPTY_COUNTS
+    text = render(empty)
+    assert "0 passed" in text
+    assert "0/0 — insufficient data" in text
+
+    errored = _report(_scenario_report("boom", "ERROR", details=["RuntimeError: exploded"]))
+    errored.grounding = EMPTY_COUNTS
+    assert "ERROR  boom" in render(errored)
+
+
+def test_to_json_emits_the_whole_report_as_one_serialisable_object():
+    import json
+
+    from eval.report import to_json
+    from eval.scoring import EMPTY_COUNTS
+
+    report = _report(_scenario_report("a", "PASS"))
+    report.grounding = EMPTY_COUNTS
+    payload = to_json(report)
+
+    assert payload["scenarios"][0]["outcome"] == "PASS"
+    assert payload["summary"]["passed"] == 1
+    assert payload["grounding"]["false_positive"] == 0
+    json.dumps(payload)  # must be serialisable, not just dict-shaped
