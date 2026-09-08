@@ -656,3 +656,115 @@ def test_record_main_exits_clearly_when_there_is_no_api_key(monkeypatch, capsys)
 
     assert main(["--all"]) == 2
     assert "ANTHROPIC_API_KEY" in capsys.readouterr().out
+
+
+def test_every_scenario_references_a_customer_that_exists_in_the_seed():
+    from data.mock_db import CUSTOMERS
+    from eval.scenarios import SCENARIOS
+
+    known = {row[0] for row in CUSTOMERS}
+    for scenario in SCENARIOS:
+        assert scenario.customer_id in known, f"{scenario.name} references unknown customer {scenario.customer_id}"
+
+
+def test_every_order_id_mentioned_by_a_scenario_exists_in_the_seed():
+    """The project's most-repeated defect: a hand-typed order ID that no
+    longer matches the seed produces a scenario which tests nothing and
+    fails plausibly. Any 3-7-7 shaped ID in a turn or a db_assertion param
+    must resolve, unless the scenario deliberately uses an unknown one."""
+    import re
+
+    from data.mock_db import ORDERS
+    from eval.scenarios import SCENARIOS
+
+    known = {row[0] for row in ORDERS}
+    pattern = re.compile(r"\b\d{3}-\d{7}-\d{7}\b")
+    deliberately_unknown = {"order_status_invalid_id_then_correct", "triage_repeated_failed_lookups"}
+    for scenario in SCENARIOS:
+        haystack = " ".join(scenario.turns) + " " + " ".join(
+            str(param) for assertion in scenario.expect.db_assertions for param in assertion.params
+        )
+        for found in pattern.findall(haystack):
+            if scenario.name in deliberately_unknown and found not in known:
+                continue
+            assert found in known, f"{scenario.name} references unknown order {found}"
+
+
+def test_every_escalation_reason_is_a_literal_the_code_can_actually_produce():
+    from agent.tools import escalation as escalation_module
+    from eval.scenarios import SCENARIOS
+
+    fixed = {
+        "explicit request for a human",
+        "policy-restricted topic",
+        "sustained negative sentiment across multiple turns",
+        "repeated failed lookups",
+        "repeated ungrounded replies",
+    }
+    source = (
+        __import__("pathlib").Path(escalation_module.__file__).read_text(encoding="utf-8")
+    )
+    for literal in fixed:
+        assert literal in source, f"{literal!r} is no longer produced by agent/tools/escalation.py"
+    for scenario in SCENARIOS:
+        reason = scenario.expect.escalation_reason
+        if reason is None:
+            continue
+        assert reason in fixed or reason.startswith("high-value refund ("), scenario.name
+
+
+def test_every_scenario_declares_one_grounding_label_per_turn_and_a_known_capability():
+    from eval.scenarios import CAPABILITIES, SCENARIOS
+
+    for scenario in SCENARIOS:
+        assert scenario.capability in CAPABILITIES, scenario.name
+        assert len(scenario.grounding_truth) == len(scenario.turns), scenario.name
+        assert all(
+            label in ("grounded", "ungrounded", "not_applicable") for label in scenario.grounding_truth
+        ), scenario.name
+
+
+def test_scenario_names_are_unique_and_usable_as_recording_filenames():
+    import re
+
+    from eval.scenarios import SCENARIOS, scenario_by_name
+
+    names = [scenario.name for scenario in SCENARIOS]
+    assert len(names) == len(set(names))
+    for name in names:
+        assert re.fullmatch(r"[a-z0-9_]+", name), name
+        assert scenario_by_name(name) is not None
+
+
+def test_the_roster_is_exactly_twenty_and_covers_all_six_capabilities():
+    """PROJECT_PLAN.md promises 10-20 scenarios across all six features.
+    That contract is asserted here rather than assumed."""
+    from collections import Counter
+
+    from eval.scenarios import CAPABILITIES, SCENARIOS
+
+    assert len(SCENARIOS) == 20
+    assert 10 <= len(SCENARIOS) <= 20
+    tally = Counter(scenario.capability for scenario in SCENARIOS)
+    assert set(tally) == set(CAPABILITIES)
+    assert tally["order_status"] == 3
+    assert tally["refunds"] == 4
+    assert tally["policy_qa"] == 4
+    assert tally["triage"] == 6
+    assert tally["scheduling"] == 2
+    assert tally["summary"] == 1
+
+
+def test_every_escalation_trigger_the_agent_can_take_is_exercised_by_some_scenario():
+    """Before this phase, live coverage reached two of five escalation
+    triggers (agent/tools/escalation.py:161-186). These scenarios close the
+    other three, so every escalation path is exercised for the first time."""
+    from eval.scenarios import SCENARIOS
+
+    reasons = {scenario.expect.escalation_reason for scenario in SCENARIOS}
+    assert "explicit request for a human" in reasons
+    assert "policy-restricted topic" in reasons
+    assert "sustained negative sentiment across multiple turns" in reasons
+    assert "repeated failed lookups" in reasons
+    assert "repeated ungrounded replies" in reasons
+    assert any(r and r.startswith("high-value refund (") for r in reasons)
