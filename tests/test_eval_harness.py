@@ -10,6 +10,8 @@ the duplicate harness this phase exists to remove.
 
 from __future__ import annotations
 
+import pytest
+
 from eval.scenarios import (
     CAPABILITIES,
     DbAssertion,
@@ -177,3 +179,142 @@ def test_frozen_now_applies_the_scenarios_clock_offset():
     scenario = _minimal_scenario(clock_offset_days=45)
     assert frozen_now(_recording(), scenario) == datetime(2026, 10, 23, 12, 0, 0)
     assert frozen_now(_recording(), _minimal_scenario()) == datetime(2026, 9, 8, 12, 0, 0)
+
+
+def _message_payload(**overrides) -> dict:
+    base = {
+        "id": "msg_eval_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-opus-5",
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 10, "output_tokens": 5},
+        "content": [{"type": "text", "text": "Happy to help!"}],
+    }
+    base.update(overrides)
+    return base
+
+
+def _tool_use_payload() -> dict:
+    from data.mock_db import ORDERS
+
+    return _message_payload(
+        stop_reason="tool_use",
+        content=[
+            {"type": "text", "text": "Let me check that."},
+            {
+                "type": "tool_use",
+                "id": "toolu_eval_1",
+                "name": "get_order_status",
+                "input": {"order_id": ORDERS[0][0]},
+            },
+        ],
+    )
+
+
+def test_rebuild_message_produces_a_real_sdk_message_not_a_mock():
+    from anthropic.types import Message
+
+    from eval.replay import rebuild_message
+
+    message = rebuild_message(_message_payload())
+    assert isinstance(message, Message)
+    assert message.stop_reason == "end_turn"
+    assert message.content[0].type == "text"
+    assert message.content[0].text == "Happy to help!"
+
+
+def test_rebuild_message_gives_a_tool_use_block_the_attributes_agent_send_consumes():
+    """agent/core.py:125-130 reads block.type, block.name, block.id and
+    block.input, and puts block.input straight into TurnResult.tool_calls.
+    A dict-LIKE input would pass isinstance checks nowhere and corrupt every
+    downstream args_subset comparison, so this pins the runtime type."""
+    from data.mock_db import ORDERS
+
+    from eval.replay import rebuild_message
+
+    message = rebuild_message(_tool_use_payload())
+    block = [b for b in message.content if b.type == "tool_use"][0]
+    assert block.name == "get_order_status"
+    assert block.id == "toolu_eval_1"
+    assert type(block.input) is dict
+    assert block.input == {"order_id": ORDERS[0][0]}
+
+
+@pytest.mark.asyncio
+async def test_fake_client_pops_creates_in_recorded_order():
+    from eval.replay import FakeAnthropicClient
+
+    client = FakeAnthropicClient("demo", [_tool_use_payload(), _message_payload()], [])
+
+    first = await client.messages.create(model="claude-opus-5", max_tokens=1024, messages=[])
+    second = await client.messages.create(model="claude-opus-5", max_tokens=1024, messages=[])
+
+    assert first.stop_reason == "tool_use"
+    assert second.stop_reason == "end_turn"
+    assert client.creates_consumed == 2
+    assert client.creates_remaining == 0
+
+
+@pytest.mark.asyncio
+async def test_fake_client_raises_recording_exhausted_naming_scenario_and_index():
+    from eval.replay import FakeAnthropicClient, RecordingExhausted
+
+    client = FakeAnthropicClient("refund_high_value_escalates", [_message_payload()], [])
+    await client.messages.create(model="m", max_tokens=1, messages=[])
+
+    with pytest.raises(RecordingExhausted) as excinfo:
+        await client.messages.create(model="m", max_tokens=1, messages=[])
+    assert "refund_high_value_escalates" in str(excinfo.value)
+    assert "create #2" in str(excinfo.value)
+    assert "1 recorded" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_fake_client_parse_dispatches_on_output_format_and_returns_parsed_output():
+    from agent.tools.escalation import TurnClassification
+
+    from eval.replay import FakeAnthropicClient
+
+    client = FakeAnthropicClient(
+        "demo",
+        [],
+        [
+            {
+                "output_format": "TurnClassification",
+                "parsed_output": {"intent": "chitchat", "sentiment": "neutral", "policy_restricted": False},
+            }
+        ],
+    )
+
+    response = await client.messages.parse(
+        model="m", max_tokens=256, messages=[], output_format=TurnClassification
+    )
+
+    assert isinstance(response.parsed_output, TurnClassification)
+    assert response.parsed_output.intent == "chitchat"
+    assert client.parses_consumed == 1
+
+
+@pytest.mark.asyncio
+async def test_fake_client_parse_raises_mismatch_when_the_call_order_diverges():
+    from agent.tools.summary import SessionSummary
+
+    from eval.replay import FakeAnthropicClient, RecordingMismatch
+
+    client = FakeAnthropicClient(
+        "demo",
+        [],
+        [
+            {
+                "output_format": "TurnClassification",
+                "parsed_output": {"intent": "chitchat", "sentiment": "neutral", "policy_restricted": False},
+            }
+        ],
+    )
+
+    with pytest.raises(RecordingMismatch) as excinfo:
+        await client.messages.parse(model="m", max_tokens=1, messages=[], output_format=SessionSummary)
+    assert "SessionSummary" in str(excinfo.value)
+    assert "TurnClassification" in str(excinfo.value)
