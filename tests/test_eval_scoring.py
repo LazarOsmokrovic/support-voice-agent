@@ -219,6 +219,43 @@ def test_pii_scoring_passes_when_identifiers_survive_and_contacts_are_redacted(t
     assert score_pii(scenario, result) == []
 
 
+def test_pii_scoring_flags_a_boundary_mangled_tracking_number(tmp_path):
+    """Phase 10a's actual damage shape: a phone-like pattern eats the digit
+    run inside an alphanumeric tracking number, leaving only the non-digit
+    boundary letters intact — TBA123456789US becomes TBA[redacted-phone]US.
+    Only 3 characters survive on each side of the marker, so a heuristic
+    demanding a long surviving prefix (the code this replaces) missed this
+    shape entirely; that's the Critical the review caught."""
+    customer_id, _name, _email, _phone = mock_db.CUSTOMERS[0]
+    order_id, _cust, _item, _q, _p, _s, _od, _ed, tracking = mock_db.ORDERS[0]
+    mangled_tracking = f"{tracking[:3]}[redacted-phone]{tracking[-2:]}"
+    scenario = _scenario(customer_id=customer_id)
+    result = _result(
+        log_lines=[{"reply": f"Order {order_id} shipped, tracking {mangled_tracking}", "user_text": "hi"}]
+    )
+    failures = score_pii(scenario, result)
+    assert any(tracking in failure.detail for failure in failures)
+    assert all(failure.kind == "pii" for failure in failures)
+
+
+def test_pii_scoring_flags_a_fully_wiped_order_id(tmp_path):
+    """The other real damage shape: a card-like pattern's replacement
+    swallows an identifier whole, leaving zero surviving characters —
+    112-3487561-2938471 becomes [redacted-number]. No surviving-prefix
+    heuristic could ever catch this one, however short the prefix
+    requirement; the check has to work from full-string absence, not
+    remnant characters."""
+    customer_id, _name, _email, _phone = mock_db.CUSTOMERS[0]
+    order_id, _cust, _item, _q, _p, _s, _od, _ed, tracking = mock_db.ORDERS[0]
+    scenario = _scenario(customer_id=customer_id)
+    result = _result(
+        log_lines=[{"reply": f"Order [redacted-number] shipped, tracking {tracking}", "user_text": "hi"}]
+    )
+    failures = score_pii(scenario, result)
+    assert any(order_id in failure.detail for failure in failures)
+    assert all(failure.kind == "pii" for failure in failures)
+
+
 def test_score_expectations_reports_a_wrong_end_reason():
     scenario = _scenario(expect=Expectations(end_reason="model_ended"))
     result = _result(observed=[_turn(1, end_reason="escalated")])

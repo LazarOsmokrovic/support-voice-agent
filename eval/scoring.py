@@ -21,6 +21,7 @@ import re
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass, fields
+from pathlib import Path
 from typing import Any
 
 from data import mock_db
@@ -28,10 +29,12 @@ from eval.harness import HarnessResult
 from eval.recording import Recording
 from eval.scenarios import Scenario
 
-# The tracking-number shape this project's seed uses. A redactor that eats it
-# is destroying the store's own identifiers, which is exactly what happened
-# in Phase 10a and was only caught on a whole-branch review.
-_TRACKING_PREFIX = "TBA"
+# HarnessResult.db_path defaults to this (eval/harness.py) when a scenario
+# never touched a real per-scenario database — only ad-hoc test construction
+# produces it, since run_scenario always sets a real seeded file. It is the
+# ONLY sqlite3 failure this module tolerates; see _stored_texts and
+# stored_record_counts.
+_NO_DB_PATH = Path()
 
 
 @dataclass(frozen=True)
@@ -159,23 +162,22 @@ def _stored_texts(result: HarnessResult) -> list[str]:
     exact code that carried Phase 10a's date-destruction bug, and the only
     way to score PII in stored records at all.
 
-    connect() itself is inside the guarded block, not just the queries after
-    it: a scenario with no db_path (HarnessResult's default is Path(), a
-    directory) must degrade to "no extra rows" rather than raise, since
-    log_lines alone is a legitimate thing to score.
+    Only the missing-db_path case (_NO_DB_PATH, HarnessResult's default) is
+    tolerated: that shape only ever comes from ad-hoc test construction,
+    since run_scenario always sets a real seeded file. A genuine sqlite3.Error
+    against a real per-scenario database — corruption, permissions, a disk
+    error — must propagate. Catching it here would silently score a broken
+    run as PII-clean, which is the dangerous direction to be wrong in.
     """
     texts = [json.dumps(line, default=str) for line in result.log_lines]
-    try:
-        conn = sqlite3.connect(result.db_path)
-    except sqlite3.Error:
+    if result.db_path == _NO_DB_PATH:
         return texts
+    conn = sqlite3.connect(result.db_path)
     conn.row_factory = sqlite3.Row
     try:
         for table in ("tickets", "escalations"):
             for row in conn.execute(f"SELECT * FROM {table}").fetchall():  # noqa: S608 — fixed literal names
                 texts.append(json.dumps(dict(row), default=str))
-    except sqlite3.Error:
-        pass
     finally:
         conn.close()
     return texts
@@ -206,23 +208,28 @@ def score_pii(scenario: Scenario, result: HarnessResult) -> list[Failure]:
         Failure("pii", f"{contact!r} appears verbatim in a stored record") for contact in contacts if contact in blob
     ]
 
-    # Every seeded order_id and tracking number must appear INTACT wherever a
-    # recognizable chunk of it shows up alongside a redaction marker — that
-    # combination is the signature of a redactor eating part of the project's
-    # own identifier while stripping contact details, which is the Phase 10a
-    # bug. Requiring a real 6-char chunk match (not just marker co-presence)
-    # keeps this from flagging unrelated identifiers that never appear in the
-    # record at all.
+    # order_id and tracking naturally co-occur in the same stored record
+    # (e.g. "Order <id> shipped, tracking <tracking>"), so each is the
+    # other's anchor: if one of the pair is present INTACT in a given text,
+    # that text is unambiguously about this specific seeded order, and the
+    # other member of the pair had better be present intact too. Missing
+    # AND a redaction marker present in the same text is not "never
+    # mentioned" — it's a redactor eating the project's own identifier
+    # (Phase 10a's bug). This intentionally requires no minimum surviving
+    # prefix: real damage can wipe an identifier completely ("112-..." ->
+    # a bare "[redacted-number]", the shape _CARDLIKE_RE produces) or leave
+    # only boundary characters ("TBA123456789US" -> "TBA[redacted-phone]US"),
+    # and a prefix-length requirement missed the first shape entirely. An
+    # order missing either half of the pair (no tracking assigned) has no
+    # anchor to check against and is silently skipped — a known limitation,
+    # not a false negative source for THIS project's seed.
     for order_id, _cust, _item, _qty, _price, _status, _od, _ed, tracking in mock_db.ORDERS:
-        for identifier in (order_id, tracking):
-            if not identifier:
+        for anchor, sibling in ((order_id, tracking), (tracking, order_id)):
+            if not anchor or not sibling:
                 continue
-            chunk = identifier[:6]
             for text in texts:
-                if identifier in text:
-                    break
-                if "[redacted-" in text and chunk in text:
-                    failures.append(Failure("pii", f"{identifier} was destroyed by redaction"))
+                if anchor in text and sibling not in text and "[redacted-" in text:
+                    failures.append(Failure("pii", f"{sibling} was destroyed by redaction"))
                     break
     return failures
 
@@ -278,19 +285,17 @@ def score_drift(recording: Recording, result: HarnessResult) -> list[Failure]:
 
 
 def stored_record_counts(result: HarnessResult) -> dict[str, int]:
-    """Counts degrade to 0 for a scenario with no usable db_path, same as
-    `_stored_texts` — connect() is inside the guarded block for the same
-    reason (see there)."""
+    """Counts degrade to 0 only for a scenario with no usable db_path
+    (_NO_DB_PATH, ad-hoc test construction only). A genuine sqlite3.Error
+    against a real per-scenario database must propagate, not be scored as
+    zero — see `_stored_texts` for the full reasoning; this mirrors it."""
     counts = {"turn_log": len(result.log_lines), "tickets": 0, "escalations": 0}
-    try:
-        conn = sqlite3.connect(result.db_path)
-    except sqlite3.Error:
+    if result.db_path == _NO_DB_PATH:
         return counts
+    conn = sqlite3.connect(result.db_path)
     try:
         for table in ("tickets", "escalations"):
             counts[table] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]  # noqa: S608
-    except sqlite3.Error:
-        pass
     finally:
         conn.close()
     return counts
