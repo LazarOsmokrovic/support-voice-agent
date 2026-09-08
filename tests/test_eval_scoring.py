@@ -521,3 +521,102 @@ def test_to_json_emits_the_whole_report_as_one_serialisable_object():
     assert payload["summary"]["passed"] == 1
     assert payload["grounding"]["false_positive"] == 0
     json.dumps(payload)  # must be serialisable, not just dict-shaped
+
+
+def test_strip_side_effect_env_removes_the_webhook_vars_after_load_dotenv(monkeypatch):
+    """agent/core.py calls load_dotenv() at import, so these are live by the
+    time the runner starts. tests/conftest.py protects the test suite and
+    cannot reach a CLI — this is that protection, moved into the CLI."""
+    import os
+
+    from eval.run_eval import strip_side_effect_env
+
+    monkeypatch.setenv("ESCALATION_WEBHOOK_URL", "https://real.example.com/hook")
+    monkeypatch.setenv("ESCALATION_WEBHOOK_SECRET", "s3cret")
+    monkeypatch.setenv("TURN_LOG_PATH", "logs/turns.jsonl")
+
+    strip_side_effect_env()
+
+    assert "ESCALATION_WEBHOOK_URL" not in os.environ
+    assert "ESCALATION_WEBHOOK_SECRET" not in os.environ
+    assert os.environ["TURN_LOG_PATH"] != "logs/turns.jsonl"
+
+
+@pytest.mark.asyncio
+async def test_evaluate_reports_missing_with_the_exact_record_command(tmp_path, monkeypatch):
+    from eval import recording as recording_module
+    from eval.run_eval import evaluate
+
+    monkeypatch.setattr(recording_module, "RECORDINGS_DIR", tmp_path / "recordings")
+    scenario = _scenario(name="never_recorded", capability="refunds")
+
+    report = await evaluate([scenario], tmp_path / "work")
+
+    assert [row.outcome for row in report.scenarios] == ["MISSING"]
+    assert any("python -m eval.record --scenario never_recorded" in d for d in report.scenarios[0].details)
+
+
+@pytest.mark.asyncio
+async def test_evaluate_reports_stale_without_scoring_or_re_recording(tmp_path, monkeypatch):
+    from eval import recording as recording_module
+    from eval.recording import Recording, current_hashes, save_recording
+    from eval.run_eval import evaluate
+
+    monkeypatch.setattr(recording_module, "RECORDINGS_DIR", tmp_path / "recordings")
+    scenario = _scenario(name="stale_demo", capability="refunds", turns=("a",), grounding_truth=("not_applicable",))
+    hashes = current_hashes()
+    hashes["system_prompt_sha256"] = "0" * 64
+    save_recording(
+        Recording(
+            scenario="stale_demo",
+            recorded_at="2026-09-08T12:00:00",
+            model="claude-opus-5",
+            anthropic_sdk_version="1.0.0",
+            creates=[],
+            parses=[],
+            observed=[],
+            **hashes,
+        )
+    )
+
+    report = await evaluate([scenario], tmp_path / "work")
+
+    assert [row.outcome for row in report.scenarios] == ["STALE"]
+    details = " ".join(report.scenarios[0].details)
+    assert "SYSTEM_PROMPT" in details or "system_prompt_sha256" in details
+    assert "python -m eval.record --scenario stale_demo" in details
+    assert (tmp_path / "recordings" / "stale_demo.json").exists()
+
+
+def test_main_runs_fully_offline_and_reports_missing_for_every_scenario(tmp_path, monkeypatch, capsys):
+    """The honest end state of the Phase 10c plan: every module built, every
+    offline test green, eval/recordings/ empty, and the runner correctly
+    saying so."""
+    from eval import recording as recording_module
+    from eval import run_eval as runner
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(recording_module, "RECORDINGS_DIR", tmp_path / "recordings")
+    monkeypatch.setattr(runner, "SCENARIOS", (_scenario(name="only_one", capability="refunds"),))
+
+    code = runner.main([])
+
+    assert code == 2
+    output = capsys.readouterr().out
+    assert "MISSING" in output
+    assert "1 missing" in output
+
+
+def test_main_emits_json_when_asked(tmp_path, monkeypatch, capsys):
+    import json
+
+    from eval import recording as recording_module
+    from eval import run_eval as runner
+
+    monkeypatch.setattr(recording_module, "RECORDINGS_DIR", tmp_path / "recordings")
+    monkeypatch.setattr(runner, "SCENARIOS", (_scenario(name="only_one", capability="refunds"),))
+
+    runner.main(["--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["summary"]["missing"] == 1
