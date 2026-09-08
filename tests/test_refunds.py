@@ -19,10 +19,12 @@ def _seed(tmp_path, monkeypatch):
     mock_db.reset_and_seed()
 
 
-# Seeded delivered orders (see data/mock_db.py):
-# 112-3487561-2938471  CUST-1001  Echo Dot            $34.99   delivered 2026-08-13
-# 116-1029384-7563829  CUST-1003  Nike Air Zoom shoes $129.95  delivered 2026-08-08
-# 119-5647382-9182736  CUST-1005  Sony WH-1000XM5     $349.99  delivered 2026-08-02
+# Seeded delivered orders (see data/mock_db.py — these dates get refreshed
+# periodically; the explicit `now=` values below are anchored to them, so both
+# move together):
+# 112-3487561-2938471  CUST-1001  Echo Dot            $34.99   delivered 2026-08-31
+# 116-1029384-7563829  CUST-1003  Nike Air Zoom shoes $129.95  delivered 2026-08-26
+# 119-5647382-9182736  CUST-1005  Sony WH-1000XM5     $349.99  delivered 2026-08-20
 LOW_VALUE_ORDER = "112-3487561-2938471"
 LOW_VALUE_CUSTOMER = "CUST-1001"
 HIGH_VALUE_ORDER = "119-5647382-9182736"
@@ -101,7 +103,7 @@ def test_opened_software_condition_is_never_eligible_regardless_of_window(tmp_pa
 def test_rejects_standard_return_outside_the_30_day_window(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
     state = PendingActionGate(turn=1)
-    far_future = datetime(2026, 9, 20, 10, 0)  # noqa: DTZ001 — naive on purpose, matches refunds.py; well over 30 days after 2026-08-13
+    far_future = datetime(2026, 10, 8, 10, 0)  # noqa: DTZ001 — naive on purpose, matches refunds.py; well over 30 days after 2026-08-31
 
     result = issue_refund(
         LOW_VALUE_ORDER, "unopened_or_unwanted", "too late", state=state, customer_id=LOW_VALUE_CUSTOMER, now=far_future
@@ -114,7 +116,7 @@ def test_rejects_standard_return_outside_the_30_day_window(tmp_path, monkeypatch
 def test_rejects_damaged_claim_outside_the_14_day_window(tmp_path, monkeypatch):
     _seed(tmp_path, monkeypatch)
     state = PendingActionGate(turn=1)
-    three_weeks_later = datetime(2026, 9, 3, 10, 0)  # noqa: DTZ001 — naive on purpose, matches refunds.py; >14 days after 2026-08-13, but <30
+    three_weeks_later = datetime(2026, 9, 21, 10, 0)  # noqa: DTZ001 — naive on purpose, matches refunds.py; >14 days after 2026-08-31, but <30
 
     result = issue_refund(
         LOW_VALUE_ORDER,

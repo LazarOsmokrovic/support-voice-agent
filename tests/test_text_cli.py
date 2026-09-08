@@ -310,16 +310,21 @@ async def test_refund_conversation_proposes_then_confirms(tmp_path, monkeypatch)
     Note on calendar drift: issue_refund's tool schema doesn't expose `now`
     to the model (matching find_available_slots), so this live test checks
     eligibility against the REAL current date vs. the seeded order's fixed
-    2026-08-13 delivery date. It's valid for the foreseeable future from
-    when this was written (2026-08-25), but will eventually fall outside
-    the 30-day window as real time passes — the deterministic tests in
-    tests/test_refunds.py inject `now` explicitly and don't have this
-    problem; they're what actually proves the window logic is correct.
+    delivery date (2026-08-31 as of the 2026-09-08 seed refresh). It expires
+    once that ages past the 30-day window, and the fix is to refresh the
+    seed dates — see the comment above ORDERS in data/mock_db.py, which
+    explains the convention and why this is not hypothetical: the sibling
+    high-value test below silently expired on 2026-09-01.
+
+    Phase 10c retires this whole class of problem by freezing the clock to
+    each recording's timestamp. The deterministic tests in
+    tests/test_refunds.py already inject `now` explicitly and never had it;
+    they're what actually proves the window logic is correct.
     """
     monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_refund_live.db")
     mock_db.reset_and_seed()
     customer_id = "CUST-1001"
-    order_id = "112-3487561-2938471"  # Echo Dot, $34.99, delivered 2026-08-13
+    order_id = "112-3487561-2938471"  # Echo Dot, $34.99, delivered 2026-08-31
 
     dispatch_tool, _handlers, gates = build_dispatch_tool(customer_id)
     agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
@@ -347,13 +352,24 @@ async def test_refund_conversation_proposes_then_confirms(tmp_path, monkeypatch)
 @pytest.mark.asyncio
 async def test_high_value_refund_conversation_escalates_instead_of_confirming(tmp_path, monkeypatch):
     """Phase 6 checkpoint: auto-escalate above the $ threshold — proven live,
-    not just at the tool level. Same calendar-drift caveat as the test
-    above (valid from 2026-08-25 for the foreseeable future).
+    not just at the tool level.
+
+    Same calendar-drift caveat as the test above, and this is the test that
+    proved the caveat was real: the order's old 2026-08-02 delivery date aged
+    past the 30-day window on 2026-09-01, after which issue_refund returned
+    `outside_window` and returned BEFORE reaching the high-value branch this
+    test asserts on. It failed for a week without being noticed, because an
+    invalid API key was making all 13 live tests fail at the same time and a
+    401 looks identical to a real assertion failure in the summary line.
+
+    The lesson worth keeping: an expiring fixture doesn't fail loudly, it
+    fails *plausibly*. Fixed by the 2026-09-08 seed refresh (now delivered
+    2026-08-20); retired permanently by Phase 10c's frozen clock.
     """
     monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_refund_escalate_live.db")
     mock_db.reset_and_seed()
     customer_id = "CUST-1005"
-    order_id = "119-5647382-9182736"  # Sony WH-1000XM5, $349.99, delivered 2026-08-02
+    order_id = "119-5647382-9182736"  # Sony WH-1000XM5, $349.99, delivered 2026-08-20
 
     dispatch_tool, _handlers, gates = build_dispatch_tool(customer_id)
     agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool)
