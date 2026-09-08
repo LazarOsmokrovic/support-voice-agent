@@ -62,8 +62,10 @@ FAILED_LOOKUP_ESCALATION_THRESHOLD = 2
 # (guardrails/validators.py) may flag before handing off. Matched to the two
 # thresholds above for consistency, but deliberately a starting value — a
 # hallucination is weaker evidence of trouble than two consecutively angry
-# messages, so 3 is arguable. Sub-phase 10c's eval suite should settle it
-# from measurement rather than intuition.
+# messages, so 3 is arguable. Sub-phase 10c instruments the threshold and
+# records a baseline — roughly a dozen labellable turns, which cannot settle
+# the value on statistical grounds but does make a later change measurable
+# as a delta rather than argued as a hunch.
 UNGROUNDED_REPLY_ESCALATION_THRESHOLD = 2
 
 

@@ -148,8 +148,8 @@ MODEL_CONSTRUCTION_SITES: tuple[tuple[str, int], ...] = (
     ("agent/core.py", 101),
     ("agent/session.py", 189),
     ("agent/tools/summary.py", 114),
-    ("agent/tools/escalation.py", 90),
-    ("agent/tools/escalation.py", 220),
+    ("agent/tools/escalation.py", 92),
+    ("agent/tools/escalation.py", 222),
 )
 
 # The ONLY two clock reads that change a decision: the refund return-window
