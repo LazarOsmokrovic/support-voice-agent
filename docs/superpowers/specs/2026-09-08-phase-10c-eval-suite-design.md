@@ -303,6 +303,22 @@ Freeze by patching `agent.tools.refunds.datetime` and `agent.tools.scheduling.da
 with a subclass whose `now()` returns `recorded_at` (naive, matching both sites'
 `# noqa: DTZ005 — naive on purpose`). Two sites, plus a grep guard test.
 
+**Correction (found while planning).** Patching the module's `datetime` also intercepts
+`refunds.py:205`, which the table above says to leave real — so a naive freeze would have
+frozen `issued_at` too. The two categories separate cleanly on timezone: both
+decision-affecting sites call `datetime.now()` with no argument, while every
+stored-string site calls `datetime.now(timezone.utc)`. The frozen subclass therefore pins
+`now()` only when no tzinfo is passed and delegates `now(tz)` to the real clock, landing
+exactly on the two sites intended and no others.
+
+**Correction (found while planning): a single frozen instant is not sufficient.**
+§7's `refund_outside_window` scenario must deliberately land outside the 30-day window,
+but after the 2026-09-08 seed refresh every Delivered order is *inside* it at
+`recorded_at` — no single frozen timestamp satisfies both that scenario and the rest.
+`Scenario` therefore carries a `clock_offset_days: int` (default `0`), applied identically
+at record and replay, so the offset is part of the reviewable scenario rather than hidden
+in the harness.
+
 **This retires the active defect.** With the clock frozen inside the window, the high-value
 refund scenario tests what it claims — escalation instead of confirmation — rather than
 silently degrading into a window check, and it stops expiring against the calendar.
@@ -509,8 +525,11 @@ more precise than any scenario; moving them would be a strict loss.
 **Net: 7 → scenarios, 3 deleted, 3 stay.** Checkable checkpoint number, derived rather than
 guessed: the suite collects 225 today, all passing after the seed refresh. Removing 10
 leaves 215, of which 3 stay live-gated — so with the keys genuinely absent `pytest -q`
-should report **212 passed / 3 skipped**, before the eval suite's own tests are added; with
-those (§9, roughly 15–20 test functions) expect around 230 passed / 3 skipped.
+should report **212 passed / 3 skipped**, before the eval suite's own tests are added.
+
+**Corrected while planning:** this spec originally estimated "roughly 15–20 test functions"
+for §9, which was a guess and too low — a real TDD pass across eight new modules produces
+**72**. Expected end state: **287 collected, 284 passed / 3 skipped** with the keys absent.
 
 **How to actually run without keys — verified, and not what you would guess.** `env -u
 ANTHROPIC_API_KEY` does **not** skip the live tests: `agent/core.py` calls `load_dotenv()`
@@ -530,8 +549,9 @@ denominator:**
   embedded example ID previously required a fix in `validators.py`.
 - **policy_qa (+2):** `policy_returns_window_30_days` (correct answer 30, matching
   `STANDARD_RETURN_WINDOW_DAYS`) · `policy_damaged_item_14_days`.
-- **refunds (+2):** `refund_outside_window` (clock frozen >30 days after delivery — the
-  *intended* outside-window path, tested deliberately rather than by calendar accident) ·
+- **refunds (+2):** `refund_outside_window` — the *intended* outside-window path, tested
+  deliberately rather than reached by calendar accident. This is the one scenario that sets
+  `clock_offset_days` (to a value past the window); every other scenario leaves it `0` ·
   `refund_not_delivered` (`115-4857392-8374651`, Processing).
 - **scheduling (+1):** `scheduling_cancel_existing` — CUST-1004's seeded appointment.
 - **triage (+2):** `triage_repeated_failed_lookups` — two bad order IDs → `"repeated failed
@@ -555,6 +575,16 @@ denominator:**
   built for. This scenario is also the single most valuable input to §4: it is the only one
   that deliberately produces `ungrounded` ground-truth labels, without which the
   false-negative count has no denominator.
+
+  **This is the one scenario that may not be scriptable, and that must be reported
+  honestly.** It requires the model to actually fabricate a policy number twice in a row,
+  which no prompt can guarantee. If the first recording shows the model behaving correctly,
+  the scenario legitimately FAILs and the right response is to reword the pressure and
+  re-record — **never** to relabel a genuinely grounded reply as `ungrounded` to make the
+  number move. Doing that would corrupt the only ground truth the false-negative count has.
+  If it proves unscriptable after a few attempts, the honest outcome is to record that the
+  ladder could not be provoked and report the false-negative denominator as `0/0 —
+  insufficient data`, exactly as §9 test 8 requires.
 
 **The full roster, so the count is checkable rather than implied (20):**
 
