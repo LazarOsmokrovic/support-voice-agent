@@ -264,3 +264,91 @@ def test_score_drift_reports_a_tool_output_that_changed_since_recording():
     assert len(failures) == 1
     assert failures[0].kind == "drift"
     assert "turn 1" in failures[0].detail
+
+
+def test_rate_reports_n_over_n_and_never_a_bare_percentage():
+    from eval.scoring import rate
+
+    assert rate(1, 9) == "1/9"
+    assert rate(0, 2) == "0/2"
+
+
+def test_rate_refuses_to_divide_by_zero_or_pretend_zero_percent():
+    """Spec §9 test 8's degenerate case. '0%' would read as a measured
+    result where nothing was measured at all."""
+    from eval.scoring import rate
+
+    assert rate(0, 0) == "0/0 — insufficient data"
+
+
+def test_grounding_counts_scores_a_hand_built_confusion_matrix():
+    from eval.scoring import grounding_counts
+
+    scenario = _scenario(
+        turns=("a", "b", "c", "d"),
+        grounding_truth=("grounded", "grounded", "ungrounded", "not_applicable"),
+    )
+    result = _result(
+        observed=[
+            _turn(1, grounding_flagged=False),  # grounded, quiet -> true negative
+            _turn(2, grounding_flagged=True, hedge_spoken=True),  # grounded, flagged -> false positive
+            _turn(3, grounding_flagged=False),  # ungrounded, quiet -> false negative
+            _turn(4, grounding_flagged=True, hedge_spoken=True),  # unlabelled -> excluded
+        ]
+    )
+
+    counts = grounding_counts(scenario, result)
+
+    assert (counts.grounded, counts.ungrounded) == (2, 1)
+    assert counts.labeled_turns == 3
+    assert counts.true_negative == 1
+    assert counts.false_positive == 1
+    assert counts.false_negative == 1
+    assert counts.true_positive == 0
+    assert counts.hedged == 2
+    assert counts.flagged == 2
+
+
+def test_grounding_counts_counts_unreachable_claims_and_the_ladder():
+    """The unreachable-claims number quantifies a real blind spot: issue_refund
+    calls search_policy internally (refunds.py:144) and returns its text as
+    policy_reference, but that internal call never enters
+    TurnResult.tool_calls — so a turn asserting a dollar amount and a 30-day
+    window is never grounding-checked at all. Measured here, not fixed."""
+    from eval.scoring import grounding_counts
+
+    scenario = _scenario(turns=("a", "b"), grounding_truth=("not_applicable", "not_applicable"))
+    result = _result(
+        replies=["You're eligible for a $349.99 refund, and you're within the 30-day window.", "Handing you over."],
+        observed=[
+            _turn(1, tool_calls=[{"name": "issue_refund", "input": {}, "output": {}}]),
+            _turn(2, grounding_flagged=True, escalation_reason="repeated ungrounded replies", end_reason="escalated"),
+        ],
+    )
+
+    counts = grounding_counts(scenario, result)
+
+    assert counts.unreachable_claims == 1
+    assert counts.ladder_fired == 1
+
+
+def test_combine_counts_sums_every_field_across_scenarios():
+    from eval.scoring import EMPTY_COUNTS, GroundingCounts, combine_counts
+
+    first = GroundingCounts(
+        grounded=3, ungrounded=1, flagged=2, true_positive=1, false_positive=1,
+        true_negative=2, false_negative=0, hedged=1, unreachable_claims=2, ladder_fired=0, labeled_turns=4,
+    )
+    second = GroundingCounts(
+        grounded=1, ungrounded=1, flagged=1, true_positive=1, false_positive=0,
+        true_negative=1, false_negative=0, hedged=1, unreachable_claims=1, ladder_fired=1, labeled_turns=2,
+    )
+
+    total = combine_counts([first, second])
+
+    assert total.grounded == 4
+    assert total.ungrounded == 2
+    assert total.false_positive == 1
+    assert total.ladder_fired == 1
+    assert total.labeled_turns == 6
+    assert combine_counts([]) == EMPTY_COUNTS

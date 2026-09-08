@@ -17,8 +17,10 @@ the agent's behaviour.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, fields
 from typing import Any
 
 from data import mock_db
@@ -292,3 +294,125 @@ def stored_record_counts(result: HarnessResult) -> dict[str, int]:
     finally:
         conn.close()
     return counts
+
+
+# A number wearing a policy-ish unit — the same shape
+# guardrails/validators.py's _CLAIM_RE looks for. Duplicated here rather
+# than imported on purpose: this is the MEASURING instrument, and if it
+# shared a regex with the thing being measured, a change to the detector
+# would silently move the baseline it is being measured against.
+_CLAIM_RE = re.compile(
+    r"\$\s?\d+(?:\.\d+)?"
+    r"|\d+(?:\.\d+)?\s*%"
+    r"|\b\d+(?:\.\d+)?\s*(?:business\s+)?(?:day|days|week|weeks|month|months|hour|hours)\b",
+    re.IGNORECASE,
+)
+
+LADDER_REASON = "repeated ungrounded replies"
+
+
+@dataclass(frozen=True)
+class GroundingCounts:
+    """The confusion matrix, plus the three companion numbers that are
+    arguably worth more than the headline rate.
+
+    What this CANNOT establish, stated rather than hidden: with 20 scenarios
+    and roughly 60-80 turns, only the subset carrying both a search_policy
+    call and a numeric claim is labellable — a single-digit to low-teens
+    denominator, putting a 95% confidence interval on the rate at roughly
+    +/-25 points. It cannot justify changing
+    UNGROUNDED_REPLY_ESCALATION_THRESHOLD on statistical grounds, cannot
+    estimate real-traffic behaviour (every scenario is authored by the same
+    person who wrote the detector), and cannot find failure modes nobody
+    scripted. What it CAN do: prove end to end that the detector fires on a
+    genuine fabrication and stays quiet on ordinary correct replies, and
+    produce a reproducible baseline whose value is the DELTA after a later
+    prompt or regex change, not the level.
+    """
+
+    grounded: int = 0
+    ungrounded: int = 0
+    flagged: int = 0
+    true_positive: int = 0
+    false_positive: int = 0
+    true_negative: int = 0
+    false_negative: int = 0
+    hedged: int = 0
+    unreachable_claims: int = 0
+    ladder_fired: int = 0
+    labeled_turns: int = 0
+
+
+EMPTY_COUNTS = GroundingCounts()
+
+
+def rate(numerator: int, denominator: int) -> str:
+    """Always n/N with raw counts, never a bare percentage.
+
+    A zero denominator reports insufficient data rather than 0%: with a
+    denominator this small, a percentage invites exactly the overstatement
+    guardrails/validators.py's own docstring warns against.
+    """
+    if denominator == 0:
+        return f"{numerator}/0 — insufficient data"
+    return f"{numerator}/{denominator}"
+
+
+def grounding_counts(scenario: Scenario, result: HarnessResult) -> GroundingCounts:
+    """One scenario's contribution to the aggregate."""
+    grounded = ungrounded = flagged = 0
+    true_positive = false_positive = true_negative = false_negative = 0
+    hedged = unreachable = 0
+    ladder = 0
+
+    for index, row in enumerate(result.observed):
+        label = scenario.grounding_truth[index] if index < len(scenario.grounding_truth) else "not_applicable"
+        if row.grounding_flagged:
+            flagged += 1
+        if row.hedge_spoken:
+            hedged += 1
+        if row.escalation_reason == LADDER_REASON:
+            ladder = 1
+
+        reply = result.replies[index] if index < len(result.replies) else ""
+        searched = any(call.get("name") == "search_policy" for call in row.tool_calls)
+        if _CLAIM_RE.search(reply) and not searched:
+            # A policy-shaped claim the detector could not possibly reach,
+            # because GROUNDING_TRIGGER_TOOLS gates on search_policy being in
+            # THIS turn's tool_calls.
+            unreachable += 1
+
+        if label == "grounded":
+            grounded += 1
+            if row.grounding_flagged:
+                false_positive += 1
+            else:
+                true_negative += 1
+        elif label == "ungrounded":
+            ungrounded += 1
+            if row.grounding_flagged:
+                true_positive += 1
+            else:
+                false_negative += 1
+
+    return GroundingCounts(
+        grounded=grounded,
+        ungrounded=ungrounded,
+        flagged=flagged,
+        true_positive=true_positive,
+        false_positive=false_positive,
+        true_negative=true_negative,
+        false_negative=false_negative,
+        hedged=hedged,
+        unreachable_claims=unreachable,
+        ladder_fired=ladder,
+        labeled_turns=grounded + ungrounded,
+    )
+
+
+def combine_counts(counts: Iterable[GroundingCounts]) -> GroundingCounts:
+    total = {f.name: 0 for f in fields(GroundingCounts)}
+    for item in counts:
+        for name in total:
+            total[name] += getattr(item, name)
+    return GroundingCounts(**total)
