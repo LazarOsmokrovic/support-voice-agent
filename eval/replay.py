@@ -20,9 +20,18 @@ green scenario for the wrong reason is worse than a red one.
 
 from __future__ import annotations
 
+import contextlib
+import os
+from collections.abc import Iterator
+from datetime import datetime
+from pathlib import Path
 from typing import Any
 
+import anthropic
 from anthropic.types import Message
+
+from agent.tools import refunds as refunds_module
+from agent.tools import scheduling as scheduling_module
 
 try:  # The SDK's own deserialiser. Private, so guarded and tested by name.
     from anthropic._models import construct_type as _construct_type
@@ -124,3 +133,114 @@ class FakeAnthropicClient:
     @property
     def parses_remaining(self) -> int:
         return len(self.parses) - self.parses_consumed
+
+
+# Verified by grep, and kept honest by a test rather than by a comment:
+# tests/test_eval_harness.py asserts these sets never drift. Five entries,
+# not four: agent/session.py:189 is prose inside create_session's docstring
+# ("...creates its own anthropic.AsyncAnthropic() by default...") describing
+# the real construction that happens in agent/core.py:101 — it never
+# executes as code. The grep-guard test matches source text, not AST, so it
+# can't tell a docstring mention from a call; the seam (patching the module
+# attribute) is unaffected either way, since a docstring never calls
+# anything.
+MODEL_CONSTRUCTION_SITES: tuple[tuple[str, int], ...] = (
+    ("agent/core.py", 101),
+    ("agent/session.py", 189),
+    ("agent/tools/summary.py", 114),
+    ("agent/tools/escalation.py", 90),
+    ("agent/tools/escalation.py", 220),
+)
+
+# The ONLY two clock reads that change a decision: the refund return-window
+# check and which appointment slots exist. Everything else agent/ reads the
+# clock for writes a stored string, and those stay real.
+FROZEN_CLOCK_SITES: tuple[tuple[str, int], ...] = (
+    ("agent/tools/refunds.py", 111),
+    ("agent/tools/scheduling.py", 108),
+)
+
+
+def frozen_datetime_class(frozen: datetime) -> type[datetime]:
+    """A datetime subclass whose bare now() is pinned to `frozen`.
+
+    Freezing the clock is the ONE place replay is not literally production,
+    and it belongs here in the docstring rather than in a footnote discovered
+    later. It is unavoidable: the alternative is scenarios that expire
+    against the calendar, which is precisely the defect this phase fixes.
+
+    now(tz) with a tzinfo is deliberately NOT frozen. agent/tools/refunds.py
+    uses this same module-level name for both the window check
+    (`datetime.now()`, line 111, decision-affecting) and `issued_at`
+    (`datetime.now(timezone.utc)`, line 205, a stored string). Splitting on
+    the argument lands the freeze on exactly the decision.
+    """
+
+    class _FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):  # type: ignore[override]
+            if tz is None:
+                return frozen
+            return datetime.now(tz)
+
+    return _FrozenDateTime
+
+
+def _blocked_sync_client(*args: Any, **kwargs: Any):
+    raise RuntimeError(
+        "eval replay blocked a synchronous anthropic.Anthropic() construction — "
+        "this project is async throughout, so a sync client means an unpatched code path"
+    )
+
+
+@contextlib.contextmanager
+def scenario_patch(client: Any, frozen: datetime, turn_log_path: Path) -> Iterator[None]:
+    """Everything one scenario needs held still, for its duration.
+
+    Three separate hazards, one context manager:
+
+    1. THE MODEL SEAM. Patch the anthropic.AsyncAnthropic CONSTRUCTOR, not a
+       `client` parameter. create_session(client=...) reaches one of four
+       model call sites; the other three build their own client. Patching the
+       constructor reaches all four, requires zero changes under agent/
+       (CLAUDE.md rule 5), and cannot be defeated by a fifth site added
+       later. anthropic.Anthropic is patched to RAISE, so an accidental sync
+       path is loud rather than a surprise network call.
+
+    2. THE CLOCK. See frozen_datetime_class.
+
+    3. THE ENVIRONMENT. agent/core.py calls load_dotenv() at import, so a
+       developer's real ESCALATION_WEBHOOK_URL is live and an escalating
+       scenario would fire a REAL webhook POST. tests/conftest.py's autouse
+       fixture protects the test suite but cannot reach a CLI. Stripping here
+       means the protection travels with the scenario, whoever runs it.
+    """
+    saved_async = anthropic.AsyncAnthropic
+    saved_sync = anthropic.Anthropic
+    saved_refunds_datetime = refunds_module.datetime
+    saved_scheduling_datetime = scheduling_module.datetime
+    saved_env = {
+        key: os.environ.get(key)
+        for key in ("ESCALATION_WEBHOOK_URL", "ESCALATION_WEBHOOK_SECRET", "TURN_LOG_PATH")
+    }
+
+    frozen_cls = frozen_datetime_class(frozen)
+    try:
+        anthropic.AsyncAnthropic = lambda *args, **kwargs: client  # type: ignore[assignment]
+        anthropic.Anthropic = _blocked_sync_client  # type: ignore[assignment]
+        refunds_module.datetime = frozen_cls  # type: ignore[assignment]
+        scheduling_module.datetime = frozen_cls  # type: ignore[assignment]
+        os.environ.pop("ESCALATION_WEBHOOK_URL", None)
+        os.environ.pop("ESCALATION_WEBHOOK_SECRET", None)
+        os.environ["TURN_LOG_PATH"] = str(turn_log_path)
+        yield
+    finally:
+        anthropic.AsyncAnthropic = saved_async  # type: ignore[assignment]
+        anthropic.Anthropic = saved_sync  # type: ignore[assignment]
+        refunds_module.datetime = saved_refunds_datetime  # type: ignore[assignment]
+        scheduling_module.datetime = saved_scheduling_datetime  # type: ignore[assignment]
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value

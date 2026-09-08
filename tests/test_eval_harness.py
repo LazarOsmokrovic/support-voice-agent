@@ -10,6 +10,8 @@ the duplicate harness this phase exists to remove.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from eval.scenarios import (
@@ -318,3 +320,139 @@ async def test_fake_client_parse_raises_mismatch_when_the_call_order_diverges():
         await client.messages.parse(model="m", max_tokens=1, messages=[], output_format=SessionSummary)
     assert "SessionSummary" in str(excinfo.value)
     assert "TurnClassification" in str(excinfo.value)
+
+
+def test_the_documented_model_construction_sites_are_still_the_only_ones():
+    """Spec §3 enumerates four anthropic.AsyncAnthropic() construction sites.
+    An enumeration in a comment rots; this makes it a maintained fact. If a
+    fifth site appears, this fails and the enumeration gets updated — the
+    seam itself still covers it, because it patches the constructor."""
+    import re
+    from pathlib import Path
+
+    from eval.replay import MODEL_CONSTRUCTION_SITES
+
+    root = Path(__file__).resolve().parent.parent
+    found = set()
+    for path in sorted((root / "agent").rglob("*.py")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if re.search(r"anthropic\.AsyncAnthropic\(", line):
+                found.add((path.relative_to(root).as_posix(), number))
+    assert found == set(MODEL_CONSTRUCTION_SITES)
+
+
+def test_the_documented_decision_affecting_clock_sites_are_still_the_only_ones():
+    """Only a bare datetime.now() can change a decision (the refund window,
+    which slots exist). datetime.now(timezone.utc) writes stored strings and
+    is deliberately left real, so it is excluded here."""
+    import re
+    from pathlib import Path
+
+    from eval.replay import FROZEN_CLOCK_SITES
+
+    root = Path(__file__).resolve().parent.parent
+    found = set()
+    for path in sorted((root / "agent").rglob("*.py")):
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+            if re.search(r"datetime\.now\(\s*\)", line):
+                found.add((path.relative_to(root).as_posix(), number))
+    assert found == set(FROZEN_CLOCK_SITES)
+
+
+def test_frozen_datetime_freezes_naive_now_but_leaves_aware_now_real():
+    from datetime import datetime, timezone
+
+    from eval.replay import frozen_datetime_class
+
+    frozen = datetime(2026, 9, 8, 12, 0, 0)
+    cls = frozen_datetime_class(frozen)
+
+    assert cls.now() == frozen
+    assert cls.now().tzinfo is None
+    aware = cls.now(timezone.utc)
+    assert aware.tzinfo is timezone.utc
+    assert abs((aware.replace(tzinfo=None) - datetime.utcnow()).total_seconds()) < 5
+
+
+def test_frozen_datetime_still_parses_iso_strings_the_tools_depend_on():
+    from datetime import datetime
+
+    from eval.replay import frozen_datetime_class
+
+    cls = frozen_datetime_class(datetime(2026, 9, 8, 12, 0, 0))
+    delivered = cls.fromisoformat("2026-08-31")
+    assert (cls.now() - delivered).days == 8
+
+
+def test_scenario_patch_intercepts_every_constructor_and_blocks_the_sync_client(tmp_path):
+    import anthropic
+
+    from eval.replay import FakeAnthropicClient, scenario_patch
+
+    fake = FakeAnthropicClient("demo", [], [])
+    with scenario_patch(fake, datetime(2026, 9, 8, 12, 0, 0), tmp_path / "turns.jsonl"):
+        assert anthropic.AsyncAnthropic() is fake
+        assert anthropic.AsyncAnthropic(api_key="garbage") is fake
+        with pytest.raises(RuntimeError, match="synchronous"):
+            anthropic.Anthropic()
+    assert anthropic.AsyncAnthropic is not fake
+
+
+def test_scenario_patch_strips_webhook_env_and_points_the_turn_log_at_its_own_file(tmp_path, monkeypatch):
+    import os
+
+    from eval.replay import FakeAnthropicClient, scenario_patch
+
+    monkeypatch.setenv("ESCALATION_WEBHOOK_URL", "https://real.example.com/hook")
+    monkeypatch.setenv("ESCALATION_WEBHOOK_SECRET", "s3cret")
+    log_path = tmp_path / "turns.jsonl"
+
+    with scenario_patch(FakeAnthropicClient("demo", [], []), datetime(2026, 9, 8), log_path):
+        assert "ESCALATION_WEBHOOK_URL" not in os.environ
+        assert "ESCALATION_WEBHOOK_SECRET" not in os.environ
+        assert os.environ["TURN_LOG_PATH"] == str(log_path)
+
+    assert os.environ["ESCALATION_WEBHOOK_URL"] == "https://real.example.com/hook"
+
+
+def test_the_frozen_clock_reaches_issue_refund_and_decides_the_window(tmp_path, monkeypatch):
+    """The regression test for the defect that motivated this phase.
+    tests/test_text_cli.py's high-value refund test silently degraded into a
+    window check when the calendar moved past the seeded delivery date.
+    Frozen inside the window it is eligible; frozen outside it is not — and
+    neither answer depends on what today happens to be."""
+    from datetime import timedelta
+
+    from agent.confirmation import PendingActionGate
+    from agent.tools.refunds import issue_refund
+    from data import mock_db
+    from eval.replay import FakeAnthropicClient, scenario_patch
+
+    monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "eval_clock.db")
+    mock_db.reset_and_seed()
+    order_id, _customer, _item, _qty, _price, _status, _ordered, delivered, _tracking = mock_db.ORDERS[0]
+    delivered_on = datetime.fromisoformat(delivered)
+    log_path = tmp_path / "turns.jsonl"
+
+    inside = delivered_on + timedelta(days=5)
+    with scenario_patch(FakeAnthropicClient("demo", [], []), inside, log_path):
+        result = issue_refund(
+            order_id=order_id,
+            condition="unopened_or_unwanted",
+            reason="changed my mind",
+            state=PendingActionGate(),
+            customer_id=mock_db.ORDERS[0][1],
+        )
+    assert result.get("error") != "outside_window"
+    assert result["status"] == "pending_confirmation"
+
+    outside = delivered_on + timedelta(days=45)
+    with scenario_patch(FakeAnthropicClient("demo", [], []), outside, log_path):
+        result = issue_refund(
+            order_id=order_id,
+            condition="unopened_or_unwanted",
+            reason="changed my mind",
+            state=PendingActionGate(),
+            customer_id=mock_db.ORDERS[0][1],
+        )
+    assert result["error"] == "outside_window"
