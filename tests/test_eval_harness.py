@@ -456,3 +456,119 @@ def test_the_frozen_clock_reaches_issue_refund_and_decides_the_window(tmp_path, 
             customer_id=mock_db.ORDERS[0][1],
         )
     assert result["error"] == "outside_window"
+
+
+def _calm_parse_entry() -> dict:
+    return {
+        "output_format": "TurnClassification",
+        "parsed_output": {"intent": "chitchat", "sentiment": "neutral", "policy_restricted": False},
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_scenario_drives_every_turn_and_returns_one_observed_row_each(tmp_path):
+    from eval.harness import run_scenario
+    from eval.replay import FakeAnthropicClient
+
+    scenario = _minimal_scenario(
+        name="two_turn_demo",
+        turns=("Hello there", "Thanks, bye"),
+        grounding_truth=("not_applicable", "not_applicable"),
+    )
+    client = FakeAnthropicClient(
+        "two_turn_demo",
+        [_message_payload(content=[{"type": "text", "text": "Hi!"}]), _message_payload(content=[{"type": "text", "text": "Bye!"}])],
+        [_calm_parse_entry(), _calm_parse_entry()],
+    )
+
+    result = await run_scenario(scenario, client, datetime(2026, 9, 8, 12, 0, 0), tmp_path)
+
+    assert result.error is None
+    assert result.replies == ["Hi!", "Bye!"]
+    assert [row.turn for row in result.observed] == [1, 2]
+    assert result.observed[0].end_reason is None
+
+
+@pytest.mark.asyncio
+async def test_run_scenario_holds_the_seam_with_a_garbage_api_key_present(tmp_path, monkeypatch):
+    """Spec §9 test 6: end to end under the patch with a garbage key. If the
+    seam leaked, the real SDK would be constructed and the call would fail
+    with an auth error rather than returning the recorded reply."""
+    from eval.harness import run_scenario
+    from eval.replay import FakeAnthropicClient
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-not-a-real-key-at-all")
+    scenario = _minimal_scenario(name="seam_demo", turns=("Hello",), grounding_truth=("not_applicable",))
+    client = FakeAnthropicClient("seam_demo", [_message_payload()], [_calm_parse_entry()])
+
+    result = await run_scenario(scenario, client, datetime(2026, 9, 8, 12, 0, 0), tmp_path)
+
+    assert result.error is None
+    assert result.replies == ["Happy to help!"]
+    assert client.creates_remaining == 0
+    assert client.parses_remaining == 0
+
+
+@pytest.mark.asyncio
+async def test_run_scenario_writes_one_real_log_line_per_captured_record(tmp_path):
+    """The pass-through spy's whole point. log_turn never raises, so a
+    missing record would otherwise be indistinguishable from a disabled log.
+    Comparing the two counts turns that never-raise policy from a blind spot
+    into a checked invariant — and the file's real bytes are what PII
+    scoring reads, because they went through the actual redacting
+    serialiser."""
+    from eval.harness import run_scenario
+    from eval.replay import FakeAnthropicClient
+
+    scenario = _minimal_scenario(name="log_demo", turns=("One", "Two"), grounding_truth=("not_applicable",) * 2)
+    client = FakeAnthropicClient(
+        "log_demo",
+        [_message_payload(), _message_payload()],
+        [_calm_parse_entry(), _calm_parse_entry()],
+    )
+
+    result = await run_scenario(scenario, client, datetime(2026, 9, 8, 12, 0, 0), tmp_path)
+
+    assert len(result.records) == 2
+    assert len(result.log_lines) == len(result.records)
+    assert result.log_lines[0]["transport"] == "eval"
+
+
+@pytest.mark.asyncio
+async def test_run_scenario_seeds_a_fresh_database_and_leaves_the_real_one_alone(tmp_path):
+    from data import mock_db
+    from eval.harness import run_scenario
+    from eval.replay import FakeAnthropicClient
+
+    real_db_path = mock_db.DB_PATH
+    scenario = _minimal_scenario(name="db_demo", turns=("Hi",), grounding_truth=("not_applicable",))
+    client = FakeAnthropicClient("db_demo", [_message_payload()], [_calm_parse_entry()])
+
+    result = await run_scenario(scenario, client, datetime(2026, 9, 8, 12, 0, 0), tmp_path)
+
+    assert mock_db.DB_PATH == real_db_path
+    assert result.db_path.parent == tmp_path
+    assert result.db_path != real_db_path
+    import sqlite3
+
+    conn = sqlite3.connect(result.db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0] == len(mock_db.ORDERS)
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_run_scenario_reports_an_exhausted_recording_as_an_error_rather_than_raising(tmp_path):
+    from eval.harness import run_scenario
+    from eval.replay import FakeAnthropicClient
+
+    scenario = _minimal_scenario(name="short_demo", turns=("One", "Two"), grounding_truth=("not_applicable",) * 2)
+    client = FakeAnthropicClient("short_demo", [_message_payload()], [_calm_parse_entry()])
+
+    result = await run_scenario(scenario, client, datetime(2026, 9, 8, 12, 0, 0), tmp_path)
+
+    assert result.error is not None
+    assert "short_demo" in result.error
+    assert "create #2" in result.error
+    assert result.replies == ["Happy to help!"]
