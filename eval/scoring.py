@@ -219,17 +219,35 @@ def score_pii(scenario: Scenario, result: HarnessResult) -> list[Failure]:
     # prefix: real damage can wipe an identifier completely ("112-..." ->
     # a bare "[redacted-number]", the shape _CARDLIKE_RE produces) or leave
     # only boundary characters ("TBA123456789US" -> "TBA[redacted-phone]US"),
-    # and a prefix-length requirement missed the first shape entirely. An
-    # order missing either half of the pair (no tracking assigned) has no
-    # anchor to check against and is silently skipped — a known limitation,
-    # not a false negative source for THIS project's seed.
-    for order_id, _cust, _item, _qty, _price, _status, _od, _ed, tracking in mock_db.ORDERS:
+    # and a prefix-length requirement missed the first shape entirely.
+    for order_id, _cust, item, _qty, _price, _status, _od, _ed, tracking in mock_db.ORDERS:
         for anchor, sibling in ((order_id, tracking), (tracking, order_id)):
             if not anchor or not sibling:
                 continue
             for text in texts:
                 if anchor in text and sibling not in text and "[redacted-" in text:
                     failures.append(Failure("pii", f"{sibling} was destroyed by redaction"))
+                    break
+
+        # Self-anchor fallback for an order with no tracking_number at all
+        # (several seeded orders — e.g. "Processing" and "Cancelled" ones —
+        # have none): there is no sibling identifier left to pair order_id
+        # against, so the check above is a silent no-op for it. `item` fills
+        # that role instead. It is free text this project's own redactor
+        # never touches (it matches none of _EMAIL_RE / _CARDLIKE_RE /
+        # _PHONE_RE), so its survival intact is a safe, independent signal
+        # that a record concerns THIS specific order — even when order_id,
+        # the field that would normally anchor it, is the very thing that
+        # got destroyed. Without an anchor here, "a redaction marker sits
+        # somewhere in a record that never mentions this order at all"
+        # would be indistinguishable from "this order's identifier was
+        # destroyed" — exactly the false-positive shape round 1 already
+        # rejected for the paired case, so it cannot be reintroduced here by
+        # dropping the anchor requirement.
+        if not tracking:
+            for text in texts:
+                if item in text and order_id not in text and "[redacted-" in text:
+                    failures.append(Failure("pii", f"{order_id} was destroyed by redaction"))
                     break
     return failures
 

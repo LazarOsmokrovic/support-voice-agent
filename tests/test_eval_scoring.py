@@ -256,6 +256,38 @@ def test_pii_scoring_flags_a_fully_wiped_order_id(tmp_path):
     assert all(failure.kind == "pii" for failure in failures)
 
 
+def test_pii_scoring_flags_a_destroyed_order_id_with_no_tracking_sibling(tmp_path):
+    """A third seed shape, and the round-2 review finding: several orders
+    (e.g. 'Processing' and 'Cancelled' ones) have no tracking_number at all,
+    so order_id has no sibling identifier to anchor against when IT is the
+    one destroyed. `item` fills that role — it is free text this project's
+    redactor never touches, so its survival intact confirms this record
+    concerns this specific order even with order_id gone."""
+    order_id, customer_id, item, *_rest = next(order for order in mock_db.ORDERS if order[8] is None)
+    scenario = _scenario(customer_id=customer_id)
+    result = _result(
+        log_lines=[
+            {"reply": f"Your {item} order [redacted-number] is currently being processed", "user_text": "hi"}
+        ]
+    )
+    failures = score_pii(scenario, result)
+    assert any(order_id in failure.detail for failure in failures)
+    assert all(failure.kind == "pii" for failure in failures)
+
+
+def test_pii_scoring_does_not_flag_an_unpaired_order_that_is_simply_not_mentioned(tmp_path):
+    """The other half of the same tension: an unrelated redaction marker
+    present somewhere in a record must not be mistaken for THIS order's
+    lone identifier having been destroyed, when the record never mentions
+    this order (not even its item) at all."""
+    order_id, customer_id, _item, *_rest = next(order for order in mock_db.ORDERS if order[8] is None)
+    scenario = _scenario(customer_id=customer_id)
+    result = _result(
+        log_lines=[{"reply": "Thanks for calling, have a great day.", "user_text": "[redacted-email]"}]
+    )
+    assert score_pii(scenario, result) == []
+
+
 def test_score_expectations_reports_a_wrong_end_reason():
     scenario = _scenario(expect=Expectations(end_reason="model_ended"))
     result = _result(observed=[_turn(1, end_reason="escalated")])
