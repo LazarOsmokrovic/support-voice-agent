@@ -25,6 +25,7 @@ from hashlib import sha1
 import httpx
 import pytest
 
+from agent.session import DEFAULT_CUSTOMER_ID, create_session
 from transport import telephony
 
 
@@ -397,3 +398,32 @@ async def test_transfer_status_rejects_an_unsigned_request(monkeypatch):
         )
 
     assert response.status_code == 403
+
+
+def test_session_registry_resumes_a_known_session():
+    """After a failed transfer the customer comes back on a NEW Media Stream.
+    Without this they would meet a brand-new session that has forgotten the
+    entire conversation — worse than never attempting the transfer."""
+    telephony.SESSIONS.clear()
+    session = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
+    telephony.SESSIONS[session.session_id] = session
+
+    assert telephony.resolve_session(session.session_id) is session
+
+
+def test_session_registry_falls_back_to_a_new_session_for_an_unknown_id():
+    """A cold restart is worse than resuming, but far better than a 500 and
+    a dropped call."""
+    telephony.SESSIONS.clear()
+    resumed = telephony.resolve_session("no-such-session")
+    assert resumed is not None
+    assert resumed.session_id != "no-such-session"
+
+
+def test_session_registry_forgets_a_session_when_it_closes():
+    """The registry is in-process and unbounded otherwise."""
+    telephony.SESSIONS.clear()
+    session = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
+    telephony.SESSIONS[session.session_id] = session
+    telephony.forget_session(session.session_id)
+    assert session.session_id not in telephony.SESSIONS

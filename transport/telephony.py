@@ -57,7 +57,7 @@ from twilio.request_validator import RequestValidator
 from twilio.rest import Client
 from twilio.twiml.voice_response import Connect, Dial, VoiceResponse
 
-from agent.session import DEFAULT_CUSTOMER_ID, close_session, create_session
+from agent.session import DEFAULT_CUSTOMER_ID, Session, close_session, create_session
 from transport.pipecat_processors import build_pipeline
 
 PORT = int(os.getenv("PORT", "8765"))
@@ -278,6 +278,31 @@ async def transfer_status(request: Request) -> Response:
     return Response(content=str(response), media_type="application/xml")
 
 
+# Live sessions keyed by session_id, so a call that comes back from a failed
+# transfer can resume the SAME conversation. In-process on purpose (one
+# uvicorn worker); entries are removed by forget_session when the call ends.
+SESSIONS: dict[str, Session] = {}
+
+
+def resolve_session(session_id: str | None) -> Session:
+    """Resume a session by id, or start a fresh one.
+
+    An unknown id is not an error worth failing a live call over — the caller
+    is on the phone right now. A cold start loses history; a 500 loses the
+    customer.
+    """
+    if session_id and session_id in SESSIONS:
+        print(f"(resuming session {session_id} after a failed transfer)")
+        return SESSIONS[session_id]
+    session = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
+    SESSIONS[session.session_id] = session
+    return session
+
+
+def forget_session(session_id: str) -> None:
+    SESSIONS.pop(session_id, None)
+
+
 async def _read_start_event(receive_text: Callable[[], Awaitable[str]]) -> tuple[str, str, str]:
     """Drain Twilio's initial "connected" then "start" events, returning
     (stream_sid, call_sid, account_sid) — what TwilioFrameSerializer needs
@@ -313,8 +338,14 @@ async def media_stream(websocket: WebSocket) -> None:
         params=FastAPIWebsocketParams(audio_in_enabled=True, audio_out_enabled=True, serializer=serializer),
     )
 
-    session = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
-    pipeline = build_pipeline(transport, session)
+    session = resolve_session(websocket.query_params.get("session"))
+
+    async def _on_escalation(packet: dict[str, Any] | None) -> bool:
+        if packet is None:
+            return False
+        return await transfer_to_human(call_sid, packet, session.session_id)
+
+    pipeline = build_pipeline(transport, session, on_escalation=_on_escalation)
     worker = PipelineWorker(pipeline, params=PipelineParams(enable_metrics=True))
     runner = WorkerRunner()
     await runner.add_workers(worker)
@@ -330,6 +361,7 @@ async def media_stream(websocket: WebSocket) -> None:
             f"(sentiment={close_result.summary.sentiment}, "
             f"follow_up_needed={close_result.summary.follow_up_needed})"
         )
+    forget_session(session.session_id)
 
 
 if __name__ == "__main__":
