@@ -134,3 +134,45 @@ async def test_read_start_event_skips_extra_connected_messages():
     assert stream_sid == "MZ2"
     assert call_sid == "CA2"
     assert account_sid == "AC2"
+
+
+def test_render_whisper_briefs_the_human_from_the_packet():
+    """The whisper is the entire point of a warm handoff — the human must
+    hear who is waiting and why before the line opens."""
+    packet = {
+        "escalation_id": 42,
+        "reason": "explicit request for a human",
+        "customer_intent": "wants a refund outside the return window",
+        "conversation_summary": "Asked about order status, then became frustrated.",
+        "verified_account_info": "Maria Gonzalez, order 112-3487561-2938471",
+        "actions_taken": "Looked up the order; explained the 30-day policy.",
+        "sentiment": "negative",
+    }
+    whisper = telephony.render_whisper(packet)
+    assert "42" in whisper
+    assert "explicit request for a human" in whisper
+    assert "refund outside the return window" in whisper
+    assert "negative" in whisper
+
+
+def test_render_whisper_survives_a_packet_missing_fields():
+    """create_handoff_packet infers its fields from a model call, so a
+    degraded packet is possible. A thin briefing beats a 500 that leaves
+    the human hearing silence."""
+    whisper = telephony.render_whisper({"escalation_id": 7})
+    assert "7" in whisper
+    assert whisper.strip()
+
+
+def test_remember_transfer_stores_the_whisper_for_the_endpoint_to_read():
+    """The /whisper endpoint runs in a SEPARATE HTTP request from the
+    redirect, so the text has to outlive the call that built it. Stashing
+    it here avoids re-reading the packet from SQLite, which would have
+    meant adding a query to agent/ — forbidden this phase."""
+    telephony.TRANSFERS.clear()
+    packet = {"escalation_id": 9, "customer_intent": "billing question"}
+    stored = telephony.remember_transfer("CA-test-sid", packet, "sess-1")
+    assert telephony.TRANSFERS["CA-test-sid"] is stored
+    assert stored.escalation_id == 9
+    assert stored.session_id == "sess-1"
+    assert "billing question" in stored.whisper

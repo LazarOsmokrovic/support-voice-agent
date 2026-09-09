@@ -41,6 +41,8 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket
@@ -70,6 +72,71 @@ def _public_hostname() -> str:
             "URL Twilio connects to (your ngrok hostname, no scheme)."
         )
     return hostname
+
+
+# How long <Dial> rings the human before giving up. Twilio allows 5-600 and
+# defaults to 30; 20 is long enough for a real pickup and short enough that a
+# customer already waiting on hold is not abandoned to silence.
+TRANSFER_TIMEOUT_SECONDS = 20
+
+
+@dataclass(frozen=True)
+class PendingTransfer:
+    """One in-flight transfer, keyed by the customer's call SID.
+
+    Exists because a transfer spans three separate HTTP interactions — the
+    REST redirect, Twilio's request to /whisper, and its request to
+    /transfer-status — and they need to share state the packet already has.
+    """
+
+    escalation_id: int | None
+    whisper: str
+    session_id: str
+
+
+# Keyed by call_sid. In-process on purpose: this project runs one uvicorn
+# worker (see __main__ at the foot of this file), and a distributed store
+# would be machinery a mock project cannot justify. Entries are removed when
+# the transfer resolves, so it cannot grow without bound.
+TRANSFERS: dict[str, PendingTransfer] = {}
+
+
+def render_whisper(packet: dict[str, Any]) -> str:
+    """Turn a handoff packet into ~15 seconds of spoken briefing.
+
+    Short on purpose: the human is holding a ringing phone and the customer
+    is waiting on the other leg. Reason and intent come first because they
+    are what decides how the human opens the conversation.
+
+    The packet's free text was already redacted by guardrails/pii.py at
+    create_handoff_packet (Phase 10a), so contact details arrive masked while
+    the order ID survives — the right split, since the order ID is the thing
+    that lets the human actually act.
+    """
+    parts = [f"Handoff {packet.get('escalation_id', 'unknown')}."]
+    for label, key in (
+        ("Reason", "reason"),
+        ("Customer wants", "customer_intent"),
+        ("Account", "verified_account_info"),
+        ("Already done", "actions_taken"),
+        ("Sentiment", "sentiment"),
+    ):
+        value = packet.get(key)
+        if value:
+            parts.append(f"{label}: {value}.")
+    return " ".join(parts)
+
+
+def remember_transfer(call_sid: str, packet: dict[str, Any], session_id: str) -> PendingTransfer:
+    """Stash what /whisper and /transfer-status will need, before the
+    redirect is issued."""
+    pending = PendingTransfer(
+        escalation_id=packet.get("escalation_id"),
+        whisper=render_whisper(packet),
+        session_id=session_id,
+    )
+    TRANSFERS[call_sid] = pending
+    return pending
 
 
 @app.post("/voice")
