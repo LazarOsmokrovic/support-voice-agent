@@ -35,6 +35,7 @@ same honest limitation as every voice checkpoint so far.
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -514,3 +515,91 @@ async def test_mic_mute_gate_passes_through_unrelated_frames_untouched():
     # was already travelling.
     assert downstream_sink.frames == [downstream_frame]
     assert upstream_sink.frames == []
+
+
+@pytest.mark.asyncio
+async def test_dtmf_escalation_fires_the_transfer_callback(monkeypatch):
+    """Press 0 is the safety net for when the AI is already failing — it MUST
+    transfer, not just announce a transfer."""
+    fired = []
+
+    async def _on_escalation(packet):
+        fired.append(packet)
+        return True
+
+    session = create_session("CUST-1001")
+    monkeypatch.setattr(
+        escalation, "create_handoff_packet", AsyncMock(return_value={"escalation_id": 5})
+    )
+    processor = ClaudeTurnProcessor(session=session, on_escalation=_on_escalation, enable_direct_mode=True)
+    await _started(processor)
+
+    await processor.process_frame(InputDTMFFrame(button=KeypadEntry.ZERO), FrameDirection.DOWNSTREAM)
+
+    assert len(fired) == 1
+    assert fired[0]["escalation_id"] == 5
+
+
+@pytest.mark.asyncio
+async def test_model_driven_escalation_fires_the_transfer_callback(monkeypatch):
+    """The other path: run_turn decided to escalate."""
+    fired = []
+
+    async def _on_escalation(packet):
+        fired.append(packet)
+        return True
+
+    session = create_session("CUST-1001")
+    outcome = SimpleNamespace(
+        reply="Connecting you with a human agent.",
+        notice=None,
+        warnings=[],
+        llm_latency_seconds=0.0,
+        ended=True,
+        end_reason="escalated",
+        escalation_packet={"escalation_id": 8},
+    )
+    monkeypatch.setattr(
+        "transport.pipecat_processors.run_turn", AsyncMock(return_value=outcome)
+    )
+    processor = ClaudeTurnProcessor(session=session, on_escalation=_on_escalation, enable_direct_mode=True)
+    await _started(processor)
+
+    await processor.process_frame(_transcript("get me a human"), FrameDirection.DOWNSTREAM)
+
+    assert len(fired) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_callback_means_todays_behaviour_is_unchanged(monkeypatch):
+    """transport/pipeline.py (local mic) passes no callback. It must behave
+    exactly as it did before this phase."""
+    session = create_session("CUST-1001")
+    monkeypatch.setattr(
+        escalation, "create_handoff_packet", AsyncMock(return_value={"escalation_id": 5})
+    )
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    await processor.process_frame(InputDTMFFrame(button=KeypadEntry.ZERO), FrameDirection.DOWNSTREAM)
+
+    assert any(isinstance(f, TextFrame) and "human agent" in f.text for f in sink.frames)
+
+
+@pytest.mark.asyncio
+async def test_a_raising_callback_never_breaks_the_call(monkeypatch):
+    """Telephony failures must not crash the pipeline — the customer still
+    hears the notice."""
+    async def _on_escalation(packet):
+        raise RuntimeError("twilio exploded")
+
+    session = create_session("CUST-1001")
+    monkeypatch.setattr(
+        escalation, "create_handoff_packet", AsyncMock(return_value={"escalation_id": 5})
+    )
+    processor = ClaudeTurnProcessor(session=session, on_escalation=_on_escalation, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    await processor.process_frame(InputDTMFFrame(button=KeypadEntry.ZERO), FrameDirection.DOWNSTREAM)
+
+    assert any(isinstance(f, TextFrame) for f in sink.frames)

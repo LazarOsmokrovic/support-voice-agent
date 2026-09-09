@@ -219,6 +219,11 @@ class TurnOutcome:
     ended: bool = False
     end_reason: str | None = None  # "model_ended" | "escalated"
     notice: str | None = None  # pre-formatted transfer text, if escalated
+    # Phase 10d: the transport needs the packet itself, not just the notice —
+    # transport/telephony.py whispers it to the human agent before bridging
+    # the call. Same purpose as `notice` above: data for a transport to
+    # render. run_turn built this and discarded it before 10d.
+    escalation_packet: dict[str, Any] | None = None
     llm_latency_seconds: float = 0.0
     warnings: list[str] = field(default_factory=list)  # non-fatal issues to surface, not swallow
 
@@ -332,6 +337,7 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
         warnings.append(f"Could not run triage classification this turn: {exc}")
 
     escalation_id: int | None = None
+    packet: dict[str, Any] | None = None
     if reason:
         try:
             packet = await escalation.create_handoff_packet(session.customer_id, session.agent.messages, reason)
@@ -345,6 +351,7 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
             ended=True,
             end_reason="escalated",
             notice=notice,
+            escalation_packet=packet,
             llm_latency_seconds=llm_latency,
             warnings=warnings,
         )

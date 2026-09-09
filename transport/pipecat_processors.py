@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from pipecat.audio.dtmf.types import KeypadEntry
 from pipecat.frames.frames import (
@@ -65,6 +67,9 @@ from transport.tts import (
     DEFAULT_CARTESIA_VOICE,
     DEFAULT_DEEPGRAM_VOICE,
 )
+
+
+EscalationHook = Callable[[dict[str, Any] | None], Awaitable[bool]]
 
 
 class ClaudeTurnProcessor(FrameProcessor):
@@ -106,9 +111,14 @@ class ClaudeTurnProcessor(FrameProcessor):
     whatever the AI is doing, not queue politely behind it.
     """
 
-    def __init__(self, *, session: Session, **kwargs):
+    def __init__(self, *, session: Session, on_escalation: EscalationHook | None = None, **kwargs):
         super().__init__(**kwargs)
         self._session = session
+        # Injected by transport/telephony.py, absent for transport/pipeline.py.
+        # This is how a real call transfer happens without this shared module
+        # importing Twilio — the local-mic pipeline has no phone call to
+        # transfer, and CLAUDE.md rule 5 keeps provider code out of here.
+        self._on_escalation = on_escalation
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -149,8 +159,23 @@ class ClaudeTurnProcessor(FrameProcessor):
         await self.push_frame(TextFrame(text=GREETING))
         await self.push_frame(LLMFullResponseEndFrame())
 
+    async def _fire_escalation_hook(self, packet: dict[str, Any] | None) -> bool:
+        """Call the transport's transfer hook, swallowing anything it raises.
+
+        A telephony failure must never crash the pipeline: the customer is
+        mid-call and the notice still has to reach them.
+        """
+        if self._on_escalation is None:
+            return False
+        try:
+            return await self._on_escalation(packet)
+        except Exception as exc:  # noqa: BLE001 — a broken transfer must not drop the call
+            print(f"(escalation hook failed: {exc})")
+            return False
+
     async def _handle_dtmf_escalation(self) -> None:
         escalation_id: int | None = None
+        packet: dict[str, Any] | None = None
         try:
             packet = await escalation.create_handoff_packet(
                 self._session.customer_id, self._session.agent.messages, "caller pressed 0 for a human"
@@ -197,6 +222,8 @@ class ClaudeTurnProcessor(FrameProcessor):
         except Exception as exc:  # noqa: BLE001 — telemetry must never break the fallback
             print(f"(turn log write failed for the DTMF escalation: {exc})")
 
+        await self._fire_escalation_hook(packet if escalation_id is not None else None)
+
         print(notice)
         await self.push_frame(LLMFullResponseStartFrame())
         await self.push_frame(TextFrame(text=notice))
@@ -226,6 +253,8 @@ class ClaudeTurnProcessor(FrameProcessor):
         await self.push_frame(LLMFullResponseEndFrame())
 
         if outcome.ended:
+            if outcome.end_reason == "escalated":
+                await self._fire_escalation_hook(outcome.escalation_packet)
             # EndFrame is a ControlFrame (ordered, not high-priority) and
             # UninterruptibleFrame — it queues in after the reply above and
             # survives a stray interruption, and the output transport drains
@@ -325,7 +354,11 @@ def get_pipecat_tts_service():
 
 
 def build_pipeline(
-    transport: BaseTransport, session: Session, *, mute_mic_during_tts: bool = False
+    transport: BaseTransport,
+    session: Session,
+    *,
+    mute_mic_during_tts: bool = False,
+    on_escalation: EscalationHook | None = None,
 ) -> Pipeline:
     """Assemble the one pipeline shape both transports share:
 
@@ -352,7 +385,7 @@ def build_pipeline(
         stages.append(MicMuteGate())
     stages += [
         stt,
-        ClaudeTurnProcessor(session=session),
+        ClaudeTurnProcessor(session=session, on_escalation=on_escalation),
         tts,
         LatencyLogger(),
         transport.output(),

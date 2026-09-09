@@ -123,6 +123,32 @@ async def test_run_turn_escalates_and_produces_a_notice(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_an_escalated_turn_exposes_the_handoff_packet(monkeypatch):
+    """Phase 10d needs it: the transport transfers the call and whispers the
+    packet to the human. run_turn built the packet and then dropped it,
+    leaving the transport nothing to hand over — so the ordinary escalation
+    path would have briefed the human with nothing while the rarer DTMF path
+    briefed them fully."""
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(return_value=_text_response("Let me get someone."))
+    monkeypatch.setattr(
+        escalation, "check_escalation", AsyncMock(return_value="explicit request for a human")
+    )
+    monkeypatch.setattr(
+        escalation,
+        "create_handoff_packet",
+        AsyncMock(return_value={"escalation_id": 3, "customer_intent": "wants a human"}),
+    )
+    session = create_session("CUST-1001", client=fake_client)
+
+    outcome = await run_turn(session, "get me a person")
+
+    assert outcome.end_reason == "escalated"
+    assert outcome.escalation_packet is not None
+    assert outcome.escalation_packet["escalation_id"] == 3
+
+
+@pytest.mark.asyncio
 async def test_run_turn_survives_a_classifier_failure_without_crashing(monkeypatch):
     fake_client = MagicMock()
     fake_client.messages.create = AsyncMock(return_value=_text_response("Here you go."))

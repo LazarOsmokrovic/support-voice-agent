@@ -1202,3 +1202,204 @@ Anthropic account:
 See `eval/README.md` for the full guide, and in particular its section on
 what the false-positive number does and does not mean — the single most
 important thing to read correctly once real numbers exist.
+
+---
+
+## Phase 10d — Real warm handoff, Twilio call transfer (code-complete; live checkpoint not yet run)
+
+Phase 9's DTMF fallback and Phase 4's model-driven escalation both end a call
+with a spoken notice and a logged handoff packet — no human ever actually
+receives the call. This phase closes that gap: a live call now transfers to
+a real human, briefed on what's happened so far, with a path back to the
+agent if the human never picks up.
+
+### The mechanism: a REST redirect, not more TwiML
+
+The call sits inside a bidirectional Media Stream (`<Connect><Stream>` from
+Phase 9) the whole time it's talking to the agent, so Pipecat has no TwiML
+channel to speak into — the only lever available to end a Media Stream and
+move a *live* call somewhere else is the Twilio REST API's
+`calls(call_sid).update(twiml=...)`, which redirects the call in flight.
+`transport/telephony.py::transfer_to_human()` issues that redirect with
+TwiML built by `build_transfer_twiml()`:
+
+- `<Say>Connecting you now. Please hold.</Say>` first, always — issuing the
+  redirect tears down the Media Stream immediately, which can truncate the
+  agent's own spoken escalation notice mid-word. This guarantees the
+  customer hears *something* regardless of how that race resolves.
+- `<Dial><Number url="https://.../whisper?escalation_id=...">` — Twilio's
+  *whisper*: TwiML that plays to the **called party only**, after they
+  answer but before the two legs are bridged. `/whisper` renders the Phase 4
+  handoff packet (`render_whisper()`, ~15 seconds: escalation id, reason,
+  customer intent, verified account info, actions already taken, sentiment)
+  so the human hears who they're picking up and why before the customer can
+  hear them. The order ID is deliberately intact — `guardrails/pii.py`
+  already redacted contact details when `create_handoff_packet` first wrote
+  the packet in Phase 10a, so the whisper masks contact info by construction
+  and still gives the human the one identifier they need to act.
+- `<Dial action="https://.../transfer-status" timeout="20">` — Twilio POSTs
+  here when the dial ends, and from that point the action URL, not the
+  original TwiML, controls the parent call. `completed`/`answered` just hang
+  up (the human took it, the conversation is now between two humans). On
+  `busy`/`no-answer`/`failed`/`canceled`, `/transfer-status` reconnects the
+  customer's leg with a fresh `<Connect><Stream>` carrying
+  `?session=<session_id>` — `resolve_session()` finds the original `Session`
+  object in the in-process `SESSIONS` registry and the agent resumes with
+  full conversation history, rather than greeting a customer who just sat
+  through 20 seconds of ringing as if the call had just started.
+
+### Both escalation paths transfer, through one hook
+
+Two things already created a handoff packet before this phase: the
+model-driven path (`agent/session.py::run_turn`, `classify_turn` +
+`EscalationTracker`) and Phase 9's DTMF "press 0" branch
+(`transport/pipecat_processors.py::_handle_dtmf_escalation`). Neither knew
+anything about Twilio, and CLAUDE.md rule 5 says they still shouldn't.
+`ClaudeTurnProcessor` now takes an optional `on_escalation` callback
+(`EscalationHook = Callable[[dict | None], Awaitable[bool]]`), injected by
+`transport/telephony.py` and absent for `transport/pipeline.py` — the local
+mic pipeline has no phone call to transfer, and this is how the transfer
+happens without `transport/pipecat_processors.py` importing anything
+Twilio-specific. Both escalation branches now call the same
+`_fire_escalation_hook()`, itself wrapped so a failed transfer can never
+crash the pipeline or drop the call — it degrades to exactly Phase 9's
+existing behavior (notice, then hang up).
+
+One real fix this phase needed: `TurnOutcome` (`agent/session.py`) built a
+handoff packet on the model-driven path and threw it away — only a
+pre-formatted spoken `notice` string survived to the caller. Left alone, the
+*ordinary* escalation path would have transferred with no packet and the
+human would have heard "no context available" every time, while the rarer
+DTMF path stayed fully briefed — exactly backwards, and it would have passed
+every offline test, since the no-packet fallback is legitimate behavior in
+its own right. `TurnOutcome` gained one new field, `escalation_packet`, to
+carry it through. That is the only change under `agent/` this phase made.
+
+### Access control on the two new endpoints
+
+`/whisper` and `/transfer-status` are internet-reachable, unauthenticated in
+the ordinary sense, and `/whisper` speaks a customer's handoff context out
+loud. **`X-Twilio-Signature` validation (`_validate_twilio_signature()`,
+shared with `/voice`) is their only access control.** Stated plainly so it
+never gets read as leftover ceremony and stripped: without it, anyone who
+finds either URL can pull a live handoff's context or redirect an in-flight
+call.
+
+### Known limitations
+
+1. **Single-worker assumption.** `TRANSFERS` and `SESSIONS` are in-process
+   `dict`s. Session resume after a failed transfer only works if the same
+   uvicorn worker that started the call also handles Twilio's callback to
+   `/transfer-status`. True today — the app runs one process
+   (`transport/telephony.py`'s own `__main__`) — but it would not survive
+   multiple workers or a load balancer without a shared store. A distributed
+   registry was judged unjustifiable machinery for a mock project.
+
+2. **A narrow teardown race on an instantly-failed dial.** The `DETACHED`
+   marker is a time window, not an ownership token. If the human's phone
+   rejects the call fast enough, Twilio's `/transfer-status` callback and the
+   customer's reconnection can both land *before* the original Media Stream's
+   teardown finishes unwinding. `resolve_session` clears the detached mark on
+   reconnection, so that late teardown then sees an ordinary session and
+   closes it — ending a call the customer is still on and writing its summary
+   ticket mid-conversation. The window is roughly the two to four seconds
+   between the transfer TwiML's `<Say>` and Pipecat finishing teardown, and it
+   needs a dial that fails almost instantly (a busy signal or a rejected
+   call), so it is unlikely rather than impossible. Found by review, not by a
+   live call. The proper fix is a per-session stream generation counter
+   captured in `media_stream`, so a teardown can prove it owns the session it
+   is closing; that was judged out of scope for a phase whose live behaviour
+   has not been observed even once. Worth doing before this handles real
+   traffic.
+3. **Timing has not been observed on a real call.** The escalation hook
+   fires before the agent's spoken notice reaches the transport, and issuing
+   the REST redirect tears down the Media Stream immediately — the two can
+   race, and the leading `<Say>` exists precisely because the notice may get
+   cut off mid-word. Whether that reads as abrupt, and whether the fix is
+   worth building (awaiting `BotStoppedSpeakingFrame` before firing the
+   hook), can only be judged by listening to a real call.
+4. **A process restart between the redirect and Twilio's callback** loses
+   the `TRANSFERS`/`SESSIONS` entries for that call: `/whisper` falls back to
+   a generic "a customer is waiting" briefing, and a failed dial hangs up
+   instead of reconnecting, since there is no session id left to resume.
+
+### Cost note — read before spending anything
+
+`HUMAN_AGENT_NUMBER` accepts any E.164 number, and Twilio bills that
+destination by its own international rate table — Serbian mobile
+termination is **$0.8211/min**, landline **$0.5970/min**. A second **Twilio**
+number in a cheap region (a US number runs roughly **$0.014/min**) or a
+**Twilio Voice SDK browser client** (no PSTN termination leg, so far cheaper
+still — check Twilio's current client pricing rather than assuming it is free) exercises
+the identical `transfer_to_human()` → whisper → `<Dial>` code path for a
+small fraction of the cost, and the browser client also demos better, since
+the whisper arriving is visible on screen rather than only audible on a
+phone the reviewer is also holding. Point `HUMAN_AGENT_NUMBER` at one of
+those first.
+
+### The honest end state
+
+Everything above is built and tested offline — **no real transfer has ever
+been performed.** There is no Twilio key in this environment, so the four
+things this phase actually needs a live call to confirm are unverified:
+that a real whisper is audible before the bridge, that the leading `<Say>`
+actually saves the truncated-notice race described above, that a real
+no-answer reconnects the customer with working history, and that signature
+validation holds up against Twilio's real requests rather than the
+hand-signed ones in `tests/test_telephony.py`.
+
+- The guarded full suite passes: **325 passed, 3 skipped**, zero API calls
+  (`ANTHROPIC_API_KEY=` `DEEPGRAM_API_KEY=` set to empty rather than unset,
+  so `load_dotenv()` cannot repopulate them from a real `.env`). The 3 skips
+  are the same live-gated tests noted in the Phase 10c section above:
+  `test_hello_live_smoke`, `test_summarize_session_always_validates_against_schema`,
+  and `test_voice_local.py`'s Deepgram round-trip.
+- The live checkpoint — placing a real call, letting it escalate, confirming
+  the human hears the whisper, and confirming a deliberate no-answer
+  reconnects the customer with full history — has **not** been run. It needs
+  a funded Twilio key and is the project owner's to run, per the cost note
+  above.
+
+**A whole-branch review found two Critical defects, both now fixed with regression
+tests (8 new, folded into the count above) — the same pattern 10a's whole-branch
+review caught, arriving a second time in a different costume:**
+
+1. **The whisper never played.** `_validate_twilio_signature` checked a
+   reconstructed *bare path* while Twilio signs the *full URL, query string
+   included* — and the whisper URL always carries `?escalation_id=...`. Every
+   real whisper request would have 403'd, and Twilio treats a whisper-URL
+   error as "no whisper" and bridges the legs anyway, so the warm handoff
+   would have silently degraded into a blind transfer on **every** call, with
+   nothing an operator could see. It survived every task-level review because
+   the existing test signed the same bare URL the code checked — signing and
+   checking agreed with each other and both were wrong. Fixed by a new
+   `_signed_url()` that rebuilds the full URL (scheme/host from
+   `PUBLIC_HOSTNAME`, since behind ngrok the request itself arrives as plain
+   `http` on an internal host; path/query from the request).
+2. **Session resume never resumed.** The REST redirect that starts a
+   transfer is itself what ends the Media Stream, so `media_stream()`'s
+   teardown ran at transfer time — roughly 20 seconds *before*
+   `/transfer-status` reports whether the human answered. It closed the
+   session and wrote the post-call summary ticket mid-call; the reconnect on
+   a failed dial then found nothing in `SESSIONS` and built a fresh session,
+   so a customer who held through the ringing and got nobody was greeted from
+   scratch by an agent that had forgotten them. It survived review because
+   the existing test populated `SESSIONS` by hand instead of driving the
+   transfer lifecycle. Fixed with a new `DETACHED` registry: `transfer_to_human`
+   marks a session detached on a successful redirect, `media_stream()`'s
+   teardown returns early for one, `/transfer-status` closes it on a
+   completed dial or keeps it alive on a failed one, `resolve_session` clears
+   the mark on a real resume, `_close_and_forget` is idempotent (so a race
+   between the two close paths still writes only one ticket), and a new
+   `_sweep_detached_sessions()` abandons a session whose `/transfer-status`
+   callback never arrives at all.
+
+Both fixes are `transport/telephony.py`-only — zero changes under `agent/`
+beyond the 7-line `escalation_packet` field already noted above. The new
+tests trace the real lifecycle (calling `transfer_to_human()` and posting
+signed requests to the actual endpoints) rather than setting registries by
+hand, and the whisper-signature regression was confirmed to 403 against the
+pre-fix code before the fix was restored. **This does not change the "not yet
+run" status of the live checkpoint above** — it means the two defects that
+would have been waiting for the project owner to hit are now caught here
+first.
