@@ -176,16 +176,45 @@ and an intact order ID — which is the right split, since the order ID is what 
 | `transport/pipecat_processors.py` | `build_pipeline` gains `on_escalation`; `ClaudeTurnProcessor` awaits it at BOTH trigger points |
 | `.env.example` / `README.md` | `HUMAN_AGENT_NUMBER`, `TWILIO_ACCOUNT_SID` |
 
-**Zero changes under `agent/`** — not even a read query. The first draft of this design added
-a `get_handoff_packet(escalation_id)` lookup so `/whisper` could fetch the packet in its own
-HTTP request. That is unnecessary: `transfer_to_human` already holds the packet at the moment
-it issues the redirect, so it stashes the rendered whisper text in the same in-process
-registry the session resume needs, keyed by `escalation_id`. `/whisper` reads it back.
+**One additive field under `agent/`, and it is required — this corrects an earlier draft.**
 
-That removes a database round-trip, keeps `agent/` untouched for the third phase running, and
-means the whisper text is built once by the code that has full context rather than
-reconstructed later from stored columns. The already-specified fallback covers the only case
-it loses — a process restart between transfer and whisper — with a generic briefing.
+This design originally claimed zero `agent/` changes. Checking the code before writing the
+plan showed that claim was wrong in a way that would have gutted the phase: `TurnOutcome`
+(`agent/session.py:212-223`) exposes `reply`, `ended`, `end_reason`, `notice`,
+`llm_latency_seconds` and `warnings` — **but not the handoff packet.** `run_turn` builds the
+packet at `agent/session.py:337` and discards it, keeping only the pre-formatted `notice`
+string.
+
+So the model-driven escalation path — the ordinary one, the one that fires when a customer
+asks for a human — would have had no packet to hand the transfer, and the human would have
+heard the "no context available" fallback. The DTMF path would have worked, because it builds
+the packet itself. Shipping that would have meant the *rare* path carried context and the
+*common* path did not, which is precisely the failure this phase exists to fix.
+
+The fix is one optional field:
+
+```
+escalation_packet: dict[str, Any] | None = None
+```
+
+populated where the packet is already in hand at `agent/session.py:337-346`.
+
+**This does not violate CLAUDE.md rule 5.** Rule 5 forbids coupling `agent/` to the active I/O
+layer. This field couples it to nothing — it is the same shape as the existing `notice` field,
+which exists for exactly this purpose. `TurnOutcome`'s own docstring says "A transport renders
+this — prints it, speaks it, whatever — rather than run_turn() doing that itself." Adding data
+for a transport to render is the documented purpose of the type. Nothing in `agent/` learns
+that Twilio exists.
+
+Two alternatives were rejected. Re-reading the packet from SQLite by `escalation_id` needs a
+new query function in `agent/tools/escalation.py` — a larger `agent/` change plus a database
+round-trip, to recover data the caller just had. Parsing the `escalation_id` back out of the
+`notice` string is worse: it makes a human-facing sentence load-bearing.
+
+Everything else stays out of `agent/`. `transfer_to_human` holds the packet when it issues the
+redirect, so it stashes the rendered whisper text in the same in-process registry the session
+resume needs. `/whisper` reads it back — no database round-trip, and the text is built once by
+the code with full context rather than reconstructed from stored columns.
 
 ## Error handling
 
