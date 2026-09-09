@@ -1167,7 +1167,7 @@ again.
 Everything above is built and tested. What has not happened yet is the live
 recording pass:
 
-- The guarded full suite passes: **287 passed, 3 skipped**, in 8 seconds,
+- The guarded full suite passes: **292 passed, 3 skipped**, in 8 seconds,
   zero API calls (`ANTHROPIC_API_KEY=` `DEEPGRAM_API_KEY=` set to empty
   rather than unset, so `load_dotenv()` cannot repopulate them from a real
   `.env`). The 3 skips are exactly the live tests that should stay skipped
