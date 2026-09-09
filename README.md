@@ -1294,14 +1294,31 @@ call.
    (`transport/telephony.py`'s own `__main__`) — but it would not survive
    multiple workers or a load balancer without a shared store. A distributed
    registry was judged unjustifiable machinery for a mock project.
-2. **Timing has not been observed on a real call.** The escalation hook
+
+2. **A narrow teardown race on an instantly-failed dial.** The `DETACHED`
+   marker is a time window, not an ownership token. If the human's phone
+   rejects the call fast enough, Twilio's `/transfer-status` callback and the
+   customer's reconnection can both land *before* the original Media Stream's
+   teardown finishes unwinding. `resolve_session` clears the detached mark on
+   reconnection, so that late teardown then sees an ordinary session and
+   closes it — ending a call the customer is still on and writing its summary
+   ticket mid-conversation. The window is roughly the two to four seconds
+   between the transfer TwiML's `<Say>` and Pipecat finishing teardown, and it
+   needs a dial that fails almost instantly (a busy signal or a rejected
+   call), so it is unlikely rather than impossible. Found by review, not by a
+   live call. The proper fix is a per-session stream generation counter
+   captured in `media_stream`, so a teardown can prove it owns the session it
+   is closing; that was judged out of scope for a phase whose live behaviour
+   has not been observed even once. Worth doing before this handles real
+   traffic.
+3. **Timing has not been observed on a real call.** The escalation hook
    fires before the agent's spoken notice reaches the transport, and issuing
    the REST redirect tears down the Media Stream immediately — the two can
    race, and the leading `<Say>` exists precisely because the notice may get
    cut off mid-word. Whether that reads as abrupt, and whether the fix is
    worth building (awaiting `BotStoppedSpeakingFrame` before firing the
    hook), can only be judged by listening to a real call.
-3. **A process restart between the redirect and Twilio's callback** loses
+4. **A process restart between the redirect and Twilio's callback** loses
    the `TRANSFERS`/`SESSIONS` entries for that call: `/whisper` falls back to
    a generic "a customer is waiting" briefing, and a failed dial hangs up
    instead of reconnecting, since there is no session id left to resume.
@@ -1312,7 +1329,8 @@ call.
 destination by its own international rate table — Serbian mobile
 termination is **$0.8211/min**, landline **$0.5970/min**. A second **Twilio**
 number in a cheap region (a US number runs roughly **$0.014/min**) or a
-**Twilio Voice SDK browser client** (no PSTN leg at all — free) exercises
+**Twilio Voice SDK browser client** (no PSTN termination leg, so far cheaper
+still — check Twilio's current client pricing rather than assuming it is free) exercises
 the identical `transfer_to_human()` → whisper → `<Dial>` code path for a
 small fraction of the cost, and the browser client also demos better, since
 the whisper arriving is visible on screen rather than only audible on a
