@@ -112,34 +112,55 @@ CUSTOMERS = [
 
 # order_id, customer_id, item, quantity, price, status, order_date, estimated_delivery, tracking_number
 # order_id format mirrors Amazon's real "NNN-NNNNNNN-NNNNNNN" order numbers (fictional values).
+#
+# THESE DATES NEED PERIODIC REFRESHING, and here is why. issue_refund checks
+# estimated_delivery against a 30-day return window using the real clock
+# (agent/tools/refunds.py), so a Delivered order silently ages out of
+# eligibility as wall-clock time passes. When that happens the refund flow
+# stops being demonstrable and the live refund tests fail for a *calendar*
+# reason that reads exactly like a logic regression — which is precisely what
+# happened on 2026-09-01, undetected for a week because an invalid API key was
+# making those tests fail for a different reason at the same time.
+#
+# In production this would never arise: real orders keep arriving, so there is
+# always something inside the window. A fixed seed has no such supply, so the
+# convention is to shift these dates forward whenever they get stale. Last
+# refreshed 2026-09-08 (shifted +18 days). The rule: every "Delivered" order's
+# estimated_delivery stays within 30 days of today, in-transit orders keep
+# estimated_delivery in the near future, and no order_date is later than today.
+#
+# Phase 10c removes the need to keep doing this for the *tests* — its eval
+# harness freezes the clock to each recording's timestamp, so a recorded
+# scenario evaluates against the dates that were true when it was recorded.
+# Refreshing will still matter for live demos.
 ORDERS = [
     ("112-3487561-2938471", "CUST-1001", "Echo Dot (5th Gen, Charcoal)", 1, 34.99,
-     "Delivered", "2026-08-10", "2026-08-13", "TBA123456789US"),
+     "Delivered", "2026-08-28", "2026-08-31", "TBA123456789US"),
     ("113-9284756-1029384", "CUST-1001", "Kindle Paperwhite (16 GB)", 1, 139.99,
-     "Out for delivery", "2026-08-19", "2026-08-22", "TBA987654321US"),
+     "Out for delivery", "2026-09-06", "2026-09-09", "TBA987654321US"),
     ("114-2938475-6193847", "CUST-1002", "Anker 6-in-1 USB-C Hub", 2, 25.99,
-     "Shipped", "2026-08-18", "2026-08-24", "TBA564738291US"),
+     "Shipped", "2026-09-05", "2026-09-11", "TBA564738291US"),
     ("115-4857392-8374651", "CUST-1002", "Instant Pot Duo 7-in-1 (6 Qt)", 1, 89.00,
-     "Processing", "2026-08-21", "2026-08-27", None),
+     "Processing", "2026-09-08", "2026-09-14", None),
     ("116-1029384-7563829", "CUST-1003", "Nike Air Zoom Pegasus 40, Size 9", 1, 129.95,
-     "Delivered", "2026-08-05", "2026-08-08", "TBA192837465US"),
+     "Delivered", "2026-08-23", "2026-08-26", "TBA192837465US"),
     ("117-6748291-3049582", "CUST-1003", "Logitech MX Master 3S Mouse", 1, 99.99,
-     "Cancelled", "2026-08-15", None, None),
+     "Cancelled", "2026-09-02", None, None),
     ("118-8374659-2019384", "CUST-1004", "Stanley Quencher 40oz Tumbler", 1, 45.00,
-     "Delayed", "2026-08-12", "2026-08-25", "TBA827364519US"),
+     "Delayed", "2026-08-30", "2026-09-12", "TBA827364519US"),
     ("119-5647382-9182736", "CUST-1005", "Sony WH-1000XM5 Headphones", 1, 349.99,
-     "Delivered", "2026-07-30", "2026-08-02", "TBA736451928US"),
+     "Delivered", "2026-08-17", "2026-08-20", "TBA736451928US"),
 ]
 
 # customer_id, issue, resolution, sentiment, follow_up_needed, created_at
 TICKETS = [
     ("CUST-1003", "Received wrong color for order 116-1029384-7563829 sneakers",
-     "Replacement shipped, no charge", "neutral", 0, "2026-08-09"),
+     "Replacement shipped, no charge", "neutral", 0, "2026-08-27"),
 ]
 
 # customer_id, scheduled_time, reason, status
 APPOINTMENTS = [
-    ("CUST-1004", "2026-08-25T15:00:00", "Callback re: delayed order 118-8374659-2019384", "scheduled"),
+    ("CUST-1004", "2026-09-12T15:00:00", "Callback re: delayed order 118-8374659-2019384", "scheduled"),
 ]
 
 # customer_id, reason, customer_intent, conversation_summary, verified_account_info,

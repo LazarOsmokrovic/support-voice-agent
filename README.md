@@ -1078,3 +1078,127 @@ shape you get. Phase 11's order-ID bug and 10a's date-destruction bug both survi
 automated review and would have been obvious in one glance at a real record; this is the
 third phase in a row where reading one real artifact was the check that actually settled
 it.
+
+---
+
+## Phase 10c — Eval suite, 20 scripted scenarios (code-complete; live checkpoint not yet run)
+
+Phase 10a shipped a grounding detector (`check_reply_grounding`) whose
+false-positive rate was unknown, and an escalation threshold
+(`UNGROUNDED_REPLY_ESCALATION_THRESHOLD = 2`) its own code comment admits is
+a guess. Phase 10b built the per-turn record that could measure both. 10c is
+the instrument that actually does the measuring: 20 scripted conversations
+across all six capabilities, recorded once against the real API, replayed
+forever after for free. See `eval/README.md` for the full guide — how to add
+a scenario, how to re-record, and (most importantly) what the false-positive
+number does and does not mean. This section covers the shape of the thing
+and where it honestly stands.
+
+### `python -m eval.run_eval` — the offline entry point
+
+No API key, no network, ever — a key present in the environment is still
+never used, because the patched constructor described below raises on any
+attempt to reach the model, so a hole in the seam is a loud failure rather
+than a surprise bill.
+
+    python -m eval.run_eval                    # everything, offline
+    python -m eval.run_eval --scenario NAME    # one scenario
+    python -m eval.run_eval --json             # the report as one JSON object
+    python -m eval.run_eval --strict           # release gate: stale fixtures fail too
+
+Six outcomes per scenario — PASS, FAIL, STALE, DRIFT, MISSING, ERROR — and
+three exit codes: `0` everything passed, `1` a genuine behavioural
+regression, `2` the fixtures need attention (STALE/DRIFT/MISSING/ERROR) with
+no behavioural failure underneath. STALE is deliberately not a code
+failure by default: it means a prompt, a tool schema, or the seed changed
+since the recording was made, not that the agent misbehaved, and scoring a
+stale recording would score a fiction — `--strict` exists for the one
+context (a release gate) where staleness should block anyway. Full detail,
+including why the three codes stay separate rather than collapsing to
+pass/fail, lives in `eval/README.md`.
+
+`python -m eval.record` is the **only** entry point that touches the API and
+the only one that costs money — record once per scenario (or `--all`), then
+every replay thereafter, including the whole 20-scenario suite, runs
+offline against the saved fixture. The runner never re-records anything on
+its own initiative, in any of the four non-passing outcomes: that would
+spend money nobody asked to spend and destroy the STALE signal itself,
+replacing "this changed, go look" with a silent fresh pass.
+
+### The seam: patch the constructor, zero changes under `agent/`
+
+`agent/core.py`, `agent/session.py`, and two call sites in `agent/tools/`
+each construct their own `anthropic.AsyncAnthropic()` client independently —
+there is no single `client` parameter that reaches all four. `eval/replay.py`
+patches the **module-level constructor** for the duration of one scenario
+(`scenario_patch`), not a call-site parameter, which reaches all four
+existing sites, needs zero code changes under `agent/` (CLAUDE.md rule 5
+held, the same way it held through voice, Pipecat, Twilio, and 10a's
+guardrails), and cannot be quietly defeated by a fifth construction site
+added later — a test (`test_the_documented_model_construction_sites_are_still_the_only_ones`)
+greps for any new one instead of trusting the list to stay accurate. The
+same patch also blocks a synchronous `anthropic.Anthropic()` construction
+outright, so an accidental sync path fails loudly rather than silently
+placing a real network call outside the async harness's control, and it
+strips the outbound-webhook env vars for the scenario's duration so a
+recorded escalation can never fire a real notification.
+
+### The frozen clock
+
+Two clock reads actually change a decision inside `agent/`: the refund
+return-window check (`agent/tools/refunds.py`) and which appointment slots
+exist (`agent/tools/scheduling.py`). Everything else that reads the clock
+writes a stored timestamp string and doesn't branch on it, so it stays real.
+`eval/replay.py` freezes only `datetime.now()` with no timezone argument —
+the two decision-affecting calls — while `datetime.now(tz)` stays live,
+because `agent/tools/refunds.py` reuses the same module-level name for both
+the window check and a stored `issued_at` value, and only the former should
+move. This is the one place replay is not literally production, and it's
+unavoidable: the alternative is scenarios that quietly expire against the
+real calendar, which is the exact defect this phase exists to retire for
+*tests*. It does not retire it for a live demo — a scenario that references
+"today" in its script still needs its identifiers current for a human
+watching the demo happen in real time, which is why `eval/scenarios.py`'s
+seed-derived dates were refreshed once already, on 2026-09-08, and will be
+again.
+
+### The honest end state
+
+Everything above is built and tested. What has not happened yet is the live
+recording pass:
+
+- The guarded full suite passes: **292 passed, 3 skipped**, in 8 seconds,
+  zero API calls (`ANTHROPIC_API_KEY=` `DEEPGRAM_API_KEY=` set to empty
+  rather than unset, so `load_dotenv()` cannot repopulate them from a real
+  `.env`). The 3 skips are exactly the live tests that should stay skipped
+  without credentials: `test_hello_live_smoke`,
+  `test_summarize_session_always_validates_against_schema`, and
+  `test_voice_local.py`'s Deepgram round-trip.
+- `eval/recordings/` holds nothing but a `.gitkeep`. No scenario has been
+  recorded.
+- `python -m eval.run_eval` reports all 20 scenarios `MISSING`, exit code
+  `2`, capability coverage 6/6 (order_status 3 · refunds 4 · policy_qa 4 ·
+  triage 6 · scheduling 2 · summary 1). That is the **correct** output at
+  this point in the project, not a failure — a suite that reported anything
+  else with an empty `recordings/` directory would be lying.
+
+There is no measured grounding baseline yet — only the machinery to produce
+one. The remaining, manual checkpoint is the project owner's to run, because
+it is the one step in this phase that spends real money against an
+Anthropic account:
+
+1. `python -m eval.record --all` — records all 20 scenarios live.
+2. Read each printed worksheet and hand-label every turn's grounding truth,
+   pasting each `grounding_truth=(...)` block into `eval/scenarios.py`.
+3. `python -m eval.run_eval` should then reproduce the same verdicts
+   offline. Some scenarios failing on the first live pass is the suite
+   doing its job, not a defect in it — see `eval/README.md` in particular
+   for `guardrail_ungrounded_ladder_escalates`, which may not be scriptable
+   at all, and why the fix there is to reword and re-record, never to
+   relabel a genuinely grounded reply.
+4. Confirm no real webhook fired and the repo's own `logs/turns.jsonl` and
+   `data/mock_data.db` were untouched by the run.
+
+See `eval/README.md` for the full guide, and in particular its section on
+what the false-positive number does and does not mean — the single most
+important thing to read correctly once real numbers exist.

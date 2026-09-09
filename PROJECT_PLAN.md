@@ -254,8 +254,9 @@ instead — and a second consecutive flag hands off to a human. The "retry" is j
 customer's next turn, so this adds no synchronous regeneration, no extra LLM round-trip,
 and no dead air. An honest abstention ("I don't have that information") asserts no
 unsupported fact, so it never trips the detector. The threshold of 2 is a **starting
-value**, not settled — 10c's eval suite should measure the real false-positive rate rather
-than it being guessed.
+value**, not settled — 10c's eval suite instruments the threshold and records a
+reproducible baseline; the value of that number is the delta a later change moves it by,
+not the level.
 
 **Checkpoint:** automated — all new and existing tests pass offline, no regressions
 against the pre-10a baseline (see `README.md` for the exact count from the final run).

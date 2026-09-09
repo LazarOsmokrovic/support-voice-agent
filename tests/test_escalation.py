@@ -12,7 +12,6 @@ alongside the project's other full-loop tests.
 
 from __future__ import annotations
 
-import os
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -22,7 +21,6 @@ from agent.tools.escalation import (
     EscalationTracker,
     HandoffFields,
     TurnClassification,
-    classify_turn,
     create_handoff_packet,
     log_escalation,
 )
@@ -378,38 +376,11 @@ async def test_create_handoff_packet_redacts_pii_in_packet_and_db(tmp_path, monk
     assert order_id in row["customer_intent"]
 
 
-# --- classify_turn: live checks that the model's judgment actually matches intent ---
-
-
-@pytest.mark.skipif(
-    not os.getenv("ANTHROPIC_API_KEY"), reason="requires a real ANTHROPIC_API_KEY to hit the live Claude API"
-)
-@pytest.mark.asyncio
-async def test_classify_turn_detects_explicit_human_request_live():
-    messages = [{"role": "user", "content": "This isn't working, please just connect me to a real person."}]
-    result = await classify_turn(messages)
-    assert result.intent == "request_human"
-
-
-@pytest.mark.skipif(
-    not os.getenv("ANTHROPIC_API_KEY"), reason="requires a real ANTHROPIC_API_KEY to hit the live Claude API"
-)
-@pytest.mark.asyncio
-async def test_classify_turn_detects_negative_sentiment_live():
-    messages = [{"role": "user", "content": "This is the third time my order has been delayed. I'm furious."}]
-    result = await classify_turn(messages)
-    assert result.sentiment == "negative"
-
-
-@pytest.mark.skipif(
-    not os.getenv("ANTHROPIC_API_KEY"), reason="requires a real ANTHROPIC_API_KEY to hit the live Claude API"
-)
-@pytest.mark.asyncio
-async def test_classify_turn_does_not_over_flag_a_calm_question():
-    """Guards against escalating too eagerly: an ordinary question should
-    read as neutral/positive, not negative or a human request."""
-    messages = [{"role": "user", "content": "Hi! Can you tell me when my order 112-3487561-2938471 will arrive?"}]
-    result = await classify_turn(messages)
-    assert result.sentiment != "negative"
-    assert result.intent != "request_human"
-    assert result.policy_restricted is False
+# The three live classify_turn checks that used to sit here moved to
+# eval/scenarios.py in Phase 10c: triage_explicit_human_request,
+# triage_sustained_frustration and triage_calm_conversation_never_escalates
+# each exercise the same classification PLUS the tracker PLUS the handoff,
+# so keeping these was the duplicate harness that phase exists to remove.
+# Everything above stays: EscalationTracker's triggers, log_escalation and
+# create_handoff_packet's redaction are deterministic and model-free, which
+# makes them faster and more precise than any scenario could be.
