@@ -107,6 +107,13 @@ def current_hashes() -> dict[str, str]:
                     "orders": mock_db.ORDERS,
                     "tickets": mock_db.TICKETS,
                     "appointments": mock_db.APPOINTMENTS,
+                    # ESCALATIONS is seeded too, and eval/scoring.py reads the
+                    # escalations table in both _stored_texts and
+                    # stored_record_counts. Omitting it meant editing the seed
+                    # could change a scenario's PII and record-count results
+                    # with no STALE signal — the one failure mode these hashes
+                    # exist to prevent.
+                    "escalations": mock_db.ESCALATIONS,
                 }
             )
         ),

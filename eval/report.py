@@ -49,6 +49,11 @@ class EvalReport:
     grounding: GroundingCounts = EMPTY_COUNTS
     pii_leaks: int = 0
     stored_records: dict[str, int] = field(default_factory=dict)
+    # Whole-run, not per-scenario: the redactor either preserves this
+    # project's own identifiers or it does not, and no scenario changes that.
+    # Empty is the healthy state; any entry means guardrails/pii.py is eating
+    # order IDs, ISO dates or tracking numbers — Phase 10a's shipped bug.
+    redactor_failures: list[str] = field(default_factory=list)
 
     def count(self, outcome: str) -> int:
         return sum(1 for row in self.scenarios if row.outcome == outcome)
@@ -60,7 +65,12 @@ def exit_code(report: EvalReport, strict: bool = False) -> int:
     --strict collapses 2 into 1 for a release gate, where "the fixtures are
     stale" is not an acceptable state to ship in either.
     """
-    if report.count("FAIL"):
+    # A redactor destroying the project's own identifiers is a behavioural
+    # regression, not a fixtures problem, so it ranks with FAIL rather than
+    # with STALE. It is also independent of the scenarios: it must still go
+    # red when every scenario is MISSING, which is exactly the state this
+    # suite sits in until the recordings exist.
+    if report.count("FAIL") or report.redactor_failures:
         return 1
     fixture_trouble = sum(report.count(name) for name in ("STALE", "DRIFT", "MISSING", "ERROR"))
     if fixture_trouble:
@@ -126,6 +136,12 @@ def render(report: EvalReport) -> str:
     breakdown = ", ".join(f"{count} {name}" for name, count in report.stored_records.items())
     suffix = f" ({breakdown})" if breakdown else ""
     lines.append(f"pii: {report.pii_leaks} leaks across {total_records} stored records{suffix}")
+    if report.redactor_failures:
+        lines.append("")
+        lines.append("REDACTOR IS DESTROYING THIS PROJECT'S OWN IDENTIFIERS:")
+        lines.extend(f"  {detail}" for detail in report.redactor_failures)
+    else:
+        lines.append("redactor: seeded order IDs, dates and tracking numbers all survive intact")
     return "\n".join(lines)
 
 
@@ -145,4 +161,5 @@ def to_json(report: EvalReport) -> dict[str, Any]:
         "grounding": asdict(report.grounding),
         "pii_leaks": report.pii_leaks,
         "stored_records": report.stored_records,
+        "redactor_failures": report.redactor_failures,
     }

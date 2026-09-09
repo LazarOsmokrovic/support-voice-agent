@@ -31,6 +31,7 @@ from eval.scoring import (
     grounding_counts,
     score_drift,
     score_expectations,
+    score_redactor_preserves_identifiers,
     stored_record_counts,
 )
 
@@ -109,10 +110,19 @@ async def evaluate(scenarios: Sequence[Scenario], workdir: Path) -> EvalReport:
         # disabled log. This turns that never-raise policy into a checked
         # invariant: every in-process captured record must have produced
         # exactly one line in the turn-log file.
-        assert len(result.log_lines) == len(result.records), (
-            f"{scenario.name}: turn log holds {len(result.log_lines)} line(s) for "
-            f"{len(result.records)} captured record(s) — a write silently failed"
-        )
+        #
+        # Reported as this scenario's ERROR rather than raised. It was a bare
+        # `assert`, which had two problems: `python -O` strips it, so the
+        # invariant would vanish in exactly the environment least likely to be
+        # watched, and an AssertionError aborted the whole run, discarding the
+        # other 19 scenarios' results over one scenario's bad write.
+        if len(result.log_lines) != len(result.records):
+            row.outcome = "ERROR"
+            row.details.append(
+                f"turn log holds {len(result.log_lines)} line(s) for "
+                f"{len(result.records)} captured record(s) — a write silently failed"
+            )
+            continue
 
         if result.error:
             row.outcome = "ERROR"
@@ -142,6 +152,15 @@ async def evaluate(scenarios: Sequence[Scenario], workdir: Path) -> EvalReport:
             stored[key] = stored.get(key, 0) + value
 
     report.grounding = combine_counts(counts)
+    # Runs once per evaluation, not per scenario: it asserts a property of the
+    # redactor itself, which no scenario can influence. It is counted with the
+    # PII leaks because it IS the other half of that question — a redactor
+    # that hides contact details by destroying the store's own order IDs and
+    # dates has not protected anything, it has just broken the data. Phase 10a
+    # shipped exactly that bug.
+    redactor_failures = score_redactor_preserves_identifiers()
+    report.redactor_failures = [failure.detail for failure in redactor_failures]
+    leaks += len(redactor_failures)
     report.pii_leaks = leaks
     report.stored_records = stored
     return report

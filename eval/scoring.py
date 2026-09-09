@@ -28,6 +28,7 @@ from data import mock_db
 from eval.harness import HarnessResult
 from eval.recording import Recording
 from eval.scenarios import Scenario
+from guardrails.pii import redact_text
 
 # HarnessResult.db_path defaults to this (eval/harness.py) when a scenario
 # never touched a real per-scenario database — only ad-hoc test construction
@@ -183,13 +184,63 @@ def _stored_texts(result: HarnessResult) -> list[str]:
     return texts
 
 
+def _seeded_identifiers() -> list[tuple[str, str]]:
+    """Every value this project must NEVER let its own redactor mangle,
+    read from the seed at runtime. Returns (kind, value) pairs.
+
+    Phase 10a destroyed exactly these three shapes: 17-digit order IDs
+    (eaten by _CARDLIKE_RE), ISO dates (eaten by _PHONE_RE), and TBA...US
+    tracking numbers (mangled mid-token by _PHONE_RE). guardrails/pii.py
+    now exempts the first two via _NON_PII_SHAPES and guards the third with
+    word boundaries — this is the check that those protections stay.
+    """
+    values: list[tuple[str, str]] = []
+    for order_id, _cust, _item, _qty, _price, _status, order_date, delivery, tracking in mock_db.ORDERS:
+        values.append(("order id", order_id))
+        if tracking:
+            values.append(("tracking number", tracking))
+        for date in (order_date, delivery):
+            if date:
+                values.append(("order date", date))
+    for _cust, scheduled_time, _reason, _status in mock_db.APPOINTMENTS:
+        values.append(("appointment time", scheduled_time))
+    return values
+
+
+def score_redactor_preserves_identifiers() -> list[Failure]:
+    """Assert the redactor leaves this project's own identifiers alone.
+
+    This is the direct form of the check, and it replaced an indirect one
+    that did not work. The earlier version inferred destruction from stored
+    records: if a record mentioned one identifier, omitted another, and
+    contained any '[redacted-' marker, it called the absent one destroyed.
+    That produced false positives on any record carrying an unrelated
+    redaction (a masked email made an unmentioned tracking number look
+    eaten), and — worse — it never covered ISO dates at all, so removing
+    _ISO_DATE_OR_DATETIME_RE from guardrails/pii.py turned every
+    order_date into '[redacted-phone]' and this suite stayed green. That is
+    precisely the Phase 10a regression the check advertises catching.
+
+    Testing the redactor itself removes the guesswork. Destruction happens
+    in redact_text; a damaged stored record is only the downstream symptom.
+    An exact equality on a known seeded value cannot false-positive, needs
+    no anchor, and fires even when no scenario happens to store that
+    identifier — so the check is real rather than incidental.
+    """
+    return [
+        Failure("pii", f"the redactor mangles a seeded {kind}: {value!r} -> {redact_text(value)!r}")
+        for kind, value in _seeded_identifiers()
+        if redact_text(value) != value
+    ]
+
+
 def score_pii(scenario: Scenario, result: HarnessResult) -> list[Failure]:
     """Reads REAL seeded values at runtime; never hard-codes one.
 
     Two directions, both of which have been real defects in this repo:
-    contact details must be GONE, and the store's own identifiers (order IDs,
-    TBA...US tracking numbers) must have SURVIVED. A redactor that passes the
-    first half by destroying everything fails the second.
+    contact details must be GONE, and the store's own identifiers must have
+    SURVIVED. A redactor that passes the first half by destroying everything
+    fails the second (score_redactor_preserves_identifiers).
     """
     if not scenario.expect.no_pii_in_records:
         return []
@@ -208,47 +259,30 @@ def score_pii(scenario: Scenario, result: HarnessResult) -> list[Failure]:
         Failure("pii", f"{contact!r} appears verbatim in a stored record") for contact in contacts if contact in blob
     ]
 
-    # order_id and tracking naturally co-occur in the same stored record
-    # (e.g. "Order <id> shipped, tracking <tracking>"), so each is the
-    # other's anchor: if one of the pair is present INTACT in a given text,
-    # that text is unambiguously about this specific seeded order, and the
-    # other member of the pair had better be present intact too. Missing
-    # AND a redaction marker present in the same text is not "never
-    # mentioned" — it's a redactor eating the project's own identifier
-    # (Phase 10a's bug). This intentionally requires no minimum surviving
-    # prefix: real damage can wipe an identifier completely ("112-..." ->
-    # a bare "[redacted-number]", the shape _CARDLIKE_RE produces) or leave
-    # only boundary characters ("TBA123456789US" -> "TBA[redacted-phone]US"),
-    # and a prefix-length requirement missed the first shape entirely.
+    # `item` anchors every order, and it is the ONLY anchor used. The
+    # earlier version paired order_id and tracking as each other's anchor,
+    # which broke twice. Pairing assumes the two co-occur; that holds for
+    # get_order_status output but not for refund, policy, escalation or
+    # ticket records, so a record naming only the order — plus any
+    # unrelated '[redacted-' marker, a masked email say — reported the
+    # absent tracking number as destroyed. It also left orders whose
+    # tracking_number is NULL (two are seeded) with no anchor at all.
+    #
+    # `item` has neither problem. It is free text the redactor provably
+    # cannot touch: it matches none of _EMAIL_RE / _CARDLIKE_RE /
+    # _PHONE_RE, since those need an uninterrupted digit run and a string
+    # like "Instant Pot Duo 7-in-1 (6 Qt)" breaks on the letters. So its
+    # presence intact means a record genuinely concerns THIS order, even
+    # when the order_id that would normally identify it is the very thing
+    # destroyed — and its absence means the record simply is not about this
+    # order, which is the case that must NOT be flagged.
     for order_id, _cust, item, _qty, _price, _status, _od, _ed, tracking in mock_db.ORDERS:
-        for anchor, sibling in ((order_id, tracking), (tracking, order_id)):
-            if not anchor or not sibling:
+        for text in texts:
+            if item not in text or "[redacted-" not in text:
                 continue
-            for text in texts:
-                if anchor in text and sibling not in text and "[redacted-" in text:
-                    failures.append(Failure("pii", f"{sibling} was destroyed by redaction"))
-                    break
-
-        # Self-anchor fallback for an order with no tracking_number at all
-        # (several seeded orders — e.g. "Processing" and "Cancelled" ones —
-        # have none): there is no sibling identifier left to pair order_id
-        # against, so the check above is a silent no-op for it. `item` fills
-        # that role instead. It is free text this project's own redactor
-        # never touches (it matches none of _EMAIL_RE / _CARDLIKE_RE /
-        # _PHONE_RE), so its survival intact is a safe, independent signal
-        # that a record concerns THIS specific order — even when order_id,
-        # the field that would normally anchor it, is the very thing that
-        # got destroyed. Without an anchor here, "a redaction marker sits
-        # somewhere in a record that never mentions this order at all"
-        # would be indistinguishable from "this order's identifier was
-        # destroyed" — exactly the false-positive shape round 1 already
-        # rejected for the paired case, so it cannot be reintroduced here by
-        # dropping the anchor requirement.
-        if not tracking:
-            for text in texts:
-                if item in text and order_id not in text and "[redacted-" in text:
-                    failures.append(Failure("pii", f"{order_id} was destroyed by redaction"))
-                    break
+            for kind, value in (("order id", order_id), ("tracking number", tracking)):
+                if value and value not in text:
+                    failures.append(Failure("pii", f"{kind} {value} was destroyed by redaction"))
     return failures
 
 

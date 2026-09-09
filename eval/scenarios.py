@@ -160,8 +160,26 @@ def _order_total(item_fragment: str) -> float:
     return round(row[4] * row[3], 2)
 
 
+def _contact(customer_id: str) -> tuple[str, str]:
+    """Resolve a seeded customer's (email, phone), or raise. See above.
+
+    Exists so a scenario can put a customer's REAL contact details into a
+    turn. That matters more than it looks: no tool under agent/tools/ ever
+    returns an email or phone, so before this the "no PII in stored records"
+    check could not fire on any of the 20 scenarios — `pii: 0 leaks` was
+    true by construction rather than by the redactor working. A customer
+    volunteering their own contact details mid-conversation is also the most
+    realistic way this data reaches a stored record in the first place.
+    """
+    matches = [(row[2], row[3]) for row in mock_db.CUSTOMERS if row[0] == customer_id]
+    if len(matches) != 1:
+        raise ValueError(f"{customer_id!r} matched {len(matches)} seeded customers, expected exactly 1")
+    return matches[0]
+
+
 MARIA = _customer_id("Maria")  # CUST-1001
 JAMES = _customer_id("James")  # CUST-1002
+MARIA_EMAIL, MARIA_PHONE = _contact(MARIA)
 PRIYA = _customer_id("Priya")  # CUST-1003
 TOM = _customer_id("Tom")  # CUST-1004
 AIKO = _customer_id("Aiko")  # CUST-1005
@@ -584,6 +602,7 @@ SCENARIOS: tuple[Scenario, ...] = (
         customer_id=MARIA,
         turns=(
             f"Hi, when is order {KINDLE} arriving?",
+            f"Could you email me the update at {MARIA_EMAIL} or call {MARIA_PHONE}?",
             "That's all, thanks — you can close this out.",
         ),
         expect=Expectations(
@@ -593,12 +612,15 @@ SCENARIOS: tuple[Scenario, ...] = (
                 DbAssertion(sql="SELECT * FROM tickets WHERE customer_id = ?", params=(MARIA,), rows=1),
             ),
         ),
-        grounding_truth=("not_applicable", "not_applicable"),
+        grounding_truth=("not_applicable", "not_applicable", "not_applicable"),
         close_session=True,
         notes=(
             "The one scenario driving close_session(). Asserts a tickets row with redacted free text "
             "and an intact order ID — the summary capability's coverage, since test_summary.py's live "
-            "20x sampling test cannot become a replay scenario."
+            "20x sampling test cannot become a replay scenario. Turn 2 speaks Maria's real seeded "
+            "email and phone, which is what makes the no-PII-in-stored-records check reachable at "
+            "all: no tool returns contact details, so without this the check could never fire on any "
+            "scenario and 'pii: 0 leaks' was true by construction rather than by redaction working."
         ),
     ),
 )

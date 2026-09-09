@@ -17,12 +17,15 @@ from data import mock_db
 from eval.harness import HarnessResult, ObservedTurn
 from eval.scenarios import DbAssertion, Expectations, Scenario, ToolExpectation
 from eval.scoring import (
+    _seeded_identifiers,
     score_db,
     score_escalation,
     score_expectations,
     score_pii,
+    score_redactor_preserves_identifiers,
     score_tools,
 )
+from guardrails import pii
 
 
 def _scenario(**overrides) -> Scenario:
@@ -227,11 +230,13 @@ def test_pii_scoring_flags_a_boundary_mangled_tracking_number(tmp_path):
     demanding a long surviving prefix (the code this replaces) missed this
     shape entirely; that's the Critical the review caught."""
     customer_id, _name, _email, _phone = mock_db.CUSTOMERS[0]
-    order_id, _cust, _item, _q, _p, _s, _od, _ed, tracking = mock_db.ORDERS[0]
+    order_id, _cust, item, _q, _p, _s, _od, _ed, tracking = mock_db.ORDERS[0]
     mangled_tracking = f"{tracking[:3]}[redacted-phone]{tracking[-2:]}"
     scenario = _scenario(customer_id=customer_id)
     result = _result(
-        log_lines=[{"reply": f"Order {order_id} shipped, tracking {mangled_tracking}", "user_text": "hi"}]
+        log_lines=[
+            {"reply": f"Your {item} (order {order_id}) shipped, tracking {mangled_tracking}", "user_text": "hi"}
+        ]
     )
     failures = score_pii(scenario, result)
     assert any(tracking in failure.detail for failure in failures)
@@ -246,10 +251,12 @@ def test_pii_scoring_flags_a_fully_wiped_order_id(tmp_path):
     requirement; the check has to work from full-string absence, not
     remnant characters."""
     customer_id, _name, _email, _phone = mock_db.CUSTOMERS[0]
-    order_id, _cust, _item, _q, _p, _s, _od, _ed, tracking = mock_db.ORDERS[0]
+    order_id, _cust, item, _q, _p, _s, _od, _ed, tracking = mock_db.ORDERS[0]
     scenario = _scenario(customer_id=customer_id)
     result = _result(
-        log_lines=[{"reply": f"Order [redacted-number] shipped, tracking {tracking}", "user_text": "hi"}]
+        log_lines=[
+            {"reply": f"Your {item} (order [redacted-number]) shipped, tracking {tracking}", "user_text": "hi"}
+        ]
     )
     failures = score_pii(scenario, result)
     assert any(order_id in failure.detail for failure in failures)
@@ -286,6 +293,75 @@ def test_pii_scoring_does_not_flag_an_unpaired_order_that_is_simply_not_mentione
         log_lines=[{"reply": "Thanks for calling, have a great day.", "user_text": "[redacted-email]"}]
     )
     assert score_pii(scenario, result) == []
+
+
+def test_pii_scoring_does_not_flag_an_unrelated_redaction_marker(tmp_path):
+    """The whole-branch review's Critical, as a permanent regression test.
+
+    A record naming an order but not its item, alongside an unrelated
+    redaction (a masked email), used to report the order's tracking number
+    as destroyed — a number that record never mentioned. Pairing order_id
+    and tracking as each other's anchor assumed they co-occur, which holds
+    for get_order_status output but not for refund, escalation or ticket
+    records. Absence is not destruction.
+    """
+    order_id, customer_id, _item, *_rest = mock_db.ORDERS[0]
+    scenario = _scenario(customer_id=customer_id)
+    result = _result(
+        log_lines=[{"reply": f"Refund for order {order_id} started", "user_text": "reach me at [redacted-email]"}]
+    )
+    assert score_pii(scenario, result) == []
+
+
+def test_the_redactor_leaves_every_seeded_identifier_intact():
+    """The healthy baseline for the check below."""
+    assert score_redactor_preserves_identifiers() == []
+
+
+def test_the_redactor_check_catches_destroyed_iso_dates():
+    """Phase 10a's date-destruction bug, reproduced exactly.
+
+    guardrails/pii.py exempts ISO dates from _PHONE_RE via _NON_PII_SHAPES.
+    Remove that exemption and every seeded order_date becomes
+    '[redacted-phone]'. The previous stored-record heuristic never looked at
+    dates at all, so this regression passed the suite green — which is what
+    the whole-branch review caught. Now it cannot.
+    """
+    original = pii._NON_PII_SHAPES
+    pii._NON_PII_SHAPES = tuple(p for p in original if p is not pii._ISO_DATE_OR_DATETIME_RE)
+    try:
+        failures = score_redactor_preserves_identifiers()
+    finally:
+        pii._NON_PII_SHAPES = original
+    assert failures, "removing the ISO-date exemption must be detected"
+    assert any("date" in failure.detail for failure in failures)
+    assert score_redactor_preserves_identifiers() == [], "the exemption must be restored"
+
+
+def test_the_redactor_check_catches_destroyed_order_ids():
+    """The Phase 11 bug: _CARDLIKE_RE swallowing this project's own
+    17-digit order IDs whole, because every test used an invented
+    '4111 1111 1111 1111' instead of a real seeded value."""
+    original = pii._NON_PII_SHAPES
+    pii._NON_PII_SHAPES = tuple(p for p in original if p is not pii.ORDER_ID_PATTERN)
+    try:
+        failures = score_redactor_preserves_identifiers()
+    finally:
+        pii._NON_PII_SHAPES = original
+    assert failures, "removing the order-ID exemption must be detected"
+    assert any("order id" in failure.detail for failure in failures)
+
+
+def test_the_redactor_check_covers_tracking_numbers_and_appointment_times():
+    """Every shape the seed actually holds is checked, not just order IDs.
+    Read from mock_db at runtime so a seed refresh cannot quietly shrink
+    what this covers."""
+    kinds = {kind for kind, _value in _seeded_identifiers()}
+    assert kinds == {"order id", "tracking number", "order date", "appointment time"}
+    values = [value for _kind, value in _seeded_identifiers()]
+    assert any(value.startswith("TBA") for value in values), "TBA...US tracking numbers must be covered"
+    seeded_order_ids = {row[0] for row in mock_db.ORDERS}
+    assert seeded_order_ids <= set(values), "every seeded order ID must be checked"
 
 
 def test_score_expectations_reports_a_wrong_end_reason():

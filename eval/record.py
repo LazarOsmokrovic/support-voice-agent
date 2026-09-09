@@ -93,6 +93,19 @@ async def record_scenario(
     client = RecordingAnthropicClient(client_factory())
     frozen = recorded_at + timedelta(days=scenario.clock_offset_days)
     result = await run_scenario(scenario, client, frozen, workdir)
+    # Same turn-log invariant the offline runner checks, and it matters more
+    # here: this is the path that WRITES the fixture. log_turn() never raises,
+    # so a silently dropped write during recording would bake a hole into the
+    # recording itself and every later replay would inherit it, with nothing
+    # left to reveal that anything was lost. Raising is right in the recorder
+    # (unlike the runner, which reports it as one scenario's ERROR) because
+    # saving a knowingly incomplete recording is worse than recording nothing.
+    if len(result.log_lines) != len(result.records):
+        raise RuntimeError(
+            f"{scenario.name}: turn log holds {len(result.log_lines)} line(s) for "
+            f"{len(result.records)} captured record(s) — a write silently failed; "
+            "refusing to save an incomplete recording"
+        )
     recording = Recording(
         scenario=scenario.name,
         recorded_at=recorded_at.isoformat(),

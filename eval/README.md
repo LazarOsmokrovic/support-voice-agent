@@ -62,6 +62,31 @@ where you want staleness to block anyway.
      identical reason: hand-typed fixture values that merely *looked*
      plausible, rather than values `data/mock_db.py` actually produces.
 
+   `score_redactor_preserves_identifiers()` is the standing guard against a
+   third occurrence. It reads every seeded order ID, tracking number, order
+   date and appointment time at runtime and asserts `redact_text(value) ==
+   value` — 30 values today, and more automatically if the seed grows. It runs
+   once per evaluation and reports through the `redactor:` line at the foot of
+   the report; a failure exits **1**, not 2, because a redactor eating the
+   store's own data is a behavioural regression rather than a stale fixture.
+
+   It is deliberately a property of the redactor rather than of the stored
+   records. An earlier version tried to infer destruction from records — if a
+   record named one identifier, omitted another, and contained any
+   `[redacted-` marker, it called the absent one destroyed. That both
+   false-positived (an unrelated masked email made an unmentioned tracking
+   number look eaten) and, more seriously, never covered dates at all, so
+   deleting the ISO-date exemption from `guardrails/pii.py` left the suite
+   green. Testing the redactor directly cannot false-positive, needs no
+   anchoring, and fires even when no scenario happens to store the value.
+
+   The stored-record check still exists alongside it, as a second net: within
+   a record, an order's `item` text anchors the check, because `item` is free
+   text none of the redaction patterns can match. If a record mentions the
+   item and carries a redaction marker but has lost the order ID or tracking
+   number, that is flagged. Absence alone never is — a record that simply does
+   not concern an order is not evidence that anything was destroyed.
+
    A hand-typed order ID or date in a scenario reintroduces exactly that
    failure mode here: it can look right, pass review, and quietly stop
    testing the thing it claims to test the moment the seed changes shape
@@ -164,15 +189,16 @@ documented here rather than left for someone to rediscover.
   label. Read `flagged` as "flagged, out of every turn in the suite," never
   as "flagged, among the turns that were actually labelled" — those are
   different denominators and the report does not collapse them into one.
-- **The turn-log invariant is enforced in one place, not two.** `len(log_lines)
-  == len(records)` is asserted inside `eval/run_eval.py`'s `evaluate()`, which
-  checks that replay produced exactly as many turn-log lines as observed
-  turns. `eval/record.py`'s own call to `run_scenario` is not covered by that
-  assertion. That is the one path where a silently-dropped write would
-  matter most: during the live recording run, a dropped log line would
-  corrupt a fixture with no signal that anything went wrong, and the mistake
-  would only surface later, if at all, once someone tried to reconcile a
-  recording against a log that has fewer lines than it should.
+- **The turn-log invariant is enforced in both places, and reacts differently
+  in each.** `len(log_lines) == len(records)` is checked in `eval/run_eval.py`'s
+  `evaluate()` and again in `eval/record.py` before a recording is saved.
+  `log_turn()` never raises, so without this a silently dropped write is
+  indistinguishable from a disabled log. The runner reports a mismatch as that
+  one scenario's `ERROR` and carries on, because losing the other 19 results to
+  one bad write helps nobody. The recorder *raises* instead: it is the path that
+  writes the fixture, so an incomplete recording would be inherited by every
+  later replay with nothing left to reveal the loss. Saving a knowingly
+  incomplete recording is worse than recording nothing.
 
 ## `guardrail_ungrounded_ladder_escalates` may not be scriptable
 
