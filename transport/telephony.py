@@ -246,6 +246,38 @@ async def whisper(request: Request) -> Response:
     return Response(content=str(response), media_type="application/xml")
 
 
+# Every DialCallStatus that means the human did NOT take the call. Twilio's
+# full set is completed/answered/busy/no-answer/failed/canceled; the first two
+# mean the bridge happened and the conversation is over.
+_DIAL_FAILED = frozenset({"busy", "no-answer", "failed", "canceled"})
+
+
+@app.post("/transfer-status")
+async def transfer_status(request: Request) -> Response:
+    """Twilio requests this when <Dial> ends, and from here the action URL —
+    not the original TwiML — controls the parent call.
+
+    On a failed dial the customer is still on the line, having waited through
+    the ringing. Reconnecting the Media Stream with the ORIGINAL session id
+    means the agent resumes with full history and can apologise and offer a
+    callback, rather than greeting them from scratch as a stranger.
+    """
+    form = await _validate_twilio_signature(request, "/transfer-status")
+    call_sid = form.get("CallSid", "")
+    pending = TRANSFERS.pop(call_sid, None)
+    status = form.get("DialCallStatus", "")
+
+    response = VoiceResponse()
+    if status in _DIAL_FAILED and pending is not None:
+        print(f"(transfer for {call_sid} ended as {status!r} — returning the caller to the agent)")
+        connect = Connect()
+        connect.stream(url=f"wss://{_public_hostname()}/media-stream?session={pending.session_id}")
+        response.append(connect)
+    else:
+        response.hangup()
+    return Response(content=str(response), media_type="application/xml")
+
+
 async def _read_start_event(receive_text: Callable[[], Awaitable[str]]) -> tuple[str, str, str]:
     """Drain Twilio's initial "connected" then "start" events, returning
     (stream_sid, call_sid, account_sid) — what TwilioFrameSerializer needs

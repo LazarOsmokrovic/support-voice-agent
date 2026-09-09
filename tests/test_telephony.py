@@ -335,3 +335,65 @@ async def test_whisper_falls_back_when_the_transfer_is_unknown(monkeypatch):
 
     assert response.status_code == 200
     assert "<Say>" in response.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["busy", "no-answer", "failed", "canceled"])
+async def test_transfer_status_returns_the_customer_to_the_agent(monkeypatch, status):
+    """The human did not pick up. The customer has been holding — bringing
+    them back to an agent that REMEMBERS the conversation is the whole point
+    of passing the session id through."""
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    telephony.remember_transfer("CA-1", {"escalation_id": 42}, "sess-abc")
+
+    url = "https://example.ngrok.app/transfer-status"
+    params = {"CallSid": "CA-1", "DialCallStatus": status}
+    signature = _sign(url, params, "test-token")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post("/transfer-status", data=params, headers={"X-Twilio-Signature": signature})
+
+    assert response.status_code == 200
+    assert "<Stream" in response.text
+    assert "session=sess-abc" in response.text
+    assert "CA-1" not in telephony.TRANSFERS
+
+
+@pytest.mark.asyncio
+async def test_transfer_status_hangs_up_after_a_completed_transfer(monkeypatch):
+    """The human answered and the call is over. Reconnecting the AI here
+    would drop a finished conversation back onto a bot."""
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    telephony.remember_transfer("CA-1", {"escalation_id": 42}, "sess-abc")
+
+    url = "https://example.ngrok.app/transfer-status"
+    params = {"CallSid": "CA-1", "DialCallStatus": "completed"}
+    signature = _sign(url, params, "test-token")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post("/transfer-status", data=params, headers={"X-Twilio-Signature": signature})
+
+    assert "<Hangup" in response.text
+    assert "<Stream" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_transfer_status_rejects_an_unsigned_request(monkeypatch):
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post(
+            "/transfer-status",
+            data={"CallSid": "CA-1", "DialCallStatus": "no-answer"},
+            headers={"X-Twilio-Signature": "wrong"},
+        )
+
+    assert response.status_code == 403
