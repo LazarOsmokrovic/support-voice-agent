@@ -203,23 +203,46 @@ async def transfer_to_human(
     return True
 
 
+async def _validate_twilio_signature(request: Request, path: str) -> dict[str, str]:
+    """Shared by every Twilio-facing endpoint. Extracted rather than repeated
+    because /whisper and /transfer-status must not drift from /voice's
+    checking — a weaker check on the endpoint that SPEAKS a customer's
+    briefing would be the worst place to have one.
+    """
+    form = await request.form()
+    signature = request.headers.get("X-Twilio-Signature", "")
+    validator = RequestValidator(os.getenv("TWILIO_AUTH_TOKEN", ""))
+    if not validator.validate(f"https://{_public_hostname()}{path}", dict(form), signature):
+        raise HTTPException(status_code=403, detail="invalid Twilio request signature")
+    return dict(form)
+
+
 @app.post("/voice")
 async def voice(request: Request) -> Response:
     """Twilio's incoming-call webhook. Validates the request signature
     before trusting anything in it, then returns TwiML connecting the call
     to a bidirectional Media Stream.
     """
-    form = await request.form()
-    signature = request.headers.get("X-Twilio-Signature", "")
-    validator = RequestValidator(os.getenv("TWILIO_AUTH_TOKEN", ""))
-    webhook_url = f"https://{_public_hostname()}/voice"
-    if not validator.validate(webhook_url, dict(form), signature):
-        raise HTTPException(status_code=403, detail="invalid Twilio request signature")
+    await _validate_twilio_signature(request, "/voice")
 
     response = VoiceResponse()
     connect = Connect()
     connect.stream(url=f"wss://{_public_hostname()}/media-stream")
     response.append(connect)
+    return Response(content=str(response), media_type="application/xml")
+
+
+@app.post("/whisper")
+async def whisper(request: Request) -> Response:
+    """Spoken to the human agent only, after they answer and before the two
+    legs are bridged. Twilio requests this via the `url` attribute on
+    <Number>; the customer never hears it.
+    """
+    form = await _validate_twilio_signature(request, "/whisper")
+    pending = TRANSFERS.get(form.get("ParentCallSid", ""))
+    text = pending.whisper if pending else "A customer is waiting. No context is available for this transfer."
+    response = VoiceResponse()
+    response.say(text)
     return Response(content=str(response), media_type="application/xml")
 
 

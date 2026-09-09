@@ -275,3 +275,63 @@ async def test_transfer_to_human_fires_only_once_per_call(monkeypatch):
     assert first is True
     assert second is False
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_whisper_speaks_the_briefing_to_the_human(monkeypatch):
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    telephony.remember_transfer("CA-1", {"escalation_id": 42, "customer_intent": "refund dispute"}, "s1")
+
+    url = "https://example.ngrok.app/whisper"
+    params = {"CallSid": "CA-whisper-leg", "ParentCallSid": "CA-1"}
+    signature = _sign(url, params, "test-token")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post("/whisper", data=params, headers={"X-Twilio-Signature": signature})
+
+    assert response.status_code == 200
+    assert "refund dispute" in response.text
+    assert "<Say>" in response.text
+
+
+@pytest.mark.asyncio
+async def test_whisper_rejects_an_unsigned_request_and_leaks_nothing(monkeypatch):
+    """This endpoint speaks a customer's handoff briefing aloud. The
+    signature check is the ONLY access control on it — without it, anyone
+    who guesses the URL can read intent, summary and account info."""
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    telephony.remember_transfer("CA-1", {"escalation_id": 42, "customer_intent": "refund dispute"}, "s1")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post(
+            "/whisper", data={"ParentCallSid": "CA-1"}, headers={"X-Twilio-Signature": "wrong"}
+        )
+
+    assert response.status_code == 403
+    assert "refund dispute" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_whisper_falls_back_when_the_transfer_is_unknown(monkeypatch):
+    """A process restart between redirect and whisper loses the registry.
+    The human should still get a usable call, not silence."""
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+
+    url = "https://example.ngrok.app/whisper"
+    params = {"ParentCallSid": "CA-unknown"}
+    signature = _sign(url, params, "test-token")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post("/whisper", data=params, headers={"X-Twilio-Signature": signature})
+
+    assert response.status_code == 200
+    assert "<Say>" in response.text
