@@ -176,3 +176,102 @@ def test_remember_transfer_stores_the_whisper_for_the_endpoint_to_read():
     assert stored.escalation_id == 9
     assert stored.session_id == "sess-1"
     assert "billing question" in stored.whisper
+
+
+def test_build_transfer_twiml_dials_the_human_with_a_whisper_url(monkeypatch):
+    """Asserted as parsed XML, not string matching — a test that greps for
+    a substring passes on malformed TwiML that Twilio would reject."""
+    import xml.etree.ElementTree as ET
+
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    xml = telephony.build_transfer_twiml(42, "+15551234567", "+15559876543")
+    root = ET.fromstring(xml)
+    dial = root.find("Dial")
+    assert dial is not None
+    assert dial.get("timeout") == "20"
+    assert "/transfer-status" in dial.get("action")
+    number = dial.find("Number")
+    assert number.text == "+15551234567"
+    assert "/whisper" in number.get("url")
+    assert "escalation_id=42" in number.get("url")
+
+
+@pytest.mark.asyncio
+async def test_transfer_to_human_issues_the_redirect(monkeypatch):
+    monkeypatch.setenv("HUMAN_AGENT_NUMBER", "+15551234567")
+    monkeypatch.setenv("TWILIO_CALLER_ID", "+15559876543")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+
+    updated = {}
+
+    class _FakeCalls:
+        def __init__(self, sid):
+            self.sid = sid
+
+        def update(self, **kwargs):
+            updated.update({"sid": self.sid, **kwargs})
+
+    fake_client = type("C", (), {"calls": staticmethod(lambda sid: _FakeCalls(sid))})()
+
+    ok = await telephony.transfer_to_human("CA-1", {"escalation_id": 42}, "sess-1", client=fake_client)
+
+    assert ok is True
+    assert updated["sid"] == "CA-1"
+    assert "+15551234567" in updated["twiml"]
+    assert telephony.TRANSFERS["CA-1"].escalation_id == 42
+
+
+@pytest.mark.asyncio
+async def test_transfer_to_human_is_a_no_op_without_a_configured_number(monkeypatch):
+    """Optional-by-default, exactly like ESCALATION_WEBHOOK_URL. A developer
+    with no human agent configured must still get a working agent."""
+    monkeypatch.delenv("HUMAN_AGENT_NUMBER", raising=False)
+    called = False
+
+    def _boom(sid):
+        nonlocal called
+        called = True
+        raise AssertionError("must not touch Twilio without a number configured")
+
+    fake_client = type("C", (), {"calls": staticmethod(_boom)})()
+    assert await telephony.transfer_to_human("CA-1", {}, "s", client=fake_client) is False
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_transfer_to_human_returns_false_when_twilio_rejects(monkeypatch):
+    """A failed transfer must degrade to today's behaviour, never drop the
+    call. The caller keeps the agent; it does not raise."""
+    monkeypatch.setenv("HUMAN_AGENT_NUMBER", "+15551234567")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+
+    class _FailingCalls:
+        def update(self, **kwargs):
+            raise RuntimeError("call is no longer in-progress")
+
+    fake_client = type("C", (), {"calls": staticmethod(lambda sid: _FailingCalls())})()
+    assert await telephony.transfer_to_human("CA-1", {"escalation_id": 1}, "s", client=fake_client) is False
+
+
+@pytest.mark.asyncio
+async def test_transfer_to_human_fires_only_once_per_call(monkeypatch):
+    """A model escalation immediately followed by a DTMF press must not
+    redirect twice — the second would land on a call already dialling."""
+    monkeypatch.setenv("HUMAN_AGENT_NUMBER", "+15551234567")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    calls = []
+
+    class _Calls:
+        def update(self, **kwargs):
+            calls.append(kwargs)
+
+    fake_client = type("C", (), {"calls": staticmethod(lambda sid: _Calls())})()
+
+    first = await telephony.transfer_to_human("CA-1", {"escalation_id": 1}, "s", client=fake_client)
+    second = await telephony.transfer_to_human("CA-1", {"escalation_id": 2}, "s", client=fake_client)
+
+    assert first is True
+    assert second is False
+    assert len(calls) == 1

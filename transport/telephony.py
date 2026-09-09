@@ -54,7 +54,8 @@ from pipecat.transports.websocket.fastapi import (
 )
 from pipecat.workers.runner import WorkerRunner
 from twilio.request_validator import RequestValidator
-from twilio.twiml.voice_response import Connect, VoiceResponse
+from twilio.rest import Client
+from twilio.twiml.voice_response import Connect, Dial, VoiceResponse
 
 from agent.session import DEFAULT_CUSTOMER_ID, close_session, create_session
 from transport.pipecat_processors import build_pipeline
@@ -137,6 +138,69 @@ def remember_transfer(call_sid: str, packet: dict[str, Any], session_id: str) ->
     )
     TRANSFERS[call_sid] = pending
     return pending
+
+
+def build_transfer_twiml(escalation_id: int | None, human_number: str, caller_id: str | None) -> str:
+    """The TwiML that replaces the Media Stream.
+
+    <Number url=...> is Twilio's whisper: that TwiML runs on the CALLED
+    party's end after they answer but before the two legs are bridged, so the
+    human hears the briefing and the customer does not. It may not contain
+    <Dial>.
+
+    <Dial action=...> hands the parent call to /transfer-status when the dial
+    ends, which is what makes the no-answer path possible — without it, the
+    customer would simply be hung up on.
+
+    The leading <Say> matters more than it looks: issuing the redirect cuts
+    the Media Stream, which can truncate the agent's own spoken notice
+    mid-word. This guarantees the customer hears something before ringing.
+    """
+    response = VoiceResponse()
+    response.say("Connecting you now. Please hold.")
+    dial = Dial(
+        action=f"https://{_public_hostname()}/transfer-status",
+        timeout=TRANSFER_TIMEOUT_SECONDS,
+        caller_id=caller_id,
+    )
+    dial.number(human_number, url=f"https://{_public_hostname()}/whisper?escalation_id={escalation_id}")
+    response.append(dial)
+    return str(response)
+
+
+async def transfer_to_human(
+    call_sid: str,
+    packet: dict[str, Any],
+    session_id: str,
+    *,
+    client: Any | None = None,
+) -> bool:
+    """Redirect the customer's live call into a whispered <Dial>.
+
+    Returns True if the redirect was issued, False otherwise. NEVER raises:
+    every caller treats False as "carry on as before", so a broken transfer
+    costs the customer a handoff, not the call.
+    """
+    human_number = os.getenv("HUMAN_AGENT_NUMBER")
+    if not human_number:
+        print("(no HUMAN_AGENT_NUMBER configured — skipping transfer)")
+        return False
+
+    if call_sid in TRANSFERS:
+        print(f"(transfer already in flight for {call_sid} — ignoring duplicate)")
+        return False
+
+    remember_transfer(call_sid, packet, session_id)
+    try:
+        rest = client or Client(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+        twiml = build_transfer_twiml(packet.get("escalation_id"), human_number, os.getenv("TWILIO_CALLER_ID"))
+        rest.calls(call_sid).update(twiml=twiml)
+    except Exception as exc:  # noqa: BLE001 — a failed transfer must never drop the call
+        TRANSFERS.pop(call_sid, None)
+        print(f"(transfer to {human_number} failed: {exc})")
+        return False
+    print(f"(transferring {call_sid} to {human_number})")
+    return True
 
 
 @app.post("/voice")
