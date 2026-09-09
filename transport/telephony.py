@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -155,15 +156,25 @@ def build_transfer_twiml(escalation_id: int | None, human_number: str, caller_id
     The leading <Say> matters more than it looks: issuing the redirect cuts
     the Media Stream, which can truncate the agent's own spoken notice
     mid-word. This guarantees the customer hears something before ringing.
+
+    Both callback URLs carry `?escalation_id=`, as the design spec's TwiML
+    does. It is deliberately not load-bearing — /whisper keys off
+    ParentCallSid and /transfer-status off CallSid, both of which Twilio
+    posts in the form body — but it makes Twilio's own request log say which
+    handoff a callback belongs to, which is the only place an operator can
+    look when a transfer misbehaves on a live call. That is only safe
+    because _signed_url() now validates the URL *including* its query
+    string; validating a reconstructed bare path 403'd every one of these.
     """
+    query = "" if escalation_id is None else f"?escalation_id={escalation_id}"
     response = VoiceResponse()
     response.say("Connecting you now. Please hold.")
     dial = Dial(
-        action=f"https://{_public_hostname()}/transfer-status",
+        action=f"https://{_public_hostname()}/transfer-status{query}",
         timeout=TRANSFER_TIMEOUT_SECONDS,
         caller_id=caller_id,
     )
-    dial.number(human_number, url=f"https://{_public_hostname()}/whisper?escalation_id={escalation_id}")
+    dial.number(human_number, url=f"https://{_public_hostname()}/whisper{query}")
     response.append(dial)
     return str(response)
 
@@ -199,20 +210,55 @@ async def transfer_to_human(
         TRANSFERS.pop(call_sid, None)
         print(f"(transfer to {human_number} failed: {exc})")
         return False
+    # The redirect that just succeeded is itself what ends the Media Stream,
+    # so media_stream()'s own teardown is about to run — ~20 seconds before
+    # /transfer-status says whether the customer is coming back. Marking the
+    # session detached here (with no await in between, so the teardown cannot
+    # interleave) is what stops that teardown closing a session the reconnect
+    # still needs. Done only on success: a failed redirect leaves the Media
+    # Stream up and the call ends normally.
+    detach_session(session_id)
     print(f"(transferring {call_sid} to {human_number})")
     return True
 
 
-async def _validate_twilio_signature(request: Request, path: str) -> dict[str, str]:
+def _signed_url(request: Request) -> str:
+    """Rebuild the exact URL Twilio signed for this request.
+
+    Twilio signs the FULL URL it requested, query string included. An earlier
+    version of this function reconstructed a bare path, which 403'd every
+    signed request carrying a query string — and Twilio treats a whisper-URL
+    error as "no whisper" and bridges the legs anyway, so the warm handoff
+    would have degraded silently into the blind transfer this phase exists to
+    prevent, with nothing an operator could see.
+
+    Scheme and host come from PUBLIC_HOSTNAME rather than from the incoming
+    request on purpose: behind ngrok (or any TLS-terminating proxy) the
+    request arrives as plain `http` on an internal hostname, while Twilio
+    signed the public `https` URL. Trusting request.url there would
+    reintroduce the same bug in a subtler form.
+
+    Path and query come from the request, so this covers /voice, /whisper and
+    /transfer-status alike — including a query string added to any of them
+    later, with nobody having to remember this function exists.
+    """
+    query = request.url.query
+    return f"https://{_public_hostname()}{request.url.path}" + (f"?{query}" if query else "")
+
+
+async def _validate_twilio_signature(request: Request) -> dict[str, str]:
     """Shared by every Twilio-facing endpoint. Extracted rather than repeated
     because /whisper and /transfer-status must not drift from /voice's
     checking — a weaker check on the endpoint that SPEAKS a customer's
     briefing would be the worst place to have one.
+
+    It takes no path argument: the URL it checks is derived entirely from the
+    request, so an endpoint can never be registered with the wrong one.
     """
     form = await request.form()
     signature = request.headers.get("X-Twilio-Signature", "")
     validator = RequestValidator(os.getenv("TWILIO_AUTH_TOKEN", ""))
-    if not validator.validate(f"https://{_public_hostname()}{path}", dict(form), signature):
+    if not validator.validate(_signed_url(request), dict(form), signature):
         raise HTTPException(status_code=403, detail="invalid Twilio request signature")
     return dict(form)
 
@@ -223,7 +269,7 @@ async def voice(request: Request) -> Response:
     before trusting anything in it, then returns TwiML connecting the call
     to a bidirectional Media Stream.
     """
-    await _validate_twilio_signature(request, "/voice")
+    await _validate_twilio_signature(request)
 
     response = VoiceResponse()
     connect = Connect()
@@ -238,7 +284,7 @@ async def whisper(request: Request) -> Response:
     legs are bridged. Twilio requests this via the `url` attribute on
     <Number>; the customer never hears it.
     """
-    form = await _validate_twilio_signature(request, "/whisper")
+    form = await _validate_twilio_signature(request)
     pending = TRANSFERS.get(form.get("ParentCallSid", ""))
     text = pending.whisper if pending else "A customer is waiting. No context is available for this transfer."
     response = VoiceResponse()
@@ -261,8 +307,14 @@ async def transfer_status(request: Request) -> Response:
     the ringing. Reconnecting the Media Stream with the ORIGINAL session id
     means the agent resumes with full history and can apologise and offer a
     callback, rather than greeting them from scratch as a stranger.
+
+    This is also where a transferred call's session lifecycle is decided,
+    because media_stream()'s teardown deliberately does nothing while a
+    transfer is in flight (see transfer_to_human): a completed dial is the
+    real end of the call and closes the session here, while a failed dial
+    keeps it alive for the reconnected stream to close when it ends.
     """
-    form = await _validate_twilio_signature(request, "/transfer-status")
+    form = await _validate_twilio_signature(request)
     call_sid = form.get("CallSid", "")
     pending = TRANSFERS.pop(call_sid, None)
     status = form.get("DialCallStatus", "")
@@ -270,10 +322,34 @@ async def transfer_status(request: Request) -> Response:
     response = VoiceResponse()
     if status in _DIAL_FAILED and pending is not None:
         print(f"(transfer for {call_sid} ended as {status!r} — returning the caller to the agent)")
+        # Refresh the detached marker rather than clearing it: this callback
+        # can arrive before the Media Stream's own teardown (a dial that fails
+        # instantly), and that teardown must still leave the session alone.
+        # resolve_session() clears it when the customer actually comes back.
+        detach_session(pending.session_id)
         connect = Connect()
         connect.stream(url=f"wss://{_public_hostname()}/media-stream?session={pending.session_id}")
         response.append(connect)
     else:
+        if pending is not None:
+            # The human took the call and it is now over. The Media Stream
+            # ended at transfer time without closing anything, so this is the
+            # only place the post-call summary ticket can be written.
+            print(f"(transfer for {call_sid} ended as {status!r} — closing the session)")
+            session = SESSIONS.get(pending.session_id)
+            if session is not None:
+                await _close_and_forget(session)
+        elif status in _DIAL_FAILED:
+            # Not the normal failure path — that one has a registry entry.
+            # Reaching here means the process restarted between the redirect
+            # and this callback, so there is no session id to reconnect to.
+            # Logged because the customer is hung up on mid-problem and an
+            # operator otherwise cannot tell this apart from a clean goodbye.
+            print(
+                f"(transfer for {call_sid} ended as {status!r} but no transfer is on record — "
+                "the process likely restarted mid-transfer; hanging up rather than reconnecting "
+                "the caller to a session that no longer exists)"
+            )
         response.hangup()
     return Response(content=str(response), media_type="application/xml")
 
@@ -282,6 +358,26 @@ async def transfer_status(request: Request) -> Response:
 # transfer can resume the SAME conversation. In-process on purpose (one
 # uvicorn worker); entries are removed by forget_session when the call ends.
 SESSIONS: dict[str, Session] = {}
+
+
+# Sessions that are alive but have no Media Stream attached, mapped to the
+# monotonic deadline past which they are abandoned. A session lands here for
+# the length of a transfer: the REST redirect ends the Media Stream long
+# before Twilio says whether the human answered, so "the WebSocket closed"
+# stops meaning "the call is over" and this is what tells the two apart.
+DETACHED: dict[str, float] = {}
+
+# A detached session outlives its Media Stream for as long as the human is
+# talking to the customer, which can be a long conversation — so this bound
+# is deliberately far longer than TRANSFER_TIMEOUT_SECONDS. It exists only so
+# a /transfer-status callback that never arrives (Twilio cannot reach us, the
+# tunnel died) cannot pin a session in memory for the life of the process.
+DETACHED_SESSION_MAX_SECONDS = 3600.0
+
+
+def detach_session(session_id: str) -> None:
+    """Mark a session as deliberately outliving its Media Stream."""
+    DETACHED[session_id] = time.monotonic() + DETACHED_SESSION_MAX_SECONDS
 
 
 def resolve_session(session_id: str | None) -> Session:
@@ -293,6 +389,9 @@ def resolve_session(session_id: str | None) -> Session:
     """
     if session_id and session_id in SESSIONS:
         print(f"(resuming session {session_id} after a failed transfer)")
+        # It has a Media Stream again, so the ordinary teardown owns it once
+        # more and the abandonment sweep must leave it alone.
+        DETACHED.pop(session_id, None)
         return SESSIONS[session_id]
     session = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
     SESSIONS[session.session_id] = session
@@ -301,6 +400,55 @@ def resolve_session(session_id: str | None) -> Session:
 
 def forget_session(session_id: str) -> None:
     SESSIONS.pop(session_id, None)
+    DETACHED.pop(session_id, None)
+
+
+async def _close_and_forget(session: Session) -> None:
+    """Close a session exactly once, whichever path ends its call.
+
+    Three paths can be the end of one call — the Media Stream closing, a
+    completed dial reported to /transfer-status, and the abandonment sweep —
+    and two of them can even race (a dial that fails instantly). Removing the
+    registry entry FIRST and closing only if it was still there makes this
+    idempotent, so one call can never write two post-call summary tickets.
+    """
+    DETACHED.pop(session.session_id, None)
+    if SESSIONS.pop(session.session_id, None) is None:
+        return
+
+    close_result = await close_session(session)
+    if close_result.error:
+        print(f"({close_result.error})")
+    elif close_result.summary is not None:
+        print(
+            f"Session logged as ticket #{close_result.ticket_id} "
+            f"(sentiment={close_result.summary.sentiment}, "
+            f"follow_up_needed={close_result.summary.follow_up_needed})"
+        )
+
+
+async def _sweep_detached_sessions() -> None:
+    """Close and drop detached sessions whose transfer never resolved.
+
+    Without this, a /transfer-status callback that never arrives would leave
+    its session in SESSIONS for the life of the process — the unbounded growth
+    the registry's own comment promises cannot happen. Run when a new call
+    arrives, which is both the moment memory starts mattering again and the
+    only regularly-scheduled event this single-process app has.
+    """
+    now = time.monotonic()
+    for session_id, deadline in list(DETACHED.items()):
+        if deadline > now:
+            continue
+        print(f"(abandoning detached session {session_id} — its transfer never reported a status)")
+        for call_sid, pending in list(TRANSFERS.items()):
+            if pending.session_id == session_id:
+                TRANSFERS.pop(call_sid, None)
+        session = SESSIONS.get(session_id)
+        if session is None:
+            DETACHED.pop(session_id, None)
+        else:
+            await _close_and_forget(session)
 
 
 async def _read_start_event(receive_text: Callable[[], Awaitable[str]]) -> tuple[str, str, str]:
@@ -325,6 +473,7 @@ async def _read_start_event(receive_text: Callable[[], Awaitable[str]]) -> tuple
 @app.websocket("/media-stream")
 async def media_stream(websocket: WebSocket) -> None:
     await websocket.accept()
+    await _sweep_detached_sessions()
     stream_sid, call_sid, account_sid = await _read_start_event(websocket.receive_text)
 
     serializer = TwilioFrameSerializer(
@@ -352,16 +501,20 @@ async def media_stream(websocket: WebSocket) -> None:
 
     await runner.run()
 
-    close_result = await close_session(session)
-    if close_result.error:
-        print(f"({close_result.error})")
-    elif close_result.summary is not None:
-        print(
-            f"Session logged as ticket #{close_result.ticket_id} "
-            f"(sentiment={close_result.summary.sentiment}, "
-            f"follow_up_needed={close_result.summary.follow_up_needed})"
-        )
-    forget_session(session.session_id)
+    # Reaching here does NOT necessarily mean the call is over. The REST
+    # redirect a transfer issues is itself what ends this Media Stream, so on
+    # a transferred call this runs ~20 seconds BEFORE /transfer-status says
+    # whether the human answered. Closing here would write a post-call summary
+    # ticket mid-call and delete the very session the reconnect resumes — the
+    # customer would explain their problem, hold through the ringing, get
+    # nobody, and then be greeted from scratch by an agent that forgot them.
+    # /transfer-status owns the close in that case: on a completed dial, and
+    # on a failed one after the resumed conversation finally ends here.
+    if session.session_id in DETACHED:
+        print(f"(media stream for {call_sid} ended with a transfer in flight — keeping the session alive)")
+        return
+
+    await _close_and_forget(session)
 
 
 if __name__ == "__main__":

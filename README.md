@@ -1330,7 +1330,7 @@ no-answer reconnects the customer with working history, and that signature
 validation holds up against Twilio's real requests rather than the
 hand-signed ones in `tests/test_telephony.py`.
 
-- The guarded full suite passes: **317 passed, 3 skipped**, zero API calls
+- The guarded full suite passes: **325 passed, 3 skipped**, zero API calls
   (`ANTHROPIC_API_KEY=` `DEEPGRAM_API_KEY=` set to empty rather than unset,
   so `load_dotenv()` cannot repopulate them from a real `.env`). The 3 skips
   are the same live-gated tests noted in the Phase 10c section above:
@@ -1341,3 +1341,47 @@ hand-signed ones in `tests/test_telephony.py`.
   reconnects the customer with full history — has **not** been run. It needs
   a funded Twilio key and is the project owner's to run, per the cost note
   above.
+
+**A whole-branch review found two Critical defects, both now fixed with regression
+tests (8 new, folded into the count above) — the same pattern 10a's whole-branch
+review caught, arriving a second time in a different costume:**
+
+1. **The whisper never played.** `_validate_twilio_signature` checked a
+   reconstructed *bare path* while Twilio signs the *full URL, query string
+   included* — and the whisper URL always carries `?escalation_id=...`. Every
+   real whisper request would have 403'd, and Twilio treats a whisper-URL
+   error as "no whisper" and bridges the legs anyway, so the warm handoff
+   would have silently degraded into a blind transfer on **every** call, with
+   nothing an operator could see. It survived every task-level review because
+   the existing test signed the same bare URL the code checked — signing and
+   checking agreed with each other and both were wrong. Fixed by a new
+   `_signed_url()` that rebuilds the full URL (scheme/host from
+   `PUBLIC_HOSTNAME`, since behind ngrok the request itself arrives as plain
+   `http` on an internal host; path/query from the request).
+2. **Session resume never resumed.** The REST redirect that starts a
+   transfer is itself what ends the Media Stream, so `media_stream()`'s
+   teardown ran at transfer time — roughly 20 seconds *before*
+   `/transfer-status` reports whether the human answered. It closed the
+   session and wrote the post-call summary ticket mid-call; the reconnect on
+   a failed dial then found nothing in `SESSIONS` and built a fresh session,
+   so a customer who held through the ringing and got nobody was greeted from
+   scratch by an agent that had forgotten them. It survived review because
+   the existing test populated `SESSIONS` by hand instead of driving the
+   transfer lifecycle. Fixed with a new `DETACHED` registry: `transfer_to_human`
+   marks a session detached on a successful redirect, `media_stream()`'s
+   teardown returns early for one, `/transfer-status` closes it on a
+   completed dial or keeps it alive on a failed one, `resolve_session` clears
+   the mark on a real resume, `_close_and_forget` is idempotent (so a race
+   between the two close paths still writes only one ticket), and a new
+   `_sweep_detached_sessions()` abandons a session whose `/transfer-status`
+   callback never arrives at all.
+
+Both fixes are `transport/telephony.py`-only — zero changes under `agent/`
+beyond the 7-line `escalation_packet` field already noted above. The new
+tests trace the real lifecycle (calling `transfer_to_human()` and posting
+signed requests to the actual endpoints) rather than setting registries by
+hand, and the whisper-signature regression was confirmed to 403 against the
+pre-fix code before the fix was restored. **This does not change the "not yet
+run" status of the live checkpoint above** — it means the two defects that
+would have been waiting for the project owner to hit are now caught here
+first.

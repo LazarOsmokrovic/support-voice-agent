@@ -20,12 +20,13 @@ from __future__ import annotations
 import base64
 import hmac
 import json
+import time
 from hashlib import sha1
 
 import httpx
 import pytest
 
-from agent.session import DEFAULT_CUSTOMER_ID, create_session
+from agent.session import DEFAULT_CUSTOMER_ID, SessionCloseResult, create_session
 from transport import telephony
 
 
@@ -319,6 +320,64 @@ async def test_whisper_rejects_an_unsigned_request_and_leaks_nothing(monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_whisper_accepts_a_signed_request_carrying_the_escalation_id_query_string(monkeypatch):
+    """Twilio signs the FULL URL it requests, query string included, and
+    build_transfer_twiml puts `?escalation_id=` on every /whisper callback.
+    An earlier version of _validate_twilio_signature checked a reconstructed
+    BARE PATH, which 403'd every real whisper request — and Twilio treats a
+    whisper-URL error as "no whisper" and bridges the legs anyway, so the
+    warm handoff silently degraded into a blind transfer on every call, with
+    nothing an operator could see.
+
+    This signs the URL WITH its query string, exactly as Twilio does, so it
+    fails against the pre-fix code (confirmed by hand: `git stash` the fix,
+    run this test, watch it 403; `git stash pop` to restore it) and only
+    passes once the signature check validates the query string too.
+    """
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    telephony.remember_transfer("CA-1", {"escalation_id": 42, "customer_intent": "refund dispute"}, "s1")
+
+    url = "https://example.ngrok.app/whisper?escalation_id=42"
+    params = {"CallSid": "CA-whisper-leg", "ParentCallSid": "CA-1"}
+    signature = _sign(url, params, "test-token")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post(
+            "/whisper?escalation_id=42", data=params, headers={"X-Twilio-Signature": signature}
+        )
+
+    assert response.status_code == 200
+    assert "refund dispute" in response.text
+
+
+@pytest.mark.asyncio
+async def test_whisper_rejects_a_wrongly_signed_query_string_request_and_leaks_nothing(monkeypatch):
+    """A signature computed for a DIFFERENT query string than the one
+    actually requested — exactly what an attacker guessing escalation ids
+    would send — must still 403, and the briefing must not leak into the
+    error response."""
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    telephony.remember_transfer("CA-1", {"escalation_id": 42, "customer_intent": "refund dispute"}, "s1")
+
+    params = {"CallSid": "CA-whisper-leg", "ParentCallSid": "CA-1"}
+    wrong_signature = _sign("https://example.ngrok.app/whisper?escalation_id=99", params, "test-token")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post(
+            "/whisper?escalation_id=42", data=params, headers={"X-Twilio-Signature": wrong_signature}
+        )
+
+    assert response.status_code == 403
+    assert "refund dispute" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_whisper_falls_back_when_the_transfer_is_unknown(monkeypatch):
     """A process restart between redirect and whisper loses the registry.
     The human should still get a usable call, not silence."""
@@ -400,6 +459,33 @@ async def test_transfer_status_rejects_an_unsigned_request(monkeypatch):
     assert response.status_code == 403
 
 
+@pytest.mark.asyncio
+async def test_transfer_status_accepts_a_signed_request_carrying_the_escalation_id_query_string(monkeypatch):
+    """build_transfer_twiml also puts `?escalation_id=` on the <Dial action>
+    URL, so /transfer-status needs the same query-string-aware signature
+    check as /whisper. Signed here exactly as Twilio signs it — URL
+    including the query string — so this would 403 against the pre-fix
+    bare-path check."""
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    telephony.remember_transfer("CA-1", {"escalation_id": 42}, "sess-abc")
+
+    url = "https://example.ngrok.app/transfer-status?escalation_id=42"
+    params = {"CallSid": "CA-1", "DialCallStatus": "no-answer"}
+    signature = _sign(url, params, "test-token")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post(
+            "/transfer-status?escalation_id=42", data=params, headers={"X-Twilio-Signature": signature}
+        )
+
+    assert response.status_code == 200
+    assert "<Stream" in response.text
+    assert "session=sess-abc" in response.text
+
+
 def test_session_registry_resumes_a_known_session():
     """After a failed transfer the customer comes back on a NEW Media Stream.
     Without this they would meet a brand-new session that has forgotten the
@@ -427,3 +513,197 @@ def test_session_registry_forgets_a_session_when_it_closes():
     telephony.SESSIONS[session.session_id] = session
     telephony.forget_session(session.session_id)
     assert session.session_id not in telephony.SESSIONS
+
+
+def _fake_twilio_calls_client() -> object:
+    """A Twilio REST client stub that accepts .calls(sid).update(twiml=...)
+    without touching the network — what every transfer_to_human() call in
+    these tests needs to drive the real redirect path."""
+
+    class _Calls:
+        def update(self, **kwargs):
+            pass
+
+    return type("C", (), {"calls": staticmethod(lambda sid: _Calls())})()
+
+
+@pytest.mark.asyncio
+async def test_transfer_to_human_detaches_the_session_so_media_stream_teardown_leaves_it_alone(monkeypatch):
+    """The REST redirect transfer_to_human() issues is itself what ends the
+    Media Stream — media_stream()'s teardown runs ~20 seconds before
+    /transfer-status says whether the human answered. Before the fix that
+    teardown closed the session outright, mid-transfer. Drives the real
+    transfer_to_human() (not a hand-set DETACHED entry) and then reproduces
+    media_stream()'s own teardown check against the real registries."""
+    monkeypatch.setenv("HUMAN_AGENT_NUMBER", "+15551234567")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    telephony.SESSIONS.clear()
+    telephony.DETACHED.clear()
+
+    session = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
+    telephony.SESSIONS[session.session_id] = session
+
+    ok = await telephony.transfer_to_human(
+        "CA-1", {"escalation_id": 1}, session.session_id, client=_fake_twilio_calls_client()
+    )
+    assert ok is True
+    assert session.session_id in telephony.DETACHED
+
+    # media_stream()'s own teardown, reproduced rather than driving a real
+    # WebSocket: it must skip _close_and_forget for a detached session.
+    if session.session_id not in telephony.DETACHED:
+        await telephony._close_and_forget(session)
+
+    assert session.session_id in telephony.SESSIONS
+
+
+@pytest.mark.asyncio
+async def test_transfer_status_failed_dial_keeps_session_alive_for_resolve_session_to_resume(monkeypatch):
+    """Traces the real lifecycle end to end: transfer_to_human() (not a
+    hand-set marker) detaches the session, then a failed-dial
+    /transfer-status callback must keep it alive rather than closing it.
+    Before the fix, media_stream()'s teardown would already have closed and
+    forgotten the session ~20s earlier, so the reconnect found nothing and
+    resolve_session() built a fresh one — the customer explained their
+    problem, held through the ringing, got nobody, and was greeted from
+    scratch. Asserts resolve_session() returns the SAME object (identity),
+    conversation history intact."""
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("HUMAN_AGENT_NUMBER", "+15551234567")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    telephony.SESSIONS.clear()
+    telephony.DETACHED.clear()
+
+    session = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
+    session.agent.messages.append({"role": "user", "content": "I need help with my order"})
+    telephony.SESSIONS[session.session_id] = session
+
+    ok = await telephony.transfer_to_human(
+        "CA-1", {"escalation_id": 42}, session.session_id, client=_fake_twilio_calls_client()
+    )
+    assert ok is True
+
+    url = "https://example.ngrok.app/transfer-status"
+    params = {"CallSid": "CA-1", "DialCallStatus": "no-answer"}
+    signature = _sign(url, params, "test-token")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post("/transfer-status", data=params, headers={"X-Twilio-Signature": signature})
+
+    assert response.status_code == 200
+    assert session.session_id in telephony.SESSIONS
+
+    resumed = telephony.resolve_session(session.session_id)
+
+    assert resumed is session
+    assert resumed.agent.messages == [{"role": "user", "content": "I need help with my order"}]
+    assert session.session_id not in telephony.DETACHED
+
+
+@pytest.mark.asyncio
+async def test_transfer_status_completed_dial_closes_the_session_exactly_once(monkeypatch):
+    """The human took the call and it is over. media_stream()'s teardown
+    already declined to close it (the session was detached), so
+    /transfer-status on a completed dial is the only place left that can
+    write the post-call summary ticket — and it must do so exactly once."""
+    monkeypatch.setenv("TWILIO_AUTH_TOKEN", "test-token")
+    monkeypatch.setenv("HUMAN_AGENT_NUMBER", "+15551234567")
+    monkeypatch.setenv("PUBLIC_HOSTNAME", "example.ngrok.app")
+    telephony.TRANSFERS.clear()
+    telephony.SESSIONS.clear()
+    telephony.DETACHED.clear()
+
+    close_calls = []
+
+    async def _fake_close_session(session):
+        close_calls.append(session.session_id)
+        return SessionCloseResult(summary=None, ticket_id=1)
+
+    monkeypatch.setattr(telephony, "close_session", _fake_close_session)
+
+    session = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
+    telephony.SESSIONS[session.session_id] = session
+
+    ok = await telephony.transfer_to_human(
+        "CA-1", {"escalation_id": 42}, session.session_id, client=_fake_twilio_calls_client()
+    )
+    assert ok is True
+
+    url = "https://example.ngrok.app/transfer-status"
+    params = {"CallSid": "CA-1", "DialCallStatus": "completed"}
+    signature = _sign(url, params, "test-token")
+
+    transport_ = httpx.ASGITransport(app=telephony.app)
+    async with httpx.AsyncClient(transport=transport_, base_url="https://example.ngrok.app") as client:
+        response = await client.post("/transfer-status", data=params, headers={"X-Twilio-Signature": signature})
+
+    assert "<Hangup" in response.text
+    assert close_calls == [session.session_id]
+    assert session.session_id not in telephony.SESSIONS
+    assert session.session_id not in telephony.DETACHED
+
+
+@pytest.mark.asyncio
+async def test_close_and_forget_is_idempotent_so_one_call_writes_only_one_ticket(monkeypatch):
+    """Two paths can race to end the same transferred call (a dial that
+    fails instantly can fire /transfer-status and the resumed Media
+    Stream's own teardown close together) — this is the guard that stops
+    one call producing two post-call summary tickets."""
+    telephony.SESSIONS.clear()
+    telephony.DETACHED.clear()
+
+    close_calls = []
+
+    async def _fake_close_session(session):
+        close_calls.append(session.session_id)
+        return SessionCloseResult(summary=None, ticket_id=1)
+
+    monkeypatch.setattr(telephony, "close_session", _fake_close_session)
+
+    session = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
+    telephony.SESSIONS[session.session_id] = session
+    telephony.DETACHED[session.session_id] = time.monotonic() + 3600
+
+    await telephony._close_and_forget(session)
+    await telephony._close_and_forget(session)
+
+    assert close_calls == [session.session_id]
+    assert session.session_id not in telephony.SESSIONS
+    assert session.session_id not in telephony.DETACHED
+
+
+@pytest.mark.asyncio
+async def test_sweep_detached_sessions_abandons_expired_and_leaves_live_alone(monkeypatch):
+    """Without this sweep, a /transfer-status callback that never arrives
+    (Twilio can't reach us, the tunnel died) would pin its session in
+    memory for the life of the process. A transfer still legitimately in
+    flight (deadline not yet passed) must be left untouched."""
+    telephony.SESSIONS.clear()
+    telephony.DETACHED.clear()
+    telephony.TRANSFERS.clear()
+
+    close_calls = []
+
+    async def _fake_close_session(session):
+        close_calls.append(session.session_id)
+        return SessionCloseResult(summary=None, ticket_id=1)
+
+    monkeypatch.setattr(telephony, "close_session", _fake_close_session)
+
+    expired = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
+    live = create_session(DEFAULT_CUSTOMER_ID, transport="telephony")
+    telephony.SESSIONS[expired.session_id] = expired
+    telephony.SESSIONS[live.session_id] = live
+    telephony.DETACHED[expired.session_id] = time.monotonic() - 1
+    telephony.DETACHED[live.session_id] = time.monotonic() + 3600
+
+    await telephony._sweep_detached_sessions()
+
+    assert close_calls == [expired.session_id]
+    assert expired.session_id not in telephony.SESSIONS
+    assert expired.session_id not in telephony.DETACHED
+    assert live.session_id in telephony.SESSIONS
+    assert live.session_id in telephony.DETACHED
