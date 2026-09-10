@@ -14,6 +14,7 @@ real-time streaming (that's Phase 8's job, via Pipecat).
 from __future__ import annotations
 
 import os
+import re
 from typing import Protocol
 
 import httpx
@@ -28,6 +29,61 @@ DEFAULT_CARTESIA_MODEL = "sonic-3.5"
 # until you pick one from your own voice library once actually using this
 # backend (see CARTESIA_TTS_VOICE below).
 DEFAULT_CARTESIA_VOICE = "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"
+
+
+# Markdown a speech synthesiser would otherwise read out loud. Ordered so
+# the longer markers are consumed before their shorter prefixes — **bold**
+# before *italic*, __bold__ before _italic_ — since matching the short form
+# first would leave a stray marker behind.
+_MARKDOWN_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    # A REAL newline after the fence, not an optional one. With \n? the
+    # language-tag class [\w-]* happily swallowed an order ID — which is
+    # entirely word characters and hyphens — leaving the capture empty and
+    # DELETING it: "order ```112-3487561-2938471``` shipped" became "order
+    # shipped". A reply that was nothing but a fenced identifier stripped to
+    # empty, tripping the empty-reply guard so the caller heard nothing at
+    # all. Exactly the defect class this function exists to prevent, in a
+    # new place.
+    (re.compile(r"```[\w-]*\n(.*?)```", re.DOTALL), r"\1"),   # fenced code block
+    (re.compile(r"`([^`]+)`"), r"\1"),                         # inline code
+    (re.compile(r"\*\*\*(.+?)\*\*\*", re.DOTALL), r"\1"),      # ***both***
+    (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),          # **bold**
+    (re.compile(r"(?<!\w)\*(?!\s)(.+?)(?<!\s)\*(?!\w)", re.DOTALL), r"\1"),  # *italic*
+    (re.compile(r"___(.+?)___", re.DOTALL), r"\1"),            # ___both___
+    (re.compile(r"__(.+?)__", re.DOTALL), r"\1"),              # __bold__
+    (re.compile(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", re.DOTALL), r"\1"),    # _italic_
+    (re.compile(r"\[([^\]]+)\]\([^)]*\)"), r"\1"),             # [text](url)
+    (re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE), ""),      # # heading
+    (re.compile(r"^\s{0,3}[-*+]\s+", re.MULTILINE), ""),       # - bullet
+    (re.compile(r"^\s{0,3}>\s?", re.MULTILINE), ""),           # > quote
+    # Anything backtick-shaped still standing after the rules above — an
+    # unmatched fence, a stray pair around a same-line identifier. A
+    # synthesiser pronounces them; nothing is lost by removing them, and
+    # unlike the capturing rules this cannot delete what sits between.
+    (re.compile(r"`+"), ""),
+)
+
+
+def speakable(text: str) -> str:
+    """Strip markdown so a speech synthesiser does not read it aloud.
+
+    A model writing "**wait for delivery**" is doing something reasonable —
+    it is emphasising a phrase the way it would in text. But Deepgram and
+    Cartesia both pronounce the asterisks, so the customer hears "star star
+    wait for delivery star star" and the agent sounds broken. The same goes
+    for backticks, bullet markers and heading hashes.
+
+    The real fix is the system prompt, which now tells the model everything
+    it says is spoken. This is the safety net: prompts are probabilistic and
+    this failure is audible on every single slip, so it is worth catching
+    deterministically at the one boundary every spoken word passes through.
+
+    Deliberately NOT applied to transport/text_cli.py, where markdown is
+    harmless and stripping it would only remove information a reader can see.
+    """
+    for pattern, replacement in _MARKDOWN_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text.strip()
 
 
 class TTSBackend(Protocol):

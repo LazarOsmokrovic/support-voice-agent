@@ -119,7 +119,17 @@ async def test_run_turn_escalates_and_produces_a_notice(monkeypatch, tmp_path):
     assert outcome.ended is True
     assert outcome.end_reason == "escalated"
     assert outcome.notice is not None
-    assert "handoff #42" in outcome.notice
+    # The notice is SPOKEN to the customer, so it must not read internal
+    # machinery aloud. It used to say "I'm connecting you with a human agent —
+    # sustained negative sentiment across multiple turns. (handoff #42)",
+    # which told an already-frustrated caller they had been classified as
+    # angry and then recited a ticket number they cannot use. Both still live
+    # in the turn log and the escalations row, which is where they belong.
+    assert "call you back" in outcome.notice
+    assert "42" not in outcome.notice, "the handoff id must not be spoken to the customer"
+    assert "explicit request for a human" not in outcome.notice, (
+        "the internal escalation reason must not be spoken to the customer"
+    )
 
 
 @pytest.mark.asyncio

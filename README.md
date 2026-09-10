@@ -1403,3 +1403,131 @@ pre-fix code before the fix was restored. **This does not change the "not yet
 run" status of the live checkpoint above** — it means the two defects that
 would have been waiting for the project owner to hit are now caught here
 first.
+
+## Phase 10f — Browser voice console (code-complete; live checkpoint not yet run)
+
+Every previous voice transport needed something outside this laptop: a real
+microphone and speakers wired up carefully enough to avoid self-echo (Phase
+7), or a Twilio number, an ngrok tunnel and `PUBLIC_HOSTNAME` (Phase 9,
+10d). This phase adds a fourth transport that needs none of that: a single
+HTML page with one circle button, served and consumed entirely on
+`localhost`, for demos, recordings, and quick manual testing without a
+phone in the loop.
+
+### Running it
+
+```
+python -m transport.browser
+```
+
+then open `http://localhost:8080` (`BROWSER_PORT` to change the port). No
+Twilio credentials and no `PUBLIC_HOSTNAME` are needed — only
+`DEEPGRAM_API_KEY` and `ANTHROPIC_API_KEY`, same as every non-Twilio
+transport. Press the circle to talk, press it again to hang up, press it a
+third time to start over.
+
+If `DEEPGRAM_API_KEY` is missing the page says so and the button returns to
+idle, rather than opening a socket that dies on the first audio frame. That
+distinction matters more than it sounds: without the pre-flight check the
+browser flashes through `in-call` and back to `idle` with an empty status
+line, which is exactly the dead-looking button this phase's design named as
+the worst possible outcome — a demo that appears broken with no clue why.
+The same applies to a denied microphone permission, and to a browser that
+hands back a sample rate other than 16 kHz.
+
+### The fourth transport, same `build_pipeline`
+
+`transport/browser.py` is the fourth transport to sit behind the unchanged
+`build_pipeline()` from `transport/pipecat_processors.py`, after the text
+CLI (Phase 1), the local microphone (Phase 7), and Twilio (Phase 9/10d).
+Nothing under `agent/` changed, and neither did
+`transport/pipecat_processors.py` — it already accepted any `BaseTransport`,
+and this phase is the proof that held. The only new pieces are
+`transport/pcm_serializer.py` (a `FrameSerializer` that passes 16 kHz mono
+Int16 LE PCM straight through, no format translation needed since both ends
+of the socket are this project's own code) and `transport/browser.py`
+itself, which mirrors `telephony.py`'s shape — accept the socket, build a
+transport, build the pipeline, run it, close the session on the way out —
+minus the parts that only exist because Twilio is a phone network: no
+signature to validate, no TwiML handshake to drain, no `PUBLIC_HOSTNAME` to
+publish.
+
+### Why a WebSocket, not WebRTC
+
+Pipecat ships `SmallWebRTCTransport`, which would talk to a browser more
+natively, but it depends on `aiortc` and that library's native
+dependencies — a new install this project has never needed. `FastAPIWebsocketTransport`
+is already installed and already carries every byte of this project's
+Twilio traffic; Twilio just wraps it in a different `FrameSerializer`
+(`TwilioFrameSerializer` vs. this phase's `PCMFrameSerializer`). Reusing it
+costs no new dependency and reuses a transport already proven against real
+calls, at the price of doing PCM framing and resampling-avoidance by hand in
+the browser rather than getting it from a WebRTC stack. A pleasant side
+effect: no tunnel. Twilio had to reach back into this machine, so Phase 9
+needed ngrok; a browser dials outward to `localhost`, so this demo runs
+entirely on one laptop with nothing exposed to the internet.
+
+### Every press is a fresh session
+
+`run_call()` calls `create_session()` fresh on every socket connection and
+`close_session()` in a `finally` block on the way out, regardless of whether
+the pipeline ended cleanly or the socket dropped mid-turn. There is no
+resume here, deliberately — this is the opposite of Phase 10d's session
+resume, which exists to survive an *unwanted* disconnect (a failed
+transfer). Here, hanging up and calling again is meant to behave like a new
+customer calling in: no shared `session_id`, no carried-over conversation
+history, no leftover confirmation gate from the previous call still open.
+
+### Escalation still reaches Slack
+
+Nothing about escalation is transport-specific: `create_handoff_packet`
+(`agent/tools/escalation.py`) fires `notify_escalation` (Phase 11's n8n
+webhook) the same way regardless of which transport produced the call. A
+browser-console conversation that escalates posts to
+`ESCALATION_WEBHOOK_URL` exactly as a phone call would, which means a
+split-screen recording — the browser tab talking on one side, the Slack
+channel it escalates into on the other — works with no special-casing.
+
+### Three audio mitigations, built in rather than left to tuning
+
+Every automated test in this phase passes with silence — none of them can
+tell whether audio actually sounds right. Three specific risks were cheap
+to get right up front and expensive to diagnose later from their symptoms
+alone, so they're built into `static/app.js` rather than deferred:
+
+1. **20 ms capture batching** (`static/capture-worklet.js`). An AudioWorklet
+   left unbatched posts one message per 128-frame render quantum — around
+   125 WebSocket sends a second at 16 kHz, each carrying only 256 bytes of
+   audio under a full frame's overhead. Batching to ~20 ms chunks cuts that
+   by more than an order of magnitude, which is the kind of thing that
+   causes audible choppiness if skipped and is easy to mistake for a network
+   or model problem instead.
+2. **A sample-rate assertion** (`startCall()` in `static/app.js`).
+   `new AudioContext({ sampleRate: 16000 })` is a hint the browser is free
+   to ignore; a browser that hands back 48 kHz instead breaks everything
+   downstream by a factor of three. The visible symptom of that mismatch
+   would be "the agent never replies," which points nowhere near its actual
+   cause — Deepgram receiving what sounds like nonsense and never firing
+   end-of-turn — so the check fails loudly at call-start instead.
+3. **A 100 ms playback lead** (`playChunk()` in `static/app.js`). Scheduling
+   each audio chunk at exactly the audio clock's current time means any
+   scheduling jitter lands it late, and a late chunk is an audible gap
+   mid-word. Scheduling ~100 ms ahead of the clock instead costs a tenth of
+   a second of latency nobody notices and removes the most likely source of
+   stutter.
+
+### The honest end state
+
+Everything above is built and covered by **fast, offline tests only** — the
+guarded full suite (`ANTHROPIC_API_KEY=` `DEEPGRAM_API_KEY=` set to empty,
+never unset) passes, and none of those tests play or capture a single real
+sample of audio; every one of them runs with mocked sockets, mocked
+pipelines, or silence. **Nobody has spoken into this yet.** Sample-rate
+conversion, capture/playback buffering, and whether the resulting audio
+actually sounds continuous rather than choppy are unverified and can only
+be judged by a real person talking into a real microphone and listening to
+the reply — the three mitigations above are informed guesses against known
+failure modes, not confirmation that the pipeline sounds good. That manual
+checkpoint — open `localhost:8080`, press the button, have an actual
+conversation, and listen — has **not** been run, and is the project owner's
+to run.

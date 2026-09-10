@@ -36,6 +36,150 @@ said anything.
 # would be rejected outright.
 GREETING = "Hi there — thanks for reaching out. How can I help you today?"
 
+
+# Spoken the instant a caller stops talking, BEFORE the model is asked
+# anything. Silence is the single worst thing a voice agent can do: on a
+# phone call a two-second gap reads as a dropped line, and the caller starts
+# saying "hello? are you there?" over the reply that is about to arrive.
+# A real person fills that gap without thinking — "sure, let me take a look".
+#
+# Chosen deterministically from the caller's own words, never by a model
+# call: the whole point is that it costs zero latency, and asking a model
+# what to say while waiting for a model would be self-defeating. Keyed on
+# what they asked about so it sounds like it followed the conversation
+# rather than a stock hold message.
+#
+# Each key rotates through its phrases so a long call does not hear the same
+# sentence five times, which is what makes filler sound robotic.
+THINKING_PHRASES: dict[str, tuple[str, ...]] = {
+    "order": (
+        "Sure, let me pull that order up.",
+        "One moment, I'll take a look at that order.",
+        "Let me check on that for you.",
+    ),
+    "refund": (
+        "Let me look into that return for you.",
+        "One moment while I check what we can do there.",
+        "Sure, let me see what the options are.",
+    ),
+    "policy": (
+        "Let me check our policy on that.",
+        "One moment, I'll look that up.",
+        "Good question — let me find that for you.",
+    ),
+    "schedule": (
+        "Let me see what times we have.",
+        "One moment while I check the calendar.",
+    ),
+    "default": (
+        "Sure, let me check that for you.",
+        "One moment.",
+        "Okay, let me look into that.",
+        "Let me see what I can find.",
+    ),
+}
+
+# Substrings that route a caller's turn to a phrase set. Deliberately crude:
+# a wrong guess costs nothing (the caller hears a slightly generic filler),
+# while anything cleverer would cost the latency this exists to hide.
+_THINKING_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("refund", ("refund", "return", "send it back", "money back", "cancel my order")),
+    ("schedule", ("appointment", "callback", "call me back", "book", "schedule")),
+    ("policy", ("policy", "how long", "can i", "am i allowed", "what happens if", "do you")),
+    ("order", ("order", "package", "delivery", "shipped", "tracking", "arrive", "where is")),
+)
+
+
+# Turns that need no filler at all, because nothing is being looked up.
+# This bites at BOTH ends of a call, and both were noticed live.
+#
+# At the start: a caller who opens with "hello" has not asked for anything.
+# Answering "let me check that for you" and only THEN saying hello is not
+# politeness, it is a non-sequitur — a person says hello back.
+#
+# At the end: "let me check that... goodbye" is the same mistake wearing a
+# different hat. Nothing is being checked; the call is finishing.
+#
+# Also covers a bare "yes" confirming something the agent just proposed,
+# where the pending work is a database write the caller already agreed to,
+# not a search.
+_PLEASANTRY_TOKENS = frozenset(
+    """
+    hi hello hey yo hiya
+    good morning afternoon evening night day
+    thanks thank you cheers appreciate appreciated
+    so much very really been helpful lovely brilliant welcome
+    yes yeah yep yup sure ok okay alright right fine great perfect cool
+    no nope nah
+    bye goodbye later
+    go ahead do it sounds works confirm confirmed correct
+    please sorry pardon excuse me
+    that is all thats everything else nothing done finished
+    im i am were we
+    and a an the my me you it now
+    """.split()
+)
+
+# Above this many non-pleasantry words, treat the turn as substantive even
+# when it opens with a greeting. "Hello, I have an issue with my order"
+# genuinely starts work; "hello there" does not.
+_SUBSTANTIVE_WORD_THRESHOLD = 2
+
+# Words that, when they OPEN a turn, mark it as agreement rather than request.
+_AFFIRMATIONS = frozenset(
+    "yes yeah yep yup sure ok okay alright correct right no nope nah go please".split()
+)
+
+
+def thinking_phrase(user_text: str, counter: int = 0) -> str | None:
+    """A short line to speak while the model is still thinking, or None when
+    the turn does not warrant one.
+
+    Returns None for a purely social turn — a greeting, a thank-you, a
+    goodbye, or a bare confirmation. See _PLEASANTRY_TOKENS for why both
+    ends of a call get this wrong without it.
+
+    A greeting attached to a real request still gets a filler, because that
+    turn does start work.
+
+    `counter` should be the session's turn number so successive turns rotate
+    through the available phrases instead of repeating one.
+    """
+    lowered = user_text.lower()
+    words = [word.strip(".,!?;:'\"") for word in lowered.split()]
+
+    # A turn that OPENS with an affirmation is confirming something the agent
+    # just proposed, however much detail follows it. "Yes, Thursday at 9am
+    # works for me" and "yes go ahead and book that slot" are agreements, not
+    # requests — and answering an agreement with "let me check that" describes
+    # the wrong thing entirely, moments before an irreversible booking
+    # commits. Checked first, so a keyword later in the sentence cannot
+    # override it.
+    if words and words[0] in _AFFIRMATIONS:
+        return None
+
+    substantive = [word for word in words if word and word not in _PLEASANTRY_TOKENS]
+
+    # A topic keyword means there is genuinely something to look up, so it
+    # wins over the length test. Without this, the commonest voice turns of
+    # all — "my order", "refund please", "where is it" — were suppressed for
+    # being short, which is the opposite mistake.
+    for key, needles in _THINKING_KEYWORDS:
+        if any(needle in lowered for needle in needles):
+            options = THINKING_PHRASES[key]
+            return options[counter % len(options)]
+
+    if len(substantive) < _SUBSTANTIVE_WORD_THRESHOLD:
+        return None
+
+    for key, needles in _THINKING_KEYWORDS:
+        if any(needle in lowered for needle in needles):
+            options = THINKING_PHRASES[key]
+            return options[counter % len(options)]
+    options = THINKING_PHRASES["default"]
+    return options[counter % len(options)]
+
+
 SYSTEM_PROMPT = """\
 You are a customer support assistant for an Amazon-style online storefront. \
 Your job is to help customers with questions about their orders and account.
@@ -74,15 +218,32 @@ the policy at them and stop there.
 Tools available:
 - get_order_status: use this whenever a customer asks about an order — its \
 shipping status, delivery date, tracking number, or contents. If they \
-haven't given an order ID, ask for it. Order IDs look like \
-112-3487561-2938471 (3 digits, 7 digits, 7 digits, separated by hyphens).
+haven't given an order ID, just ask for it plainly: "Sure — what's the \
+order number?" and stop there.
+
+  Do NOT recite the format unprompted. Reading out "order IDs look like \
+112-3487561-2938471, three digits then seven then seven" takes ten seconds \
+of a caller's time to tell most of them something they already know, and \
+this is spoken aloud, so they cannot skim past it. Plenty of people have \
+contacted support before.
+
+  Explain the format ONLY when it is actually needed: they say they don't \
+know where to find it, they ask what one looks like, or they give you \
+something that isn't one. In that last case get_order_status already \
+returns an example in its error message, so pass that on rather than \
+inventing your own.
 - search_policy: use this for any policy/FAQ question, per the rules above.
 - issue_refund: use this for actual refund/return requests, per the rules \
 below — not for general policy questions about returns.
 - end_conversation: call this once the customer's issue is fully resolved \
 and they've signaled they're done (thanks, goodbye, "that's all I needed", \
 etc.). Give your closing reply in the same turn you call it — don't call it \
-and then wait for another message. Do not call it while anything they \
+and then wait for another message. That closing reply is the last thing the \
+customer hears before the line goes dead, so make it a real goodbye: \
+briefly acknowledge what was sorted, invite them back if they need anything \
+else, and sign off warmly. One or two short sentences — this is spoken \
+aloud, and ending a call someone has just been helped on with a bare \
+"goodbye" sounds like being hung up on. Do not call it while anything they \
 raised is still open, and never call it just because they said thanks for \
 one part of a still-ongoing issue.
 
@@ -163,6 +324,19 @@ waste the customer's time. Acknowledge once, then be useful.
 You have already greeted the customer before your first reply — they've \
 heard a hello and an offer to help. Don't open with "Hello" or "How can I \
 help you today"; just respond to what they actually said.
+
+Everything you say is read aloud, so never use markdown or any other \
+written formatting. No asterisks, no **bold**, no bullet points, no \
+numbered lists laid out on separate lines, no headings, no backticks. A \
+speech synthesiser reads "**" out loud as "star star", which is jarring \
+and makes you sound broken.
+
+This does NOT mean stop organising your answer. When there genuinely are \
+two options, say so the way a person would on the phone: "There are two \
+things you could do. The first is to wait for it to arrive and then return \
+it — you'd have thirty days from delivery. The second is to speak to a \
+specialist who may be able to intercept it. Which sounds better?" Structure \
+the thought in your sentences, not in punctuation the listener cannot see.
 """
 
 SUMMARY_PROMPT = """\

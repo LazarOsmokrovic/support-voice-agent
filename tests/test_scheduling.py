@@ -318,3 +318,50 @@ def test_cancel_appointment_disambiguates_via_slot_time(tmp_path, monkeypatch):
             "SELECT COUNT(*) FROM appointments WHERE customer_id = ? AND status = 'scheduled'", ("CUST-1001",)
         ).fetchone()[0]
     assert remaining == 1  # the 08-25 one is still scheduled
+
+
+def test_confirmation_survives_the_model_rephrasing_the_reason(tmp_path, monkeypatch):
+    """The booking loop bug, as a permanent regression test.
+
+    `reason` is model-authored prose, and a model legitimately rephrases prose
+    between turns — "callback about my Kindle" becoming "call back regarding
+    the Kindle order". The gate used to key on ("book", slot_time, reason), so
+    a customer's "yes" arrived under a different key and check() read the
+    confirmation as a brand-new proposal. The agent asked the same question
+    again, and again, for as long as the customer kept agreeing.
+
+    Keying on the slot alone fixes it: the slot is what identifies a booking,
+    the reason merely describes it. issue_refund and cancel_appointment never
+    had this bug because they key on stable identifiers rather than sentences.
+    """
+    _seed(tmp_path, monkeypatch)
+    state = PendingActionGate(turn=1)
+    slot = find_available_slots()["slots"][0]
+
+    proposal = book_appointment(slot, "callback about my Kindle", state=state, customer_id="CUST-1001")
+    assert proposal["booked"] is False
+    assert proposal["status"] == "pending_confirmation"
+
+    # The customer says yes; the model re-words the reason on its way back.
+    state.turn = 2  # a later turn
+    confirmed = book_appointment(
+        slot, "call back regarding the Kindle order", state=state, customer_id="CUST-1001"
+    )
+
+    assert confirmed["booked"] is True, "a rephrased reason must not restart the confirmation loop"
+
+
+def test_a_different_slot_still_requires_its_own_confirmation(tmp_path, monkeypatch):
+    """The other half of the same tension. Loosening the key must not make the
+    gate accept a booking the customer never agreed to: changing the SLOT is a
+    genuinely different action and has to be proposed on its own."""
+    _seed(tmp_path, monkeypatch)
+    state = PendingActionGate(turn=1)
+    slots = find_available_slots()["slots"]
+
+    book_appointment(slots[0], "callback", state=state, customer_id="CUST-1001")
+    state.turn = 2  # a later turn
+    other = book_appointment(slots[1], "callback", state=state, customer_id="CUST-1001")
+
+    assert other["booked"] is False
+    assert other["status"] == "pending_confirmation"

@@ -159,13 +159,44 @@ class Agent:
             }, None
 
     async def _call_api(self):
+        """One Messages API call, with the fixed prefix marked cacheable.
+
+        The system prompt and tool schemas are byte-identical on every turn of
+        every call — together roughly 3,460 tokens — and without a cache
+        breakpoint the model reprocesses all of it each time, on top of a
+        history that grows as the conversation does.
+
+        The breakpoint goes on `system`, NOT on the last tool. Requests render
+        tools BEFORE system, so a breakpoint on the last tool caches the tools
+        alone (~1,150 tokens) and leaves the larger system prompt outside it.
+
+        HONEST LIMITATION, measured rather than assumed: Anthropic enforces a
+        minimum cacheable prefix, and for Haiku 4.5 that minimum is 4,096
+        tokens. This project's prefix is ~3,460, so on the default model this
+        caches NOTHING — silently, with no error, reporting
+        cache_creation_input_tokens: 0. It does engage on Sonnet and Opus,
+        whose minimum is 1,024.
+
+        So this is correct code that is currently inert. It is kept because it
+        is right, costs nothing, and starts working the moment the model or
+        the prompt size changes — but it must NOT be described as having
+        fixed the growing-latency problem on Haiku, because it has not. The
+        real remaining cost there is the second model call per turn
+        (classify_turn) resending the whole transcript.
+        """
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
             "messages": self.messages,
         }
         if self.system:
-            kwargs["system"] = self.system
+            kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": self.system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         if self.tools:
             kwargs["tools"] = self.tools
         return await self.client.messages.create(**kwargs)

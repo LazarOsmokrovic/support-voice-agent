@@ -129,9 +129,10 @@ BOOK_APPOINTMENT_SCHEMA: dict[str, Any] = {
         "Book an appointment slot (from find_available_slots) for the "
         "customer. The FIRST call proposes the booking and asks for "
         "confirmation — it does not book yet. Only call it a second time, "
-        "with the exact same slot_time and reason, after the customer has "
-        "clearly confirmed in their own words in a later message. Never "
-        "call it twice in the same reply."
+        "with the exact same slot_time, after the customer has clearly "
+        "confirmed in their own words in a later message. Never call it "
+        "twice in the same reply. The slot_time is what must match; you do "
+        "not need to reproduce the reason word for word."
     ),
     "input_schema": {
         "type": "object",
@@ -157,7 +158,18 @@ def book_appointment(slot_time: str, reason: str, state: PendingActionGate, cust
             "message": f"{slot_time} is no longer available — someone else has booked it.",
         }
 
-    if not state.check(key=("book", slot_time, reason)):
+    # Keyed on the slot alone, NOT on `reason`. What identifies a booking is
+    # the time; `reason` is model-authored prose describing it, and the model
+    # legitimately rephrases prose between turns ("callback about my Kindle"
+    # becoming "call back regarding the Kindle order"). Including it in the
+    # key meant a customer's "yes" arrived under a different key, so check()
+    # read the confirmation as a fresh proposal and asked again — and again,
+    # for as long as the customer kept agreeing. issue_refund and
+    # cancel_appointment never had this bug because they key on an order ID
+    # plus a fixed condition, and on an appointment ID: stable identifiers,
+    # not sentences. Changing the SLOT still changes the key, which is right,
+    # because that genuinely is a different booking.
+    if not state.check(key=("book", slot_time)):
         return {
             "booked": False,
             "status": "pending_confirmation",

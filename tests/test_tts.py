@@ -78,3 +78,78 @@ def test_get_tts_backend_rejects_an_unknown_value(monkeypatch):
     monkeypatch.setenv("TTS_BACKEND", "not-a-real-backend")
     with pytest.raises(ValueError, match="unknown TTS_BACKEND"):
         get_tts_backend()
+
+
+def test_speakable_strips_markdown_a_synthesiser_would_pronounce():
+    """The bug this exists for, verbatim from a real call.
+
+    The agent replied with "**wait for delivery and then return it**" and the
+    customer heard "star star wait for delivery star star". A model
+    emphasising a phrase is doing something reasonable for text; it is only
+    wrong because the text is spoken.
+    """
+    from transport.tts import speakable
+
+    assert speakable("**wait for delivery and then return it**") == (
+        "wait for delivery and then return it"
+    )
+    assert speakable("Two options. One, **wait**. Two, **contact support**.") == (
+        "Two options. One, wait. Two, contact support."
+    )
+    assert speakable("Use `get_order_status` for that.") == "Use get_order_status for that."
+    assert speakable("- first\n- second") == "first\nsecond"
+    assert speakable("# Heading\nbody") == "Heading\nbody"
+    assert speakable("See [our policy](https://example.com/p).") == "See our policy."
+
+
+def test_speakable_leaves_ordinary_text_alone():
+    """The other half: stripping must not damage what it does not understand.
+
+    An order ID's hyphens, a price's dollar sign and an arithmetic asterisk
+    are not markdown, and mangling a seeded order ID would be this project's
+    most-repeated defect class showing up in a new place.
+    """
+    from data import mock_db
+    from transport.tts import speakable
+
+    order_id = mock_db.ORDERS[0][0]
+    tracking = mock_db.ORDERS[0][8]
+    sentence = f"Order {order_id} shipped, tracking {tracking}, total $34.99."
+
+    assert speakable(sentence) == sentence
+    assert speakable("A 5*3 calculation and an unmatched * asterisk.") == (
+        "A 5*3 calculation and an unmatched * asterisk."
+    )
+    assert speakable("Nothing to strip here at all.") == "Nothing to strip here at all."
+
+
+def test_speakable_never_deletes_a_fenced_identifier():
+    """A Critical caught by review, and the exact defect class this function
+    exists to prevent — appearing inside the prevention itself.
+
+    The fenced-code pattern allowed an OPTIONAL newline after the language
+    tag, and the tag class matches word characters and hyphens. An order ID
+    is nothing but word characters and hyphens, so the tag swallowed the
+    whole payload and the capture matched empty: the identifier was DELETED
+    rather than unwrapped. A reply that was only a fenced identifier stripped
+    to nothing at all, tripping the empty-reply guard, and the caller heard
+    silence for the entire turn.
+    """
+    from data import mock_db
+    from transport.tts import speakable
+
+    order_id = mock_db.ORDERS[0][0]
+    tracking = mock_db.ORDERS[0][8]
+
+    assert order_id in speakable(f"Your order is ```{order_id}``` and it shipped.")
+    assert tracking in speakable(f"Tracking ```{tracking}``` arrives Friday.")
+    assert speakable(f"```{order_id}```") == order_id
+    assert "34.99" in speakable("```34.99```")
+
+
+def test_speakable_still_unwraps_a_real_code_block():
+    """The fix must not break what the rule was for."""
+    from transport.tts import speakable
+
+    assert speakable("```python\nprint(1)\n```") == "print(1)"
+    assert speakable("Use `get_order_status` for that.") == "Use get_order_status for that."

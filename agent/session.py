@@ -22,6 +22,7 @@ from __future__ import annotations
 import time
 import uuid
 from collections.abc import Callable
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -228,6 +229,48 @@ class TurnOutcome:
     warnings: list[str] = field(default_factory=list)  # non-fatal issues to surface, not swallow
 
 
+def _escalation_notice(callback_time: str | None) -> str:
+    """What the customer actually hears when the agent hands them off.
+
+    This is spoken aloud, which the original wording forgot: it read the
+    INTERNAL escalation reason out loud ("sustained negative sentiment across
+    multiple turns") and then recited a handoff number. That told an already
+    frustrated customer they had been classified as angry, and gave them a
+    ticket ID they cannot use. Both belong in the turn log and the escalations
+    row, where they already are.
+
+    It promises a callback rather than a transfer because, outside Phase 10d's
+    Twilio path, no transfer happens — the call simply ends. Saying "connecting
+    you now" and then hanging up is worse than saying nothing.
+    """
+    if callback_time:
+        when = _spoken_time(callback_time)
+        return (
+            "Let me get one of my colleagues to call you back about this. "
+            f"The earliest we have is {when}, and they'll have the full details of our conversation."
+        )
+    return (
+        "Let me get one of my colleagues to call you back about this. "
+        "They'll be in touch shortly, and they'll have the full details of our conversation."
+    )
+
+
+def _spoken_time(slot: str) -> str:
+    """Turn an ISO slot into something a person would say.
+
+    "2026-09-11T09:00:00" read aloud by a speech synthesiser is unintelligible;
+    "Thursday at 9am" is what a human on a support line would say.
+    """
+    try:
+        when = datetime.fromisoformat(slot)
+    except (TypeError, ValueError):
+        return slot
+    hour = when.hour % 12 or 12
+    meridiem = "am" if when.hour < 12 else "pm"
+    minutes = f":{when.minute:02d}" if when.minute else ""
+    return f"{when.strftime('%A')} at {hour}{minutes}{meridiem}"
+
+
 async def run_turn(session: Session, user_text: str) -> TurnOutcome:
     """Send one user turn through the agent and run the same per-turn
     orchestration every transport needs: sanitize the caller's text, advance
@@ -342,7 +385,7 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
         try:
             packet = await escalation.create_handoff_packet(session.customer_id, session.agent.messages, reason)
             escalation_id = packet["escalation_id"]
-            notice = f"I'm connecting you with a human agent — {reason}. (handoff #{escalation_id})"
+            notice = _escalation_notice(packet.get("callback_time"))
         except Exception as exc:  # noqa: BLE001 — exit path must never crash on this
             notice = None
             warnings.append(f"Escalation triggered ({reason}) but the handoff packet couldn't be logged: {exc}")
