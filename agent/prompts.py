@@ -90,19 +90,68 @@ _THINKING_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
-def thinking_phrase(user_text: str, counter: int = 0) -> str:
-    """A short line to speak while the model is still thinking.
+# Turns that need no filler at all, because nothing is being looked up.
+# This bites at BOTH ends of a call, and both were noticed live.
+#
+# At the start: a caller who opens with "hello" has not asked for anything.
+# Answering "let me check that for you" and only THEN saying hello is not
+# politeness, it is a non-sequitur — a person says hello back.
+#
+# At the end: "let me check that... goodbye" is the same mistake wearing a
+# different hat. Nothing is being checked; the call is finishing.
+#
+# Also covers a bare "yes" confirming something the agent just proposed,
+# where the pending work is a database write the caller already agreed to,
+# not a search.
+_PLEASANTRY_TOKENS = frozenset(
+    """
+    hi hello hey yo hiya
+    good morning afternoon evening night day
+    thanks thank you cheers appreciate appreciated
+    yes yeah yep yup sure ok okay alright right fine great perfect cool
+    no nope nah
+    bye goodbye later
+    go ahead do it sounds works confirm confirmed correct
+    please sorry pardon excuse me
+    that is all thats everything else nothing done finished
+    im i am were we
+    and a an the my me you it now
+    """.split()
+)
+
+# Above this many non-pleasantry words, treat the turn as substantive even
+# when it opens with a greeting. "Hello, I have an issue with my order"
+# genuinely starts work; "hello there" does not.
+_SUBSTANTIVE_WORD_THRESHOLD = 2
+
+
+def thinking_phrase(user_text: str, counter: int = 0) -> str | None:
+    """A short line to speak while the model is still thinking, or None when
+    the turn does not warrant one.
+
+    Returns None for a purely social turn — a greeting, a thank-you, a
+    goodbye, or a bare confirmation. See _PLEASANTRY_TOKENS for why both
+    ends of a call get this wrong without it.
+
+    A greeting attached to a real request still gets a filler, because that
+    turn does start work.
 
     `counter` should be the session's turn number so successive turns rotate
     through the available phrases instead of repeating one.
     """
     lowered = user_text.lower()
+    words = [word.strip(".,!?;:'\"") for word in lowered.split()]
+    substantive = [word for word in words if word and word not in _PLEASANTRY_TOKENS]
+    if len(substantive) < _SUBSTANTIVE_WORD_THRESHOLD:
+        return None
+
     for key, needles in _THINKING_KEYWORDS:
         if any(needle in lowered for needle in needles):
             options = THINKING_PHRASES[key]
             return options[counter % len(options)]
     options = THINKING_PHRASES["default"]
     return options[counter % len(options)]
+
 
 SYSTEM_PROMPT = """\
 You are a customer support assistant for an Amazon-style online storefront. \

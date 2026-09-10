@@ -260,6 +260,14 @@ class ClaudeTurnProcessor(FrameProcessor):
         spoken and finished while run_turn is still in flight.
         """
         filler = thinking_phrase(user_text, self._session.turn)
+        if filler is None:
+            # A purely social turn — a greeting, a thank-you, a goodbye, a bare
+            # confirmation. Nothing is being looked up, so "let me check that"
+            # would be a non-sequitur: answering "hello" with "let me check
+            # that for you" and only then saying hello is not how a person
+            # speaks, and "let me check that... goodbye" is the same mistake at
+            # the other end of the call. Both were noticed on a live call.
+            return
         print(f"[thinking] {filler}")
         await self.push_frame(LLMFullResponseStartFrame())
         await self.push_frame(TextFrame(text=filler))

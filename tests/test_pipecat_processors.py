@@ -669,3 +669,65 @@ async def test_a_slow_turn_is_covered_by_a_thinking_filler(monkeypatch):
     assert spoken[0] in _all_thinking_phrases()
     assert spoken[1] == "Your order is out for delivery."
     assert slow.is_set()
+
+
+@pytest.mark.asyncio
+async def test_a_greeting_gets_no_thinking_filler(monkeypatch):
+    """The first thing a real caller noticed.
+
+    Saying "hello" to the agent produced "let me check that for you" and
+    THEN "hi, how can I help?". Nothing was being checked — the caller had
+    not asked for anything. A person says hello back.
+
+    Uses a deliberately slow turn so the filler WOULD fire on a substantive
+    question; the point is that a social turn suppresses it regardless of
+    how long the model takes.
+    """
+    async def _slow_run_turn(session, text):
+        await asyncio.sleep(processors.THINKING_FILLER_DELAY_SECONDS + 0.2)
+        return SimpleNamespace(
+            reply="Hi there! How can I help?",
+            notice=None,
+            warnings=[],
+            llm_latency_seconds=0.0,
+            ended=False,
+            end_reason=None,
+            escalation_packet=None,
+        )
+
+    monkeypatch.setattr(processors, "run_turn", _slow_run_turn)
+    session = create_session("CUST-1001")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    await processor.process_frame(_transcript("Hello"), FrameDirection.DOWNSTREAM)
+
+    spoken = [f.text for f in sink.frames if isinstance(f, TextFrame)]
+    assert spoken == ["Hi there! How can I help?"], f"a greeting must not be filled: {spoken}"
+
+
+@pytest.mark.asyncio
+async def test_a_goodbye_gets_no_thinking_filler(monkeypatch):
+    """The same mistake at the other end of the call: "let me check
+    that... goodbye" checks nothing. The call is finishing."""
+    async def _slow_run_turn(session, text):
+        await asyncio.sleep(processors.THINKING_FILLER_DELAY_SECONDS + 0.2)
+        return SimpleNamespace(
+            reply="Glad I could help — take care!",
+            notice=None,
+            warnings=[],
+            llm_latency_seconds=0.0,
+            ended=True,
+            end_reason="model_ended",
+            escalation_packet=None,
+        )
+
+    monkeypatch.setattr(processors, "run_turn", _slow_run_turn)
+    session = create_session("CUST-1001")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    await processor.process_frame(_transcript("No that's everything, thanks"), FrameDirection.DOWNSTREAM)
+
+    spoken = [f.text for f in sink.frames if isinstance(f, TextFrame)]
+    assert spoken == ["Glad I could help — take care!"], f"a goodbye must not be filled: {spoken}"
