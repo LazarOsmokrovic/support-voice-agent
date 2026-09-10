@@ -662,7 +662,12 @@ async def test_a_slow_turn_is_covered_by_a_thinking_filler(monkeypatch):
     processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
     sink = await _started(processor)
 
-    await processor.process_frame(_transcript("where is my order"), FrameDirection.DOWNSTREAM)
+    # A POLICY question, deliberately: search_policy needs nothing from the
+    # caller, so the agent really can start work and the filler is honest.
+    # An order question with no ID in play is now suppressed instead.
+    await processor.process_frame(
+        _transcript("how long do I have to return something"), FrameDirection.DOWNSTREAM
+    )
 
     spoken = [f.text for f in sink.frames if isinstance(f, TextFrame)]
     assert len(spoken) == 2, f"expected a filler then the reply, got {spoken}"
@@ -731,3 +736,81 @@ async def test_a_goodbye_gets_no_thinking_filler(monkeypatch):
 
     spoken = [f.text for f in sink.frames if isinstance(f, TextFrame)]
     assert spoken == ["Glad I could help — take care!"], f"a goodbye must not be filled: {spoken}"
+
+
+@pytest.mark.asyncio
+async def test_an_order_question_with_no_id_yet_gets_no_filler(monkeypatch):
+    """Noticed live: "can you help me with my order" produced "sure, let me
+    look into that" and then "actually, I need the order ID".
+
+    The agent cannot begin an order lookup without a number, so a filler
+    there promises work that has not started — worse than silence, because
+    it claims to be doing something impossible. The honest reply is simply
+    "I can do that, what's the order number?".
+
+    Uses a deliberately slow turn, so the filler would fire on a question
+    the agent COULD act on. The suppression is about capability, not speed.
+    """
+    async def _slow_run_turn(session, text):
+        await asyncio.sleep(processors.THINKING_FILLER_DELAY_SECONDS + 0.2)
+        return SimpleNamespace(
+            reply="Of course — what's the order number?",
+            notice=None,
+            warnings=[],
+            llm_latency_seconds=0.0,
+            ended=False,
+            end_reason=None,
+            escalation_packet=None,
+        )
+
+    monkeypatch.setattr(processors, "run_turn", _slow_run_turn)
+    session = create_session("CUST-1001")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    await processor.process_frame(
+        _transcript("Hi, can you help me with my order?"), FrameDirection.DOWNSTREAM
+    )
+
+    spoken = [f.text for f in sink.frames if isinstance(f, TextFrame)]
+    assert spoken == ["Of course — what's the order number?"], (
+        f"an order question with no ID must not be filled: {spoken}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_order_question_is_filled_once_the_id_is_known(monkeypatch):
+    """The other half: once an order ID is in the conversation the agent CAN
+    look something up, so covering the wait is honest again.
+
+    The ID is read from the transcript rather than tracked as state, because
+    that is where it actually arrives — via a tool call the model composes.
+    """
+    from data import mock_db
+
+    order_id = mock_db.ORDERS[0][0]
+
+    async def _slow_run_turn(session, text):
+        await asyncio.sleep(processors.THINKING_FILLER_DELAY_SECONDS + 0.2)
+        return SimpleNamespace(
+            reply="It's out for delivery.",
+            notice=None,
+            warnings=[],
+            llm_latency_seconds=0.0,
+            ended=False,
+            end_reason=None,
+            escalation_packet=None,
+        )
+
+    monkeypatch.setattr(processors, "run_turn", _slow_run_turn)
+    session = create_session("CUST-1001")
+    session.agent.messages.append({"role": "user", "content": f"my order is {order_id}"})
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    await processor.process_frame(_transcript("where is my order"), FrameDirection.DOWNSTREAM)
+
+    spoken = [f.text for f in sink.frames if isinstance(f, TextFrame)]
+    assert len(spoken) == 2, f"expected a filler then the reply, got {spoken}"
+    assert spoken[0] in _all_thinking_phrases()
+    assert spoken[1] == "It's out for delivery."

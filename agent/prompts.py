@@ -82,10 +82,15 @@ THINKING_PHRASES: dict[str, tuple[str, ...]] = {
 # Substrings that route a caller's turn to a phrase set. Deliberately crude:
 # a wrong guess costs nothing (the caller hears a slightly generic filler),
 # while anything cleverer would cost the latency this exists to hide.
+# ORDER MATTERS. Policy is tested before refund because the two overlap and
+# the wrong winner changes behaviour: "how long do I have to return
+# something" is a POLICY question answerable with no order ID, but "return"
+# is also a refund needle. Routed to refund it was suppressed for lacking an
+# ID it never needed. Asking about a rule is not asking to invoke it.
 _THINKING_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("refund", ("refund", "return", "send it back", "money back", "cancel my order")),
-    ("schedule", ("appointment", "callback", "call me back", "book", "schedule")),
     ("policy", ("policy", "how long", "can i", "am i allowed", "what happens if", "do you")),
+    ("schedule", ("appointment", "callback", "call me back", "book", "schedule")),
+    ("refund", ("refund", "return", "send it back", "money back", "cancel my order")),
     ("order", ("order", "package", "delivery", "shipped", "tracking", "arrive", "where is")),
 )
 
@@ -130,8 +135,33 @@ _AFFIRMATIONS = frozenset(
     "yes yeah yep yup sure ok okay alright correct right no nope nah go please".split()
 )
 
+# Topics the agent CANNOT begin without an order ID. Saying "let me pull that
+# order up" and then asking for the number promises work that has not started
+# — worse than silence, because it claims to be doing something impossible.
+# Policy, shipping and scheduling questions are not on this list: search_policy
+# and find_available_slots need nothing from the caller, so a filler there is
+# honest.
+_NEEDS_ORDER_ID = frozenset({"order", "refund"})
 
-def thinking_phrase(user_text: str, counter: int = 0) -> str | None:
+# Spoken digits arrive as words, not numerals — Deepgram transcribes "one one
+# three" and the MODEL assembles the ID, so a numeric regex on the transcript
+# finds nothing. A run of number-words is the available signal that a caller
+# is reading an ID out, which means a lookup really is about to happen.
+_NUMBER_WORDS = frozenset(
+    "zero one two three four five six seven eight nine ten oh nought".split()
+)
+_ID_DIGIT_RUN = 5
+
+
+def _turn_supplies_an_order_id(words: list[str]) -> bool:
+    """Whether this turn looks like the caller reading an order number out."""
+    numeric = sum(1 for w in words if w in _NUMBER_WORDS or w.isdigit())
+    return numeric >= _ID_DIGIT_RUN
+
+
+def thinking_phrase(
+    user_text: str, counter: int = 0, order_id_known: bool = False
+) -> str | None:
     """A short line to speak while the model is still thinking, or None when
     the turn does not warrant one.
 
@@ -166,6 +196,12 @@ def thinking_phrase(user_text: str, counter: int = 0) -> str | None:
     # being short, which is the opposite mistake.
     for key, needles in _THINKING_KEYWORDS:
         if any(needle in lowered for needle in needles):
+            # An order or refund question the agent cannot act on yet. It has
+            # to ask for the number first, so there is nothing to "check" —
+            # the honest reply is "I can do that, what is the order number?"
+            # and a filler in front of it is a promise it cannot keep.
+            if key in _NEEDS_ORDER_ID and not order_id_known and not _turn_supplies_an_order_id(words):
+                return None
             options = THINKING_PHRASES[key]
             return options[counter % len(options)]
 

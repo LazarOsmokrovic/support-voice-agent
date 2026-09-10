@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -77,6 +78,11 @@ from transport.tts import (
 # instant reply sounds worse than no filler at all. Roughly the pause a
 # person leaves before saying "sure, let me take a look".
 THINKING_FILLER_DELAY_SECONDS = 0.6
+
+# This project's order-ID shape (3-7-7 digits), used only to answer "does the
+# agent already have one?" — never to validate. agent/tools/orders.py owns
+# validation; this is a presentation decision about whether a filler is honest.
+_ORDER_ID_IN_TEXT = re.compile(r"\b\d{3}-\d{7}-\d{7}\b")
 
 
 EscalationHook = Callable[[dict[str, Any] | None], Awaitable[bool]]
@@ -259,7 +265,17 @@ class ClaudeTurnProcessor(FrameProcessor):
         keys per-turn audio-context tracking off that pair, so this can be
         spoken and finished while run_turn is still in flight.
         """
-        filler = thinking_phrase(user_text, self._session.turn)
+        # Has an order ID come up yet in this conversation? If it has, the
+        # agent can genuinely start a lookup and a filler is honest. If it
+        # has not, an order question can only be answered with "what is the
+        # number?", and promising to check first is a promise it cannot keep.
+        #
+        # Read from the transcript rather than tracked as state: the ID
+        # reaches the conversation through a tool call the model composes,
+        # so the transcript is where it actually lives, and scanning it
+        # cannot drift out of sync with reality the way a flag could.
+        order_id_known = bool(_ORDER_ID_IN_TEXT.search(str(self._session.agent.messages)))
+        filler = thinking_phrase(user_text, self._session.turn, order_id_known=order_id_known)
         if filler is None:
             # A purely social turn — a greeting, a thank-you, a goodbye, a bare
             # confirmation. Nothing is being looked up, so "let me check that"
