@@ -1,0 +1,178 @@
+/* Support Voice Agent — browser console
+ *
+ * One page, one circle. Dark ground so the ripple colour carries the whole
+ * effect; the chrome around it stays out of the way on purpose. The palette
+ * has two anchors — a cool cyan for the caller and a warm amber for the
+ * agent — and app.js interpolates every ripple's hue continuously between
+ * them, so this file only needs to know the neutral shell.
+ */
+
+:root {
+  --bg: #0a0b0d;
+  --bg-radial: #101319;
+  --fg: #f2f3f5;
+  --fg-dim: #8a8f98;
+  --ring-idle: rgba(242, 243, 245, 0.16);
+  --ring-idle-hover: rgba(242, 243, 245, 0.28);
+  --ring-in-call: rgba(251, 146, 60, 0.55);
+  --ring-connecting: rgba(94, 234, 212, 0.5);
+  --button-fill: #16181d;
+  --button-fill-hover: #1c1f26;
+  --focus: #f2f3f5;
+  --ease: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: radial-gradient(circle at 50% 42%, var(--bg-radial), var(--bg) 70%);
+  color: var(--fg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial,
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+main {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 28px;
+  width: 100%;
+  height: 100vh;
+  overflow: hidden;
+}
+
+#ripples {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+/* ---- The button ------------------------------------------------------- */
+
+#call {
+  position: relative;
+  z-index: 1;
+  width: min(30vw, 200px);
+  height: min(30vw, 200px);
+  border-radius: 50%;
+  border: 1.5px solid var(--ring-idle);
+  background: var(--button-fill);
+  color: var(--fg);
+  font-size: 1.05rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.25s var(--ease), border-color 0.25s var(--ease),
+    box-shadow 0.25s var(--ease), transform 0.2s var(--ease);
+  box-shadow: 0 0 0 0 transparent;
+}
+
+#call:hover {
+  background: var(--button-fill-hover);
+  border-color: var(--ring-idle-hover);
+}
+
+#call:active {
+  transform: scale(0.97);
+}
+
+#call:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 6px;
+}
+
+#label {
+  pointer-events: none;
+}
+
+/* idle: a slow breathing invitation to press */
+#call[data-state="idle"] {
+  animation: breathe 3.6s var(--ease) infinite;
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(242, 243, 245, 0.08);
+  }
+  50% {
+    box-shadow: 0 0 0 14px rgba(242, 243, 245, 0);
+  }
+}
+
+/* connecting: a spinning ring says "working", not "broken" */
+#call[data-state="connecting"] {
+  border-color: transparent;
+  background:
+    linear-gradient(var(--button-fill), var(--button-fill)) padding-box,
+    conic-gradient(
+        from 0deg,
+        var(--ring-connecting),
+        transparent 55%,
+        var(--ring-connecting)
+      )
+      border-box;
+  animation: spin 1.1s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* in-call: settled, warm-edged, unmistakably "press to hang up" */
+#call[data-state="in-call"] {
+  border-color: var(--ring-in-call);
+  box-shadow: 0 0 0 1px rgba(251, 146, 60, 0.12);
+}
+
+/* ending: a quick collapse acknowledging the hang-up */
+#call[data-state="ending"] {
+  border-color: var(--ring-idle);
+  transform: scale(0.94);
+  transition: transform 0.15s var(--ease), border-color 0.15s var(--ease);
+}
+
+/* ---- Status line -------------------------------------------------------- */
+
+#status {
+  position: relative;
+  z-index: 1;
+  min-height: 1.2em;
+  margin: 0;
+  color: var(--fg-dim);
+  font-size: 0.9rem;
+  letter-spacing: 0.01em;
+  text-align: center;
+  max-width: 320px;
+}
+
+/* ---- Motion preference -------------------------------------------------- */
+
+@media (prefers-reduced-motion: reduce) {
+  #call[data-state="idle"],
+  #call[data-state="connecting"] {
+    animation: none;
+  }
+
+  #call {
+    transition: none;
+  }
+}
