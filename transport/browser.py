@@ -52,12 +52,12 @@ SAMPLE_RATE = 16000
 _STATIC = Path(__file__).resolve().parent.parent / "static"
 
 app = FastAPI()
-# check_dir=False: a separate, parallel task owns everything under static/
-# and populates it independently of this module. Without it, mounting here
-# would raise at import time on any checkout where that directory hasn't
-# been created yet — an import-time dependency on another task's files that
-# this module has no business having.
-app.mount("/static", StaticFiles(directory=_STATIC, check_dir=False), name="static")
+# static/ now ships real files (index.html, app.js, style.css, the capture
+# worklet), so the mount is held to the normal StaticFiles default: raise at
+# import time if the directory is missing. A silently-tolerated missing
+# directory would otherwise turn a broken deployment into a 404 at request
+# time instead of a clear failure at startup.
+app.mount("/static", StaticFiles(directory=_STATIC), name="static")
 
 
 @app.get("/")

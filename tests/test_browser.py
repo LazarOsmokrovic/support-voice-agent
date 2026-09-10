@@ -7,12 +7,6 @@ summary, and pressing it a third time starts something that remembers
 nothing. What is NOT tested here is audio — sample rates, buffering and
 playback smoothness are only answerable by speaking into it, and the spec
 says so plainly rather than pretending otherwise.
-
-Note: the brief for this file also specifies a test asserting the page and
-its static assets (app.js, style.css) are served. That test — and creating
-the placeholder static/ files it depends on — is deliberately omitted here:
-a separate, parallel task owns the entire static/ directory, and this task
-was instructed not to create or touch anything under it.
 """
 
 from __future__ import annotations
@@ -20,8 +14,23 @@ from __future__ import annotations
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi.testclient import TestClient
 
 from transport import browser
+
+
+def test_the_page_is_served_with_its_script_and_stylesheet():
+    """A demo that 404s on its own assets is worse than no demo. This is the
+    cheapest possible guard against a renamed file."""
+    client = TestClient(browser.app)
+
+    page = client.get("/")
+
+    assert page.status_code == 200
+    assert "app.js" in page.text
+    assert "style.css" in page.text
+    assert client.get("/static/app.js").status_code == 200
+    assert client.get("/static/style.css").status_code == 200
 
 
 @pytest.mark.asyncio

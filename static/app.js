@@ -20,6 +20,14 @@ let socket = null;
 let stream = null;
 let playHead = 0;
 
+// endCall() only *begins* hanging up (stop the mic, close the socket); the
+// socket's own onclose is what actually settles the UI back to idle, so the
+// "ending" state is on screen for as long as the close handshake takes. A
+// floor keeps it visible even when the socket closes instantly (e.g. it was
+// never opened) — hanging up should read as deliberate, not as a flicker.
+const MIN_ENDING_MS = 200;
+let endingSince = 0;
+
 function setState(state, message = "") {
   button.dataset.state = state;
   label.textContent = state === "in-call" ? "Hang up" : "Call";
@@ -90,7 +98,17 @@ async function startCall() {
   socket.binaryType = "arraybuffer";
 
   socket.onmessage = (event) => playChunk(event.data);
-  socket.onclose = () => endCall();
+  // If we're already in the "ending" state, this is the close we asked for
+  // via endCall() — settle to idle. Otherwise the server or the network
+  // closed the socket out from under us (mid-turn drop, server crash) while
+  // we were still "connecting" or "in-call", so run the same hang-up
+  // sequence a manual press would. Routing both cases through endCall()
+  // (which no-ops once already "ending") keeps there being exactly one
+  // teardown path instead of two.
+  socket.onclose = () => {
+    if (button.dataset.state === "ending") settleIdle();
+    else endCall();
+  };
   socket.onerror = () => setState("idle", "Connection failed.");
 
   socket.onopen = () => {
@@ -106,17 +124,37 @@ async function startCall() {
   };
 }
 
+function settleIdle() {
+  // Never resolve faster than MIN_ENDING_MS after "ending" was first shown,
+  // so a socket that closes instantly (or was never open at all) still
+  // leaves the state on screen long enough for the CSS to actually paint it.
+  const elapsed = performance.now() - endingSince;
+  setTimeout(() => {
+    if (ctx) ctx.close();
+    socket = null;
+    stream = null;
+    ctx = null;
+    window.audioLevel = { mic: 0, agent: 0 };
+    setState("idle", "");
+  }, Math.max(0, MIN_ENDING_MS - elapsed));
+}
+
 function endCall() {
-  if (button.dataset.state === "idle") return;
+  // Idempotent: a second hang-up press, or the socket's own onclose firing
+  // after we've already begun ending, must not restart the sequence.
+  if (button.dataset.state === "idle" || button.dataset.state === "ending") return;
+  endingSince = performance.now();
   setState("ending", "");
-  if (socket && socket.readyState === WebSocket.OPEN) socket.close();
   if (stream) stream.getTracks().forEach((track) => track.stop());
-  if (ctx) ctx.close();
-  socket = null;
-  stream = null;
-  ctx = null;
-  window.audioLevel = { mic: 0, agent: 0 };
-  setState("idle", "");
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    // socket.close() completes asynchronously; onclose (above) calls
+    // settleIdle() once it fires. Nothing else to do here.
+    socket.close();
+  } else {
+    // No socket, or it's already closed/never opened (e.g. hang-up pressed
+    // mid-"connecting") — nothing will ever call onclose, so settle directly.
+    settleIdle();
+  }
 }
 
 button.addEventListener("click", () => {
