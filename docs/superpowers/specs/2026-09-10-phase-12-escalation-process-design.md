@@ -33,6 +33,57 @@ are visible in that one exchange:
 The fix is not a better classifier. It is that **escalation should be a state the
 agent has to work its way out of**, with the call unable to end until it has.
 
+## Not every trigger deserves to be imposed
+
+A second live call exposed a deeper problem than the one above. The customer
+mis-dictated an order number, said so immediately — *"I'm sorry, that's not what I
+said, let me give you a new one"* — and the agent escalated and hung up.
+
+`FAILED_LOOKUP_ESCALATION_THRESHOLD = 2`, and the counter resets **only on a
+successful lookup**. A customer correcting themselves resets nothing, because the
+tracker reads tool outcomes and never sees the conversation. Turn 3 invalid → 1.
+Turn 7 not-found → 2 → escalate. Turn 9 → escalate again. Turn 10 contained *no
+lookup at all* and escalated a third time, because the counter is re-checked every
+turn regardless of whether anything was looked up.
+
+The trigger was built to catch *"the agent is failing this customer"*, which is a fair
+thing to catch. But it counts failures without asking whose they are, and cannot
+distinguish:
+
+- **the agent failing** — orders that exist are not found, something is broken;
+- **the customer self-correcting** — a mis-heard digit, immediately acknowledged.
+
+The second is a **cooperative repair**, the healthiest signal a conversation can
+produce. The customer was one transposed digit from success and got hung up on
+instead.
+
+So triggers divide by whose decision they represent:
+
+| Trigger | Class | Why |
+|---|---|---|
+| Explicit request for a human | **mandatory** | The customer asked |
+| Policy-restricted topic | **mandatory** | A rule, not a judgement |
+| Tool-signalled (high-value refund) | **mandatory** | A specialist must approve |
+| Repeated failed lookups | **suggested** | The agent's inference |
+| Sustained negative sentiment | **suggested** | The agent's inference |
+| Repeated ungrounded replies | **suggested** | A guardrail's suspicion |
+
+**Mandatory triggers open an escalation directly.** **Suggested triggers make the
+agent offer one** — *"I'm still not finding that. Would you like me to have a
+colleague call you, or shall we try the number once more?"* — and an escalation opens
+only if the customer accepts.
+
+This is the principle rule 6 already applies to refunds, extended to handoffs: the
+agent proposes, the customer decides. An inference is a suggestion, not a verdict.
+
+**Declining resets the counter that produced the offer**, so the customer gets a clean
+run at correcting themselves rather than tripping the same threshold on their next
+breath. Without the reset an offer is meaningless — the agent would simply ask again
+one turn later.
+
+**A suggested trigger fires at most one offer per state.** Being asked repeatedly
+whether you want a human is its own kind of failure.
+
 ## The state machine
 
 A session holds **at most one escalation for its entire life**.
@@ -123,7 +174,14 @@ callback is a real booking behind a real confirmation.
 ## Error handling
 
 - **A trigger fires while an escalation is already open** — amend, never reopen. No
-  second callback, no second process.
+  second callback, no second process. Today this re-fires every single turn once
+  tripped: one live call produced escalation rows 7, 8 and 9 for one problem, which
+  with n8n connected would have been three Slack messages about one customer.
+- **A suggested trigger fires but the customer declines** — no escalation opens, the
+  counter resets, and no further offer is made for that trigger until something
+  changes. The conversation continues normally.
+- **A turn with no tool calls at all** must not re-evaluate a lookup counter. Turn 10
+  of the call above escalated while merely being asked to repeat a number back.
 - **The customer never resolves and the call drops** — `close_session` notifies as
   `unresolved`. The record is never silently lost.
 - **`schedule_human_callback` with an unavailable slot** — `book_appointment` already
@@ -148,6 +206,26 @@ callback is a real booking behind a real confirmation.
 - The packet's `items` accumulate in order and survive redaction with identifiers intact.
 - **Regression for the bug that prompted this:** a turn whose reply ends in a question
   must not end the call when escalation fires.
+- **Regression for the second live failure:** two failed lookups make the agent *offer*
+  rather than escalate; declining resets the counter; and a third consecutive failure
+  after a decline does not silently escalate behind the customer's back.
+- A turn with no tool calls does not advance or re-trigger a lookup counter.
+- One tripped trigger produces **one** escalation row, not one per subsequent turn.
+  Asserted by counting rows, since the live failure produced three for one problem.
+- A mandatory trigger still opens without asking — the offer path must not weaken an
+  explicit request for a human or a policy-restricted topic.
+
+## A related defect this phase must also fix
+
+The same call showed `ended=True` returned at turn 7, with turns 9 and 10 continuing
+normally afterwards. Whatever the transport does with `EndFrame`, the session did not
+actually stop — which is also why nothing was spoken at the real ending.
+
+This is independent of the escalation redesign and would bite anywhere `ended=True` is
+returned, including a normal `end_conversation`. Phase 12 removes the specific case
+that produced it (escalation no longer ends a call at detection), but the underlying
+"a turn said the call was over and it wasn't" behaviour needs its own investigation and
+its own test, not merely to be routed around.
 
 Values come from `data/mock_db.py` at runtime, never hard-coded.
 
