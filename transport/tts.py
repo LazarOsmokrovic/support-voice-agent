@@ -36,7 +36,15 @@ DEFAULT_CARTESIA_VOICE = "db6b0ed5-d5d3-463d-ae85-518a07d3c2b4"
 # before *italic*, __bold__ before _italic_ — since matching the short form
 # first would leave a stray marker behind.
 _MARKDOWN_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
-    (re.compile(r"```[\w-]*\n?(.*?)```", re.DOTALL), r"\1"),  # fenced code
+    # A REAL newline after the fence, not an optional one. With \n? the
+    # language-tag class [\w-]* happily swallowed an order ID — which is
+    # entirely word characters and hyphens — leaving the capture empty and
+    # DELETING it: "order ```112-3487561-2938471``` shipped" became "order
+    # shipped". A reply that was nothing but a fenced identifier stripped to
+    # empty, tripping the empty-reply guard so the caller heard nothing at
+    # all. Exactly the defect class this function exists to prevent, in a
+    # new place.
+    (re.compile(r"```[\w-]*\n(.*?)```", re.DOTALL), r"\1"),   # fenced code block
     (re.compile(r"`([^`]+)`"), r"\1"),                         # inline code
     (re.compile(r"\*\*\*(.+?)\*\*\*", re.DOTALL), r"\1"),      # ***both***
     (re.compile(r"\*\*(.+?)\*\*", re.DOTALL), r"\1"),          # **bold**
@@ -48,6 +56,11 @@ _MARKDOWN_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^\s{0,3}#{1,6}\s+", re.MULTILINE), ""),      # # heading
     (re.compile(r"^\s{0,3}[-*+]\s+", re.MULTILINE), ""),       # - bullet
     (re.compile(r"^\s{0,3}>\s?", re.MULTILINE), ""),           # > quote
+    # Anything backtick-shaped still standing after the rules above — an
+    # unmatched fence, a stray pair around a same-line identifier. A
+    # synthesiser pronounces them; nothing is lost by removing them, and
+    # unlike the capturing rules this cannot delete what sits between.
+    (re.compile(r"`+"), ""),
 )
 
 

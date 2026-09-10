@@ -108,6 +108,7 @@ _PLEASANTRY_TOKENS = frozenset(
     hi hello hey yo hiya
     good morning afternoon evening night day
     thanks thank you cheers appreciate appreciated
+    so much very really been helpful lovely brilliant welcome
     yes yeah yep yup sure ok okay alright right fine great perfect cool
     no nope nah
     bye goodbye later
@@ -123,6 +124,11 @@ _PLEASANTRY_TOKENS = frozenset(
 # when it opens with a greeting. "Hello, I have an issue with my order"
 # genuinely starts work; "hello there" does not.
 _SUBSTANTIVE_WORD_THRESHOLD = 2
+
+# Words that, when they OPEN a turn, mark it as agreement rather than request.
+_AFFIRMATIONS = frozenset(
+    "yes yeah yep yup sure ok okay alright correct right no nope nah go please".split()
+)
 
 
 def thinking_phrase(user_text: str, counter: int = 0) -> str | None:
@@ -141,7 +147,28 @@ def thinking_phrase(user_text: str, counter: int = 0) -> str | None:
     """
     lowered = user_text.lower()
     words = [word.strip(".,!?;:'\"") for word in lowered.split()]
+
+    # A turn that OPENS with an affirmation is confirming something the agent
+    # just proposed, however much detail follows it. "Yes, Thursday at 9am
+    # works for me" and "yes go ahead and book that slot" are agreements, not
+    # requests — and answering an agreement with "let me check that" describes
+    # the wrong thing entirely, moments before an irreversible booking
+    # commits. Checked first, so a keyword later in the sentence cannot
+    # override it.
+    if words and words[0] in _AFFIRMATIONS:
+        return None
+
     substantive = [word for word in words if word and word not in _PLEASANTRY_TOKENS]
+
+    # A topic keyword means there is genuinely something to look up, so it
+    # wins over the length test. Without this, the commonest voice turns of
+    # all — "my order", "refund please", "where is it" — were suppressed for
+    # being short, which is the opposite mistake.
+    for key, needles in _THINKING_KEYWORDS:
+        if any(needle in lowered for needle in needles):
+            options = THINKING_PHRASES[key]
+            return options[counter % len(options)]
+
     if len(substantive) < _SUBSTANTIVE_WORD_THRESHOLD:
         return None
 

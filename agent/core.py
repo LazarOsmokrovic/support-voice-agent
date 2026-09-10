@@ -161,17 +161,28 @@ class Agent:
     async def _call_api(self):
         """One Messages API call, with the fixed prefix marked cacheable.
 
-        The system prompt and the seven tool schemas come to roughly 3,300
-        tokens and are byte-identical on every turn of every call. Without
-        cache_control the model reprocesses all of it each time, on top of a
-        conversation history that grows with the call — which is why a long
-        conversation gets steadily slower to answer, the symptom that
-        prompted this.
+        The system prompt and tool schemas are byte-identical on every turn of
+        every call — together roughly 3,460 tokens — and without a cache
+        breakpoint the model reprocesses all of it each time, on top of a
+        history that grows as the conversation does.
 
-        Marking the LAST tool caches the whole prefix before it, tools and
-        system together, since the cache breakpoint covers everything above
-        it. Cache hits are also billed at a fraction of input rate, so this
-        cuts cost as well as latency.
+        The breakpoint goes on `system`, NOT on the last tool. Requests render
+        tools BEFORE system, so a breakpoint on the last tool caches the tools
+        alone (~1,150 tokens) and leaves the larger system prompt outside it.
+
+        HONEST LIMITATION, measured rather than assumed: Anthropic enforces a
+        minimum cacheable prefix, and for Haiku 4.5 that minimum is 4,096
+        tokens. This project's prefix is ~3,460, so on the default model this
+        caches NOTHING — silently, with no error, reporting
+        cache_creation_input_tokens: 0. It does engage on Sonnet and Opus,
+        whose minimum is 1,024.
+
+        So this is correct code that is currently inert. It is kept because it
+        is right, costs nothing, and starts working the moment the model or
+        the prompt size changes — but it must NOT be described as having
+        fixed the growing-latency problem on Haiku, because it has not. The
+        real remaining cost there is the second model call per turn
+        (classify_turn) resending the whole transcript.
         """
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -179,14 +190,15 @@ class Agent:
             "messages": self.messages,
         }
         if self.system:
-            kwargs["system"] = self.system
+            kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": self.system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         if self.tools:
-            # Copy before mutating: self.tools is shared module state
-            # (agent/session.py's TOOLS) and every session would otherwise
-            # accumulate cache_control markers on the same dicts.
-            tools = [dict(tool) for tool in self.tools]
-            tools[-1]["cache_control"] = {"type": "ephemeral"}
-            kwargs["tools"] = tools
+            kwargs["tools"] = self.tools
         return await self.client.messages.create(**kwargs)
 
     @staticmethod
