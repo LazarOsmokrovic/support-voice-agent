@@ -577,20 +577,43 @@ git commit -m "Phase 10f Task 3: prove each call starts a genuinely fresh sessio
 // An AudioWorklet rather than the deprecated ScriptProcessorNode: capture
 // must not compete with the animation for the main thread, or the ripples
 // stutter exactly when someone is speaking.
+//
+// Audio is BATCHED to ~20 ms before being posted. An AudioWorklet's render
+// quantum is 128 frames, which at 16 kHz is 8 ms — posting every quantum would
+// send 125 WebSocket messages a second, each carrying 256 bytes of audio
+// under a full frame's worth of overhead. Batching to 320 samples cuts that
+// to 50 messages a second and matches the chunk size telephony transports
+// use. Sending unbatched is a plausible cause of choppy audio on its own,
+// so this is built in rather than discovered later.
+const BATCH_SAMPLES = 320; // 20 ms at 16 kHz
+
 class CaptureProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._buffer = new Int16Array(BATCH_SAMPLES);
+    this._filled = 0;
+    this._energy = 0;
+  }
+
   process(inputs) {
     const input = inputs[0];
     if (!input || !input[0]) return true;
     const samples = input[0];
-    const pcm = new Int16Array(samples.length);
-    let sum = 0;
+
     for (let i = 0; i < samples.length; i++) {
       const clamped = Math.max(-1, Math.min(1, samples[i]));
-      pcm[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
-      sum += clamped * clamped;
+      this._buffer[this._filled++] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+      this._energy += clamped * clamped;
+
+      if (this._filled === BATCH_SAMPLES) {
+        // RMS travels with the audio so the animation never re-measures it.
+        const level = Math.sqrt(this._energy / BATCH_SAMPLES);
+        const batch = this._buffer.slice();
+        this.port.postMessage({ pcm: batch, level }, [batch.buffer]);
+        this._filled = 0;
+        this._energy = 0;
+      }
     }
-    // RMS travels with the audio so the animation never has to re-measure it.
-    this.port.postMessage({ pcm, level: Math.sqrt(sum / samples.length) }, [pcm.buffer]);
     return true;
   }
 }
@@ -634,6 +657,9 @@ registerProcessor("capture-processor", CaptureProcessor);
 // caller.
 const SAMPLE_RATE = 16000;
 
+// How far ahead of the audio clock each chunk is scheduled. See playChunk.
+const PLAYBACK_LEAD_SECONDS = 0.1;
+
 const button = document.getElementById("call");
 const label = document.getElementById("label");
 const status = document.getElementById("status");
@@ -669,8 +695,12 @@ function playChunk(bytes) {
   const source = ctx.createBufferSource();
   source.buffer = buffer;
   source.connect(ctx.destination);
-  const now = ctx.currentTime;
-  playHead = Math.max(playHead, now);
+  // Schedule a jitter buffer ahead of the clock rather than at it. Starting
+  // a chunk at exactly ctx.currentTime means any scheduling jitter lands it
+  // late, and a late chunk is an audible gap mid-word. A ~100 ms lead costs
+  // a tenth of a second of latency nobody notices and removes the most
+  // likely source of stutter.
+  playHead = Math.max(playHead, ctx.currentTime + PLAYBACK_LEAD_SECONDS);
   source.start(playHead);
   playHead += buffer.duration;
 }
@@ -692,6 +722,21 @@ async function startCall() {
   // Opening the context at the pipeline's rate means nothing resamples,
   // anywhere.
   ctx = new AudioContext({ sampleRate: SAMPLE_RATE });
+
+  // sampleRate is a HINT, not a guarantee. A browser that ignores it and
+  // hands back 48 kHz breaks everything downstream by a factor of three:
+  // Deepgram receives what sounds like nonsense, never fires end-of-turn,
+  // and the agent simply never replies. That symptom points nowhere near
+  // its cause, so fail loudly here instead of debugging silence later.
+  if (ctx.sampleRate !== SAMPLE_RATE) {
+    setState("idle", `Browser gave ${ctx.sampleRate} Hz, not ${SAMPLE_RATE} Hz. Try Chrome.`);
+    await ctx.close();
+    stream.getTracks().forEach((track) => track.stop());
+    ctx = null;
+    stream = null;
+    return;
+  }
+
   await ctx.audioWorklet.addModule("/static/capture-worklet.js");
 
   socket = new WebSocket(`ws://${location.host}/browser-stream`);
@@ -840,3 +885,11 @@ The `_run_pipeline` seam exists so Task 2's lifecycle can be tested without a re
 Self-review already caught one instance of exactly that: this plan originally used `PipelineTask`/`PipelineRunner`, which Pipecat 1.7.0 does export, but `transport/telephony.py` uses `PipelineWorker` + `WorkerRunner` (`pipecat.pipeline.worker` and `pipecat.workers.runner`). Both work; the project having two conventions for the same thing would not. Corrected to match telephony.
 
 Audio is genuinely unverified. Every test in this plan passes with silence. Sample-rate agreement, buffer sizing, and whether playback sounds continuous rather than choppy are settled only by Task 6's manual checkpoint, and one round of tuning afterwards should be expected rather than treated as failure.
+
+**Three mitigations are built in rather than left to that tuning round**, because each is cheap to do correctly the first time and expensive to diagnose from its symptom:
+
+1. **20 ms capture batching** (Task 4, worklet). Unbatched, an AudioWorklet posts every 128-frame quantum — 125 WebSocket messages a second at 16 kHz, each 256 bytes of audio wrapped in a full frame's overhead. A plausible cause of choppiness by itself.
+2. **A sample-rate assertion** (Task 4, `startCall`). `AudioContext({sampleRate})` is a hint. A browser that returns 48 kHz instead breaks everything downstream by a factor of three, and the visible symptom is that the agent never replies — which points nowhere near the cause.
+3. **A 100 ms playback lead** (Task 4, `playChunk`). Scheduling at exactly `currentTime` means any jitter lands a chunk late, and a late chunk is an audible gap mid-word.
+
+Three further mitigations were considered and deliberately left out, to be added only if the symptoms actually appear: resetting `playHead` when drift exceeds 500 ms, fades at chunk edges to kill clicks, and server-side RMS logging to distinguish "capture is broken" from "the model is quiet". Building all six up front would ship untested defensive code against problems that may never occur.
