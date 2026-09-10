@@ -280,7 +280,10 @@ async def test_claude_turn_processor_pushes_notice_and_ends_on_escalation(monkey
 
     await processor.process_frame(_transcript("I want to talk to a human"), FrameDirection.DOWNSTREAM)
 
-    notice_frames = [f for f in sink.frames if isinstance(f, TextFrame) and "handoff #42" in f.text]
+    # Matches on the customer-facing wording, not the internal handoff id —
+    # which is deliberately no longer spoken. See test_session.py's
+    # escalation-notice test for the reasoning.
+    notice_frames = [f for f in sink.frames if isinstance(f, TextFrame) and "call you back" in f.text]
     assert len(notice_frames) == 1
     assert isinstance(sink.frames[-1], EndFrame)
 

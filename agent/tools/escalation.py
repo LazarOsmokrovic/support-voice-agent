@@ -44,6 +44,7 @@ from pydantic import BaseModel
 from agent.core import DEFAULT_MODEL
 from agent.prompts import CLASSIFICATION_PROMPT, HANDOFF_PROMPT
 from agent.tools.notifications import notify_escalation
+from agent.tools.scheduling import find_available_slots
 from agent.tools.summary import format_transcript
 from data.mock_db import get_connection
 from guardrails.pii import HANDOFF_TEXT_FIELDS, redact_fields
@@ -272,6 +273,24 @@ def mark_notified(escalation_id: int, delivered: bool, notified_at: str | None =
         )
 
 
+def _next_callback_slot() -> str | None:
+    """The earliest open slot a human could call back on, or None.
+
+    Read-only: it asks the real calendar so the time offered is genuinely
+    free, but reserves nothing. Returns None rather than raising if the
+    calendar is unreachable or fully booked — an escalation must never fail
+    because scheduling did, so the caller falls back to wording that promises
+    a callback without naming a time.
+    """
+    try:
+        slots = find_available_slots()
+    except Exception:  # noqa: BLE001 — escalation must not depend on the calendar
+        logger.exception("find_available_slots raised while picking a callback time")
+        return None
+    available = slots.get("slots") or []
+    return available[0] if available else None
+
+
 async def create_handoff_packet(
     customer_id: str,
     messages: list[dict[str, Any]],
@@ -294,6 +313,20 @@ async def create_handoff_packet(
     fields = HandoffFields(**redact_fields(inferred.model_dump(), HANDOFF_TEXT_FIELDS))
     escalation_id = log_escalation(customer_id, reason, fields)
     packet = {"escalation_id": escalation_id, "reason": reason, **fields.model_dump()}
+
+    # The earliest slot a human could ring back on, so the customer hears a
+    # specific time and the human agent's notification names the SAME one.
+    # Without it the customer is told to hold for a transfer that (outside
+    # Phase 10d's Twilio path) is not going to happen.
+    #
+    # Deliberately NOT booked. Reserving a slot is irreversible and CLAUDE.md
+    # rule 6 requires an explicit confirmation turn — and escalation ends the
+    # call, so there is no turn left to confirm in. The human agent confirms
+    # the time when they actually ring. The cost is that the slot is not held,
+    # so two escalations in quick succession would offer the same one; the
+    # alternative is pausing an escalation to negotiate a booking with a
+    # customer who has just asked to stop talking to a bot.
+    packet["callback_time"] = _next_callback_slot()
 
     try:
         delivered = await notify_escalation(packet)
