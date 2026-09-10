@@ -61,6 +61,7 @@ from agent.prompts import GREETING
 from agent.session import create_session
 from agent.tools import escalation
 from agent.tools.escalation import TurnClassification
+from transport import pipecat_processors as processors
 from transport.pipecat_processors import ClaudeTurnProcessor, LatencyLogger, MicMuteGate
 
 
@@ -133,6 +134,14 @@ def _tool_use_response(name: str, tool_input: dict):
     return response
 
 
+def _all_thinking_phrases() -> set[str]:
+    """Every filler the agent might speak while the model is thinking, so a
+    test can assert "it said one of these" without pinning which."""
+    from agent.prompts import THINKING_PHRASES
+
+    return {phrase for phrases in THINKING_PHRASES.values() for phrase in phrases}
+
+
 def _calm_classification():
     return TurnClassification(intent="chitchat", sentiment="neutral", policy_restricted=False)
 
@@ -197,6 +206,10 @@ async def test_claude_turn_processor_pushes_reply_and_absorbs_the_transcript(mon
         TextFrame,
         LLMFullResponseEndFrame,
     ]
+    # No thinking filler here, deliberately: the fake client answers instantly,
+    # and Phase 10f only speaks a filler once a turn has taken longer than
+    # THINKING_FILLER_DELAY_SECONDS. Padding a fast reply with "let me check
+    # that" sounds worse than the silence it was meant to cover.
     assert sink.frames[1].text == "Happy to help!"
 
 
@@ -315,7 +328,13 @@ async def test_claude_turn_processor_drops_a_stale_reply_when_cancelled_mid_turn
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert sink.frames == []
+    # The thinking filler is spoken before run_turn is even called, so it has
+    # legitimately already left by the time the cancellation lands. What must
+    # NOT escape is the reply — stale audio arriving after a barge-in is the
+    # bug this test exists for, and that guarantee is unchanged.
+    assert all(
+        not isinstance(f, TextFrame) or f.text in _all_thinking_phrases() for f in sink.frames
+    ), "a stale reply escaped after the turn was cancelled"
 
 
 @pytest.mark.asyncio
@@ -606,3 +625,47 @@ async def test_a_raising_callback_never_breaks_the_call(monkeypatch):
     await processor.process_frame(InputDTMFFrame(button=KeypadEntry.ZERO), FrameDirection.DOWNSTREAM)
 
     assert any(isinstance(f, TextFrame) for f in sink.frames)
+
+
+@pytest.mark.asyncio
+async def test_a_slow_turn_is_covered_by_a_thinking_filler(monkeypatch):
+    """The other half of the filler design: a turn that actually takes time.
+
+    Silence is the worst thing a voice agent can do — on a phone line a
+    multi-second gap reads as a dropped call, and the caller starts saying
+    "hello? are you there?" over the reply as it arrives. So a slow turn gets
+    an acknowledgement, chosen deterministically from the caller's own words
+    so it costs no extra model round-trip.
+
+    Crucially the model call is already in flight while the filler plays:
+    pushing a TextFrame only queues it downstream, so synthesis overlaps the
+    rest of the turn rather than delaying it. This test proves the filler is
+    spoken BEFORE the reply, which is only possible if the two overlap.
+    """
+    slow = asyncio.Event()
+
+    async def _slow_run_turn(session, text):
+        await asyncio.sleep(processors.THINKING_FILLER_DELAY_SECONDS + 0.2)
+        slow.set()
+        return SimpleNamespace(
+            reply="Your order is out for delivery.",
+            notice=None,
+            warnings=[],
+            llm_latency_seconds=0.0,
+            ended=False,
+            end_reason=None,
+            escalation_packet=None,
+        )
+
+    monkeypatch.setattr(processors, "run_turn", _slow_run_turn)
+    session = create_session("CUST-1001")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    await processor.process_frame(_transcript("where is my order"), FrameDirection.DOWNSTREAM)
+
+    spoken = [f.text for f in sink.frames if isinstance(f, TextFrame)]
+    assert len(spoken) == 2, f"expected a filler then the reply, got {spoken}"
+    assert spoken[0] in _all_thinking_phrases()
+    assert spoken[1] == "Your order is out for delivery."
+    assert slow.is_set()

@@ -36,6 +36,74 @@ said anything.
 # would be rejected outright.
 GREETING = "Hi there — thanks for reaching out. How can I help you today?"
 
+
+# Spoken the instant a caller stops talking, BEFORE the model is asked
+# anything. Silence is the single worst thing a voice agent can do: on a
+# phone call a two-second gap reads as a dropped line, and the caller starts
+# saying "hello? are you there?" over the reply that is about to arrive.
+# A real person fills that gap without thinking — "sure, let me take a look".
+#
+# Chosen deterministically from the caller's own words, never by a model
+# call: the whole point is that it costs zero latency, and asking a model
+# what to say while waiting for a model would be self-defeating. Keyed on
+# what they asked about so it sounds like it followed the conversation
+# rather than a stock hold message.
+#
+# Each key rotates through its phrases so a long call does not hear the same
+# sentence five times, which is what makes filler sound robotic.
+THINKING_PHRASES: dict[str, tuple[str, ...]] = {
+    "order": (
+        "Sure, let me pull that order up.",
+        "One moment, I'll take a look at that order.",
+        "Let me check on that for you.",
+    ),
+    "refund": (
+        "Let me look into that return for you.",
+        "One moment while I check what we can do there.",
+        "Sure, let me see what the options are.",
+    ),
+    "policy": (
+        "Let me check our policy on that.",
+        "One moment, I'll look that up.",
+        "Good question — let me find that for you.",
+    ),
+    "schedule": (
+        "Let me see what times we have.",
+        "One moment while I check the calendar.",
+    ),
+    "default": (
+        "Sure, let me check that for you.",
+        "One moment.",
+        "Okay, let me look into that.",
+        "Let me see what I can find.",
+    ),
+}
+
+# Substrings that route a caller's turn to a phrase set. Deliberately crude:
+# a wrong guess costs nothing (the caller hears a slightly generic filler),
+# while anything cleverer would cost the latency this exists to hide.
+_THINKING_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("refund", ("refund", "return", "send it back", "money back", "cancel my order")),
+    ("schedule", ("appointment", "callback", "call me back", "book", "schedule")),
+    ("policy", ("policy", "how long", "can i", "am i allowed", "what happens if", "do you")),
+    ("order", ("order", "package", "delivery", "shipped", "tracking", "arrive", "where is")),
+)
+
+
+def thinking_phrase(user_text: str, counter: int = 0) -> str:
+    """A short line to speak while the model is still thinking.
+
+    `counter` should be the session's turn number so successive turns rotate
+    through the available phrases instead of repeating one.
+    """
+    lowered = user_text.lower()
+    for key, needles in _THINKING_KEYWORDS:
+        if any(needle in lowered for needle in needles):
+            options = THINKING_PHRASES[key]
+            return options[counter % len(options)]
+    options = THINKING_PHRASES["default"]
+    return options[counter % len(options)]
+
 SYSTEM_PROMPT = """\
 You are a customer support assistant for an Amazon-style online storefront. \
 Your job is to help customers with questions about their orders and account.

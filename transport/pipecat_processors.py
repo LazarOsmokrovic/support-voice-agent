@@ -30,6 +30,7 @@ which supplies the `transport` object build_pipeline() wires in.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -58,7 +59,7 @@ from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.transports.base_transport import BaseTransport
 
-from agent.prompts import GREETING
+from agent.prompts import GREETING, thinking_phrase
 from agent.session import Session, run_turn
 from agent.tools import escalation
 from observability.turn_log import TurnRecord, log_turn
@@ -68,6 +69,14 @@ from transport.tts import (
     DEFAULT_DEEPGRAM_VOICE,
     speakable,
 )
+
+
+# How long to let the model work before covering the silence. Short enough
+# that a caller never sits in dead air wondering if the line dropped, long
+# enough that a quick answer arrives unpadded — a filler in front of an
+# instant reply sounds worse than no filler at all. Roughly the pause a
+# person leaves before saying "sure, let me take a look".
+THINKING_FILLER_DELAY_SECONDS = 0.6
 
 
 EscalationHook = Callable[[dict[str, Any] | None], Awaitable[bool]]
@@ -231,21 +240,77 @@ class ClaudeTurnProcessor(FrameProcessor):
         await self.push_frame(LLMFullResponseEndFrame())
         await self.push_frame(EndFrame())
 
+    async def _speak_thinking(self, user_text: str) -> None:
+        """Acknowledge immediately, before the model has been asked anything.
+
+        Without this the caller stops talking and hears nothing at all until
+        the whole turn completes — two model round-trips plus tool calls plus
+        synthesis. On a phone line that silence reads as a dropped call, and
+        the caller starts saying "hello? are you there?" over the top of the
+        reply just as it arrives.
+
+        The phrase is chosen deterministically from the caller's own words
+        (agent/prompts.py), never by a model call — the entire point is that
+        it costs no latency, and asking a model what to say while waiting for
+        a model would defeat it. Keyed on the session's turn number so a long
+        call rotates through phrasings instead of repeating one.
+
+        Its own response bracket, separate from the reply's: the TTS service
+        keys per-turn audio-context tracking off that pair, so this can be
+        spoken and finished while run_turn is still in flight.
+        """
+        filler = thinking_phrase(user_text, self._session.turn)
+        print(f"[thinking] {filler}")
+        await self.push_frame(LLMFullResponseStartFrame())
+        await self.push_frame(TextFrame(text=filler))
+        await self.push_frame(LLMFullResponseEndFrame())
+
     async def _handle_final_transcript(self, text: str) -> None:
-        outcome = await run_turn(self._session, text)
+        # Start looking for the answer FIRST, then decide whether the caller
+        # needs covering. The filler is a mask over a slow turn, not a
+        # preamble to one: speaking it unconditionally pads a fast answer with
+        # "let me check that" it never needed, which sounds worse than the
+        # silence it was meant to fix.
+        #
+        # So the model call goes out immediately and we wait a beat. If the
+        # answer lands inside THINKING_FILLER_DELAY_SECONDS the caller just
+        # gets it, with no filler at all. If it does not, they hear the
+        # acknowledgement while the work continues underneath — pushing a
+        # TextFrame only queues it downstream, so synthesis and playback
+        # overlap the rest of the turn rather than delaying it.
+        turn = asyncio.ensure_future(run_turn(self._session, text))
+        try:
+            done, _ = await asyncio.wait({turn}, timeout=THINKING_FILLER_DELAY_SECONDS)
+            if not done:
+                await self._speak_thinking(text)
+            outcome = await turn
+        except asyncio.CancelledError:
+            # Barge-in. The pipeline cancels this coroutine mid-turn, and the
+            # in-flight model call has to go with it — otherwise it completes
+            # in the background and its reply is pushed after the caller has
+            # already moved on, which is the stale-audio bug Phase 8 fixed.
+            turn.cancel()
+            raise
         print(f"[latency] LLM turn: {outcome.llm_latency_seconds * 1000:.0f}ms")
         print(f"[reply] {len(outcome.reply)} chars: {outcome.reply!r}")
         for warning in outcome.warnings:
             print(f"({warning})")
 
         await self.push_frame(LLMFullResponseStartFrame())
-        if outcome.reply.strip():
-            # speakable() strips markdown the TTS service would otherwise
-            # pronounce: a model emphasising "**wait for delivery**" makes the
-            # customer hear "star star wait for delivery star star". The system
-            # prompt tells it not to format, but prompts are probabilistic and
-            # this failure is audible on every slip, so it is caught here too.
-            await self.push_frame(TextFrame(text=speakable(outcome.reply)))
+        # speakable() strips markdown the TTS service would otherwise
+        # pronounce: a model emphasising "**wait for delivery**" makes the
+        # customer hear "star star wait for delivery star star". The system
+        # prompt tells it not to format, but prompts are probabilistic and
+        # this failure is audible on every slip, so it is caught here too.
+        #
+        # Guard on the SPOKEN text, not the raw reply. Checking the raw one
+        # and pushing the stripped one meant a reply consisting only of
+        # markup pushed an empty TextFrame — which is exactly the "TTS
+        # context completed with no audio" its own watchdog then reports,
+        # three seconds later, after the customer has heard nothing.
+        spoken_reply = speakable(outcome.reply)
+        if spoken_reply:
+            await self.push_frame(TextFrame(text=spoken_reply))
         else:
             # Nothing to synthesize — pushing an empty TextFrame would ask
             # DeepgramTTSService to open a TTS context that produces zero
@@ -255,7 +320,12 @@ class ClaudeTurnProcessor(FrameProcessor):
             print("(model returned an empty reply this turn — nothing to speak)")
         if outcome.notice:
             print(outcome.notice)
-            await self.push_frame(TextFrame(text=outcome.notice))
+            # Leading space because the TTS service concatenates consecutive
+            # TextFrames within one response bracket. Without it the customer
+            # hears "...someone will be with you shortly.Let me get one of my
+            # colleagues..." run together as a single word, which the
+            # synthesiser reads without the pause a full stop should give it.
+            await self.push_frame(TextFrame(text=f" {outcome.notice}"))
         await self.push_frame(LLMFullResponseEndFrame())
 
         if outcome.ended:

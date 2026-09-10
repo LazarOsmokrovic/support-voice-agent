@@ -159,6 +159,20 @@ class Agent:
             }, None
 
     async def _call_api(self):
+        """One Messages API call, with the fixed prefix marked cacheable.
+
+        The system prompt and the seven tool schemas come to roughly 3,300
+        tokens and are byte-identical on every turn of every call. Without
+        cache_control the model reprocesses all of it each time, on top of a
+        conversation history that grows with the call — which is why a long
+        conversation gets steadily slower to answer, the symptom that
+        prompted this.
+
+        Marking the LAST tool caches the whole prefix before it, tools and
+        system together, since the cache breakpoint covers everything above
+        it. Cache hits are also billed at a fraction of input rate, so this
+        cuts cost as well as latency.
+        """
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": self.max_tokens,
@@ -167,7 +181,12 @@ class Agent:
         if self.system:
             kwargs["system"] = self.system
         if self.tools:
-            kwargs["tools"] = self.tools
+            # Copy before mutating: self.tools is shared module state
+            # (agent/session.py's TOOLS) and every session would otherwise
+            # accumulate cache_control markers on the same dicts.
+            tools = [dict(tool) for tool in self.tools]
+            tools[-1]["cache_control"] = {"type": "ephemeral"}
+            kwargs["tools"] = tools
         return await self.client.messages.create(**kwargs)
 
     @staticmethod
