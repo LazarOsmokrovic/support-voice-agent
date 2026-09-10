@@ -35,7 +35,7 @@ from deepgram import AsyncDeepgramClient
 from agent.core import configure_logging
 from agent.prompts import GREETING
 from agent.session import DEFAULT_CUSTOMER_ID, close_session, create_session, run_turn
-from transport.tts import TTSBackend, get_tts_backend
+from transport.tts import TTSBackend, get_tts_backend, speakable
 
 # Flux's documented model for English; matches transport/tts.py's
 # DEEPGRAM_TTS_URL sibling constants in spirit — the one place these
@@ -120,7 +120,10 @@ async def speak(text: str, backend: TTSBackend) -> float:
     latency in seconds, covering synthesis + playback.
     """
     start = time.perf_counter()
-    audio_bytes = await backend.synthesize(text)
+    # Strip markdown before synthesis — see transport/tts.py's speakable().
+    # Applied here rather than at each call site so the greeting, the reply
+    # and the escalation notice are all covered by one boundary.
+    audio_bytes = await backend.synthesize(speakable(text))
     audio, sample_rate = _decode_wav(audio_bytes)
     sd.play(audio, samplerate=sample_rate)
     await asyncio.get_running_loop().run_in_executor(None, sd.wait)

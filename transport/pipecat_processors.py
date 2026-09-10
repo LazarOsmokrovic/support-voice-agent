@@ -66,6 +66,7 @@ from transport.tts import (
     DEFAULT_CARTESIA_MODEL,
     DEFAULT_CARTESIA_VOICE,
     DEFAULT_DEEPGRAM_VOICE,
+    speakable,
 )
 
 
@@ -239,7 +240,12 @@ class ClaudeTurnProcessor(FrameProcessor):
 
         await self.push_frame(LLMFullResponseStartFrame())
         if outcome.reply.strip():
-            await self.push_frame(TextFrame(text=outcome.reply))
+            # speakable() strips markdown the TTS service would otherwise
+            # pronounce: a model emphasising "**wait for delivery**" makes the
+            # customer hear "star star wait for delivery star star". The system
+            # prompt tells it not to format, but prompts are probabilistic and
+            # this failure is audible on every slip, so it is caught here too.
+            await self.push_frame(TextFrame(text=speakable(outcome.reply)))
         else:
             # Nothing to synthesize — pushing an empty TextFrame would ask
             # DeepgramTTSService to open a TTS context that produces zero
