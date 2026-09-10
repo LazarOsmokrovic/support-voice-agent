@@ -51,6 +51,14 @@ SAMPLE_RATE = 16000
 
 _STATIC = Path(__file__).resolve().parent.parent / "static"
 
+# Sent as a TEXT frame, which is why the browser distinguishes text from
+# binary in its onmessage: audio is binary, and anything textual is the
+# server explaining why this call cannot happen.
+MISSING_DEEPGRAM_KEY = (
+    "DEEPGRAM_API_KEY is not set on the server, so speech cannot be "
+    "transcribed. Add it to .env and restart the browser console."
+)
+
 app = FastAPI()
 # static/ now ships real files (index.html, app.js, style.css, the capture
 # worklet), so the mount is held to the normal StaticFiles default: raise at
@@ -94,17 +102,22 @@ async def run_call(websocket: WebSocket) -> Session:
     to lose the ticket.
     """
     session = create_session(DEFAULT_CUSTOMER_ID, transport="browser")
-    transport = FastAPIWebsocketTransport(
-        websocket,
-        params=FastAPIWebsocketParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            audio_in_sample_rate=SAMPLE_RATE,
-            audio_out_sample_rate=SAMPLE_RATE,
-            serializer=PCMFrameSerializer(),
-        ),
-    )
     try:
+        # Inside the try, not before it. Constructing the transport can fail
+        # (a bad param, a socket that died between accept() and here), and a
+        # failure between create_session() and the try would leak the session
+        # with no summary ever written — the one thing this function exists to
+        # guarantee.
+        transport = FastAPIWebsocketTransport(
+            websocket,
+            params=FastAPIWebsocketParams(
+                audio_in_enabled=True,
+                audio_out_enabled=True,
+                audio_in_sample_rate=SAMPLE_RATE,
+                audio_out_sample_rate=SAMPLE_RATE,
+                serializer=PCMFrameSerializer(),
+            ),
+        )
         await _run_pipeline(build_pipeline(transport, session))
     except Exception as exc:  # noqa: BLE001 — a dropped socket is normal, not exceptional
         print(f"(call ended: {exc})")
@@ -124,6 +137,18 @@ async def run_call(websocket: WebSocket) -> Session:
 @app.websocket("/browser-stream")
 async def browser_stream(websocket: WebSocket) -> None:
     await websocket.accept()
+
+    # Pre-flight, before a session is ever created. Without a Deepgram key
+    # build_pipeline() constructs an STT service that dies on the first audio
+    # frame; run_call() swallows that (a dropped socket is normal), the socket
+    # closes, and the page flashes in-call -> ending -> idle with nothing in
+    # the status line. That is exactly the dead-looking button the spec names
+    # as the worst outcome for a demo, so say what is wrong instead.
+    if not os.getenv("DEEPGRAM_API_KEY"):
+        await websocket.send_text(MISSING_DEEPGRAM_KEY)
+        await websocket.close()
+        return
+
     await run_call(websocket)
 
 

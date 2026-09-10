@@ -1426,6 +1426,15 @@ Twilio credentials and no `PUBLIC_HOSTNAME` are needed — only
 transport. Press the circle to talk, press it again to hang up, press it a
 third time to start over.
 
+If `DEEPGRAM_API_KEY` is missing the page says so and the button returns to
+idle, rather than opening a socket that dies on the first audio frame. That
+distinction matters more than it sounds: without the pre-flight check the
+browser flashes through `in-call` and back to `idle` with an empty status
+line, which is exactly the dead-looking button this phase's design named as
+the worst possible outcome — a demo that appears broken with no clue why.
+The same applies to a denied microphone permission, and to a browser that
+hands back a sample rate other than 16 kHz.
+
 ### The fourth transport, same `build_pipeline`
 
 `transport/browser.py` is the fourth transport to sit behind the unchanged
