@@ -163,8 +163,7 @@ _NEEDS_ORDER_ID = frozenset({"order", "refund"})
 # explanation, not a lookup. These frequently contain a topic keyword, which is
 # why this is checked before _THINKING_KEYWORDS: a question about an order ID
 # is not a request to fetch an order.
-_NO_LOOKUP_PHRASES: tuple[str, ...] = (
-    # stalling
+_STALLING_PHRASES: tuple[str, ...] = (
     "give me a moment",
     "give me a second",
     "give me a sec",
@@ -173,6 +172,9 @@ _NO_LOOKUP_PHRASES: tuple[str, ...] = (
     "just a sec",
     "one moment",
     "one second",
+    "one sec",
+    "a moment",
+    "a second",
     "hold on",
     "hang on",
     "bear with me",
@@ -181,12 +183,27 @@ _NO_LOOKUP_PHRASES: tuple[str, ...] = (
     "let me look",
     "let me see",
     "let me get",
-    "i'm looking",
-    "im looking",
-    "i am looking",
-    "looking for it",
-    "wait a moment",
-    "wait a second",
+    # Bare "looking" on purpose, so every way of saying it is covered without
+    # guessing at the phrasing: "I'm looking", "I'm STILL looking", "still
+    # looking for it", "I was looking". A real request almost never contains
+    # the word, and the one that does — "I'm looking for my order" — needs an
+    # ID before anything can happen, so it is suppressed either way.
+    "looking",
+    "look for",
+    "can't find",
+    "cant find",
+    "cannot find",
+    "not finding",
+    "almost",
+    "nearly",
+    "be quick",
+    "be right there",
+    "won't be long",
+    "wont be long",
+    "wait",
+)
+
+_NO_LOOKUP_PHRASES: tuple[str, ...] = _STALLING_PHRASES + (
     # clarifying
     "what do you mean",
     "can you repeat",
@@ -218,8 +235,51 @@ def _turn_supplies_an_order_id(words: list[str]) -> bool:
     return numeric >= _ID_DIGIT_RUN
 
 
+def stalling_continues(user_text: str, currently_stalling: bool) -> bool:
+    """Is the caller still hunting for their order number?
+
+    Looking for something takes as long as it takes, and people narrate it the
+    whole way: "hold on", then "sorry, I'm still looking", then "I just can't
+    find it", then "one sec, nearly there". Matching phrases catches the first
+    of those and misses the rest — there is no list that covers how people
+    actually talk.
+
+    So it is a STATE rather than a per-turn test. Once the caller starts
+    hunting they are treated as hunting until something ends it, and only two
+    things do: they read out a number, or they drop the search and ask about
+    something else entirely. Everything in between is more hunting, however
+    they phrase it.
+
+    Deliberately biased toward staying in the state. Being wrong in that
+    direction costs a fraction of a second of silence; being wrong the other
+    way is the agent announcing "let me look into that" at someone who has not
+    given it anything to look at.
+    """
+    lowered = user_text.lower()
+    words = [word.strip(".,!?;:'\"") for word in lowered.split()]
+
+    # The number arrived. The search is over regardless of anything else said.
+    if _turn_supplies_an_order_id(words):
+        return False
+
+    if any(phrase in lowered for phrase in _STALLING_PHRASES):
+        return True
+
+    if not currently_stalling:
+        return False
+
+    # Already hunting. Only a genuine change of subject ends it — asking about
+    # a policy, or scheduling, means they have given up on finding the number
+    # for now. Order and refund keywords do NOT count: "it's not in my order
+    # emails" is still someone looking for an order number.
+    for key, needles in _THINKING_KEYWORDS:
+        if key not in _NEEDS_ORDER_ID and any(needle in lowered for needle in needles):
+            return False
+    return True
+
+
 def thinking_phrase(
-    user_text: str, counter: int = 0, order_id_known: bool = False
+    user_text: str, counter: int = 0, order_id_known: bool = False, stalling: bool = False
 ) -> str | None:
     """A short line to speak while the model is still thinking, or None when
     the turn does not warrant one.
@@ -259,6 +319,13 @@ def thinking_phrase(
     # "sorry, what does the order number look like" is a question ABOUT an
     # order, not a request to fetch one.
     if any(phrase in lowered for phrase in _NO_LOOKUP_PHRASES):
+        return None
+
+    # The caller was already hunting for their number on an earlier turn and
+    # has not produced it yet, so whatever they just said is more of the same
+    # however it is phrased. See stalling_continues for why this is a state
+    # and not a phrase match.
+    if stalling and not _turn_supplies_an_order_id(words):
         return None
 
     substantive = [word for word in words if word and word not in _PLEASANTRY_TOKENS]
@@ -351,6 +418,14 @@ check", "I'm looking for it". Say something brief and warm and then STOP — \
 "Of course, take your time." Do not repeat the question, do not explain the \
 format, do not say you are checking anything, and do not call a tool. They \
 have not given you anything to check yet. Wait for the number.
+
+  People often stay in case 2 for several turns — "sorry, still looking", "I \
+can't find it", "one sec, nearly there". Keep waiting, and keep it SHORT and \
+different each time: "no rush", "take your time", "I'm here". Never repeat \
+the same sentence back at them, and never start pressing. If they sound \
+stuck after a few turns, offer a way out once — you can look it up from the \
+email confirmation, or they can tell you roughly when they ordered and what \
+it was — but only offer, and only once.
   3. A question back at you: "sorry, what's the order number?", "what does \
 it look like?", "where do I find it?". Answer THAT question — explain where \
 to find it or what it looks like — and ask again once, gently.

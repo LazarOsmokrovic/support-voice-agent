@@ -61,7 +61,7 @@ from pipecat.services.deepgram.flux.stt import DeepgramFluxSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.transports.base_transport import BaseTransport
 
-from agent.prompts import GREETING, thinking_phrase
+from agent.prompts import GREETING, stalling_continues, thinking_phrase
 from agent.session import Session, run_turn
 from agent.tools import escalation
 from observability.turn_log import TurnRecord, log_turn
@@ -149,6 +149,12 @@ class ClaudeTurnProcessor(FrameProcessor):
         # was never heard — its reply was pushed into a pipeline that had
         # already begun shutting down.
         self._ended = False
+        # True while the caller is hunting for their order number. Hunting
+        # takes as long as it takes and gets narrated the whole way — "hold
+        # on", "sorry, still looking", "I just can't find it" — so this is a
+        # state that persists until a number arrives, not a per-turn phrase
+        # match. See agent/prompts.py's stalling_continues.
+        self._stalling = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -320,7 +326,12 @@ class ClaudeTurnProcessor(FrameProcessor):
         # so the transcript is where it actually lives, and scanning it
         # cannot drift out of sync with reality the way a flag could.
         order_id_known = bool(_ORDER_ID_IN_TEXT.search(str(self._session.agent.messages)))
-        filler = thinking_phrase(user_text, self._session.turn, order_id_known=order_id_known)
+        filler = thinking_phrase(
+            user_text,
+            self._session.turn,
+            order_id_known=order_id_known,
+            stalling=self._stalling,
+        )
         if filler is None:
             # A purely social turn — a greeting, a thank-you, a goodbye, a bare
             # confirmation. Nothing is being looked up, so "let me check that"
@@ -335,6 +346,12 @@ class ClaudeTurnProcessor(FrameProcessor):
         await self.push_frame(LLMFullResponseEndFrame())
 
     async def _handle_final_transcript(self, text: str) -> None:
+        # Updated before the filler is chosen, so a turn that STARTS a search
+        # ("hold on, let me find it") is already covered by the same rule that
+        # covers every turn after it. The state ends when a number arrives or
+        # the caller changes the subject.
+        self._stalling = stalling_continues(text, self._stalling)
+
         # Start looking for the answer FIRST, then decide whether the caller
         # needs covering. The filler is a mask over a slow turn, not a
         # preamble to one: speaking it unconditionally pads a fast answer with

@@ -58,7 +58,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from agent.prompts import GREETING, thinking_phrase
+from agent.prompts import GREETING, stalling_continues, thinking_phrase
 from agent.session import create_session
 from agent.tools import escalation
 from agent.tools.escalation import TurnClassification
@@ -970,3 +970,67 @@ def test_stalling_and_clarifying_turns_never_get_a_filler():
     assert thinking_phrase("where is my kindle order", 2, order_id_known=True) is not None
     assert thinking_phrase("how long do I have to return something", 2) is not None
     assert thinking_phrase("I need to book a callback", 2) is not None
+
+
+@pytest.mark.asyncio
+async def test_stalling_survives_a_caller_who_keeps_narrating_the_search(monkeypatch):
+    """Looking for an order number takes as long as it takes, and people talk
+    the whole way through it: "hold on", then "sorry, I'm still looking", then
+    "I just can't find it", then "one sec, I'll be quick".
+
+    Matching phrases catches the first of those and misses the rest, so the
+    agent stays quiet once and then announces "let me look into that" at
+    someone who still has not given it anything. The state has to persist
+    until the number actually arrives.
+
+    Every turn here is deliberately slow, so a filler would fire on each one.
+    """
+    async def _slow_run_turn(session, text):
+        await asyncio.sleep(processors.THINKING_FILLER_DELAY_SECONDS + 0.15)
+        return SimpleNamespace(
+            reply="No rush.",
+            notice=None,
+            warnings=[],
+            llm_latency_seconds=0.0,
+            ended=False,
+            end_reason=None,
+            escalation_packet=None,
+        )
+
+    monkeypatch.setattr(processors, "run_turn", _slow_run_turn)
+    session = create_session("CUST-1001")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    hunt = [
+        "hold on a second",
+        "I'm sorry, I'm still looking",
+        "I just can't find it",
+        "one more second, I'll be quick",
+        "it's not in my emails",
+    ]
+    for line in hunt:
+        await processor.process_frame(_transcript(line), FrameDirection.DOWNSTREAM)
+
+    spoken = [f.text for f in sink.frames if isinstance(f, TextFrame)]
+    assert spoken == ["No rush."] * len(hunt), (
+        f"no filler may be spoken while the caller is still hunting: {spoken}"
+    )
+    assert processor._stalling is True
+
+
+def test_the_search_ends_when_the_number_arrives_or_the_subject_changes():
+    """Two exits, and only two. Everything else is more hunting."""
+    state = stalling_continues("hold on, let me find it", False)
+    assert state is True
+
+    spoken_id = "one one three nine two eight four seven five six one zero two nine three eight four"
+    assert stalling_continues(spoken_id, True) is False, "reading the number out ends the search"
+
+    assert stalling_continues("actually, what's your return policy?", True) is False, (
+        "changing the subject ends the search"
+    )
+
+    assert stalling_continues("it's not in my order emails", True) is True, (
+        "an order keyword mid-hunt is still hunting, not a new request"
+    )
