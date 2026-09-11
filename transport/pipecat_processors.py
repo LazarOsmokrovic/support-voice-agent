@@ -42,6 +42,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     EndFrame,
+    EndWorkerFrame,
     Frame,
     InputDTMFFrame,
     LLMFullResponseEndFrame,
@@ -281,7 +282,14 @@ class ClaudeTurnProcessor(FrameProcessor):
         flag covers the gap that politeness buys.
         """
         self._ended = True
-        await self.push_frame(EndFrame())
+        # EndWorkerFrame, NOT EndFrame. Pushing a bare EndFrame downstream from
+        # inside a processor drains the queued audio but never reaches the
+        # worker that owns the pipeline, so the call went silent and then sat
+        # there until Pipecat's 2-minute idle timeout cancelled it — the caller
+        # got a dead line instead of a hang-up. EndWorkerFrame travels down,
+        # flushing everything queued ahead of it, and the worker turns it into
+        # the real EndFrame that actually stops the run.
+        await self.push_frame(EndWorkerFrame())
 
     async def _speak_thinking(self, user_text: str) -> None:
         """Acknowledge immediately, before the model has been asked anything.

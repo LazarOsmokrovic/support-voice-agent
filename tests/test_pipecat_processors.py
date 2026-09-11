@@ -44,6 +44,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     EndFrame,
+    EndWorkerFrame,
     Frame,
     InputDTMFFrame,
     LLMFullResponseEndFrame,
@@ -264,7 +265,7 @@ async def test_claude_turn_processor_pushes_end_frame_when_model_ends_conversati
 
     await processor.process_frame(_transcript("Thanks, that's all!"), FrameDirection.DOWNSTREAM)
 
-    assert isinstance(sink.frames[-1], EndFrame)
+    assert isinstance(sink.frames[-1], EndWorkerFrame)
     assert any(isinstance(f, TextFrame) and f.text == "Take care!" for f in sink.frames)
 
 
@@ -298,7 +299,7 @@ async def test_claude_turn_processor_pushes_notice_and_ends_on_escalation(monkey
     # escalation-notice test for the reasoning.
     notice_frames = [f for f in sink.frames if isinstance(f, TextFrame) and "call you back" in f.text]
     assert len(notice_frames) == 1
-    assert isinstance(sink.frames[-1], EndFrame)
+    assert isinstance(sink.frames[-1], EndWorkerFrame)
 
 
 @pytest.mark.asyncio
@@ -361,7 +362,12 @@ async def test_claude_turn_processor_escalates_on_dtmf_zero_independent_of_the_m
     await processor.process_frame(InputDTMFFrame(KeypadEntry.ZERO), FrameDirection.DOWNSTREAM)
 
     fake_client.messages.create.assert_not_called()
-    assert [type(f) for f in sink.frames] == [LLMFullResponseStartFrame, TextFrame, LLMFullResponseEndFrame, EndFrame]
+    assert [type(f) for f in sink.frames] == [
+        LLMFullResponseStartFrame,
+        TextFrame,
+        LLMFullResponseEndFrame,
+        EndWorkerFrame,
+    ]
     assert "handoff #7" in sink.frames[1].text
 
 
@@ -394,7 +400,7 @@ async def test_claude_turn_processor_dtmf_escalation_survives_a_handoff_packet_f
 
     await processor.process_frame(InputDTMFFrame(KeypadEntry.ZERO), FrameDirection.DOWNSTREAM)
 
-    assert isinstance(sink.frames[-1], EndFrame)
+    assert isinstance(sink.frames[-1], EndWorkerFrame)
     assert any(isinstance(f, TextFrame) and "human agent" in f.text for f in sink.frames)
 
 
@@ -884,7 +890,9 @@ async def test_ending_the_call_still_lets_shutdown_frames_through(monkeypatch):
     sink = await _started(processor)
 
     await processor.process_frame(_transcript("bye"), FrameDirection.DOWNSTREAM)
-    assert any(isinstance(f, EndFrame) for f in sink.frames), "the call must actually end"
+    assert any(isinstance(f, EndWorkerFrame) for f in sink.frames), (
+        "the call must actually end — a bare EndFrame drains audio but never stops the worker"
+    )
 
     before = len(sink.frames)
     await processor.process_frame(TextFrame(text="downstream traffic"), FrameDirection.DOWNSTREAM)

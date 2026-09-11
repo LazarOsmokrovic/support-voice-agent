@@ -1,3 +1,4 @@
+<!-- /autoplan restore point: /Users/lazarosmokrovic/.gstack/projects/LazarOsmokrovic-support-voice-agent/main-autoplan-restore-20260911-111549.md -->
 # Phase 12 — Escalation as a Resolvable Process Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
