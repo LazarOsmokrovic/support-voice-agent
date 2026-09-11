@@ -413,3 +413,24 @@ def test_the_classifier_is_told_that_cancelling_is_not_a_complaint():
     assert "service" in prompt, (
         "sentiment must be scoped to how they feel about the SERVICE, not raw tone"
     )
+
+
+def test_the_prompt_tells_the_agent_what_to_do_when_no_id_arrives():
+    """Live: the agent asked for an order number, the caller said "give me a
+    moment to check, please", and the agent replied as though a lookup had
+    started.
+
+    agent/prompts.py's thinking_phrase already suppresses the spoken filler
+    for that turn, but the filler is only the first half — the MODEL's own
+    reply has to handle it too, and nothing in the prompt told it how. Both
+    halves are needed: one stops the wrong thing being said before the model
+    answers, the other stops the model answering wrongly.
+    """
+    from agent.prompts import SYSTEM_PROMPT
+
+    prompt = SYSTEM_PROMPT.lower()
+    assert "take your time" in prompt, "the stalling case needs a concrete reply to give"
+    assert "still looking for it" in prompt or "looking for it" in prompt
+    assert "do not call a tool" in prompt, (
+        "a caller who has not given a number yet must not trigger a lookup"
+    )
