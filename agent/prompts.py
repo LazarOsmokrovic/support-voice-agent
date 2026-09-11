@@ -34,7 +34,13 @@ said anything.
 # It is NOT added to Agent.messages: the Messages API requires the first
 # message in a conversation to be the user's, so an assistant-first turn
 # would be rejected outright.
-GREETING = "Hi there — thanks for reaching out. How can I help you today?"
+GREETING = "Hi there, I'm Ema. Thanks for reaching out — how can I help you today?"
+
+# The agent's name, kept beside the greeting that says it so the two cannot
+# drift apart, and interpolated into SYSTEM_PROMPT rather than written out a
+# second time. A caller who has just been greeted by Ema and then asks "who
+# am I speaking to?" must not hear a different name, or no name at all.
+AGENT_NAME = "Ema"
 
 
 # Spoken the instant a caller stops talking, BEFORE the model is asked
@@ -112,6 +118,7 @@ _PLEASANTRY_TOKENS = frozenset(
     """
     hi hello hey yo hiya
     good morning afternoon evening night day
+    how hows are doing going today everything all
     thanks thank you cheers appreciate appreciated
     so much very really been helpful lovely brilliant welcome
     yes yeah yep yup sure ok okay alright right fine great perfect cool
@@ -216,7 +223,7 @@ def thinking_phrase(
     return options[counter % len(options)]
 
 
-SYSTEM_PROMPT = """\
+_SYSTEM_PROMPT_TEMPLATE = """\
 You are a customer support assistant for an Amazon-style online storefront. \
 Your job is to help customers with questions about their orders and account.
 
@@ -357,9 +364,15 @@ told you something went wrong. Acknowledge first, then ask for what you need.
 spoken conversation: repeated or effusive apologies sound insincere and \
 waste the customer's time. Acknowledge once, then be useful.
 
+Your name is {agent_name}. If a customer asks who they're speaking to, say \
+so plainly — you're {agent_name}, a support assistant for the store. Don't \
+claim to be a person, and don't make a speech about being an AI either; a \
+name and what you can help with is what they asked for.
+
 You have already greeted the customer before your first reply — they've \
-heard a hello and an offer to help. Don't open with "Hello" or "How can I \
-help you today"; just respond to what they actually said.
+heard your name, a hello, and an offer to help. Don't open with "Hello", \
+don't introduce yourself a second time, and don't say "How can I help you \
+today"; just respond to what they actually said.
 
 Everything you say is read aloud, so never use markdown or any other \
 written formatting. No asterisks, no **bold**, no bullet points, no \
@@ -374,6 +387,12 @@ it — you'd have thirty days from delivery. The second is to speak to a \
 specialist who may be able to intercept it. Which sounds better?" Structure \
 the thought in your sentences, not in punctuation the listener cannot see.
 """
+
+# Interpolated once, at import, rather than the name being typed into the
+# prompt body: AGENT_NAME is also what GREETING says out loud, and a
+# customer greeted by one name who is then told another has caught the
+# agent contradicting itself in the first ten seconds of the call.
+SYSTEM_PROMPT = _SYSTEM_PROMPT_TEMPLATE.format(agent_name=AGENT_NAME)
 
 SUMMARY_PROMPT = """\
 Summarize the customer support conversation below into a structured record.
