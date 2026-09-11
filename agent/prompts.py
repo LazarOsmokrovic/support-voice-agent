@@ -416,8 +416,18 @@ Classify the customer's most recent message in this support conversation.
 - intent: the best single category for what the customer is trying to do \
 in their latest message — one of: "order_status", "policy_question", \
 "refund_or_return", "complaint", "request_human", "chitchat", "other".
-- sentiment: the customer's tone in their latest message specifically (not \
-the conversation as a whole) — "positive", "neutral", or "negative".
+- sentiment: how the customer feels about the SERVICE they are getting, in \
+their latest message specifically (not the conversation as a whole) — \
+"positive", "neutral", or "negative". "negative" means dissatisfaction with \
+us: frustration at not being understood, anger at a policy or an outcome, \
+having to repeat themselves, or saying this is a waste of their time. A \
+message is NOT negative merely because the customer wants to cancel, return, \
+refuse, or send something back, or because they are unhappy with a product. \
+Wanting to undo a purchase is an ordinary transactional request — someone can \
+ask to cancel an order perfectly cheerfully, and "I don't want it anymore, I \
+want to cancel" is a neutral instruction, not a complaint. Judge how they \
+feel about the help they are receiving, not about the thing they are asking \
+to change.
 - policy_restricted: true if the latest message raises any of the \
 following, regardless of tone — a legal threat or mention of a \
 lawsuit/attorney, a safety or self-harm concern, an allegation of fraud or \

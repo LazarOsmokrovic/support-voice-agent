@@ -384,3 +384,32 @@ async def test_create_handoff_packet_redacts_pii_in_packet_and_db(tmp_path, monk
 # Everything above stays: EscalationTracker's triggers, log_escalation and
 # create_handoff_packet's redaction are deterministic and model-free, which
 # makes them faster and more precise than any scenario could be.
+
+
+def test_the_classifier_is_told_that_cancelling_is_not_a_complaint():
+    """From a live call: the customer said "I changed my mind, I don't want it
+    anymore, I want to cancel" and then "I can't accept it, so I want to
+    cancel". Both turns were scored negative, two in a row tripped
+    NEGATIVE_SENTIMENT_ESCALATION_THRESHOLD, and the call ended on an
+    escalation — while the agent was answering both turns correctly.
+
+    The bug was in what the prompt asked for. It asked for the customer's
+    TONE, but the answer is used as "this customer is frustrated with US and
+    needs a human". Those are different questions: wanting to undo a purchase
+    is an ordinary transactional request, and someone can ask to cancel an
+    order perfectly cheerfully.
+
+    Asserted on the prompt text rather than on a classification, because
+    classify_turn needs an API call and the whole suite runs offline. The real
+    verification is a live call that cancels an order without escalating.
+    """
+    from agent.prompts import CLASSIFICATION_PROMPT
+
+    prompt = CLASSIFICATION_PROMPT.lower()
+    assert "cancel" in prompt, "the prompt must address cancellation explicitly"
+    assert "not negative" in prompt or "is not negative" in prompt, (
+        "the prompt must say outright that wanting to cancel is not negative sentiment"
+    )
+    assert "service" in prompt, (
+        "sentiment must be scoped to how they feel about the SERVICE, not raw tone"
+    )
