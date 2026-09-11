@@ -150,6 +150,58 @@ _AFFIRMATIONS = frozenset(
 # honest.
 _NEEDS_ORDER_ID = frozenset({"order", "refund"})
 
+# Turns where the caller is not making a request at all, so there is nothing to
+# "check". Two kinds, and both were heard live.
+#
+# STALLING — the caller is asking the agent to hold on while THEY find
+# something. The correct reply is "of course, take your time"; a filler answers
+# a question they did not ask, and then the real reply agrees with them, so the
+# agent says two contradictory things in a row.
+#
+# CLARIFYING — the caller is asking about what the agent just asked THEM for
+# ("sorry, what's the order number?", "what does it look like?"). They need an
+# explanation, not a lookup. These frequently contain a topic keyword, which is
+# why this is checked before _THINKING_KEYWORDS: a question about an order ID
+# is not a request to fetch an order.
+_NO_LOOKUP_PHRASES: tuple[str, ...] = (
+    # stalling
+    "give me a moment",
+    "give me a second",
+    "give me a sec",
+    "just a moment",
+    "just a second",
+    "just a sec",
+    "one moment",
+    "one second",
+    "hold on",
+    "hang on",
+    "bear with me",
+    "let me check",
+    "let me find",
+    "let me look",
+    "let me see",
+    "let me get",
+    "i'm looking",
+    "im looking",
+    "i am looking",
+    "looking for it",
+    "wait a moment",
+    "wait a second",
+    # clarifying
+    "what do you mean",
+    "can you repeat",
+    "could you repeat",
+    "say that again",
+    "come again",
+    "what does it look like",
+    "what does the",
+    "where do i find",
+    "how does it look",
+    "what format",
+    "sorry what",
+    "sorry, what",
+)
+
 # Spoken digits arrive as words, not numerals — Deepgram transcribes "one one
 # three" and the MODEL assembles the ID, so a numeric regex on the transcript
 # finds nothing. A run of number-words is the available signal that a caller
@@ -193,6 +245,20 @@ def thinking_phrase(
     # commits. Checked first, so a keyword later in the sentence cannot
     # override it.
     if words and words[0] in _AFFIRMATIONS:
+        return None
+
+    # The caller is not asking for anything yet — they are either asking US to
+    # wait while THEY look, or asking what it is we just asked them for.
+    # Either way there is nothing to look up, and "let me look into that" is a
+    # reply to a request that was never made. Noticed live: the agent asked for
+    # an order number, the caller said "give me a moment to check, please", and
+    # the agent answered "okay, let me look into that" and then "of course,
+    # take your time" — talking past them and then agreeing with them.
+    #
+    # Checked before the topic keywords, because these turns often contain one:
+    # "sorry, what does the order number look like" is a question ABOUT an
+    # order, not a request to fetch one.
+    if any(phrase in lowered for phrase in _NO_LOOKUP_PHRASES):
         return None
 
     substantive = [word for word in words if word and word not in _PLEASANTRY_TOKENS]

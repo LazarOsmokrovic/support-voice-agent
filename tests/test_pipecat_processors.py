@@ -58,7 +58,7 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from agent.prompts import GREETING
+from agent.prompts import GREETING, thinking_phrase
 from agent.session import create_session
 from agent.tools import escalation
 from agent.tools.escalation import TurnClassification
@@ -898,3 +898,75 @@ async def test_ending_the_call_still_lets_shutdown_frames_through(monkeypatch):
     await processor.process_frame(TextFrame(text="downstream traffic"), FrameDirection.DOWNSTREAM)
 
     assert len(sink.frames) == before + 1, "unrelated frames must still pass through after the end"
+
+
+@pytest.mark.asyncio
+async def test_a_caller_asking_us_to_wait_gets_no_filler(monkeypatch):
+    """Live: the agent asked for an order number, the caller said "give me a
+    moment to check, please", and the agent replied "okay, let me look into
+    that" — then, a beat later, "of course, take your time".
+
+    Two contradictory sentences in a row, because the filler answered a
+    request that was never made. The caller is asking US to hold on; there is
+    nothing to look up.
+
+    Driven through a deliberately slow turn, so a filler WOULD fire if the
+    turn were treated as a request.
+    """
+    async def _slow_run_turn(session, text):
+        await asyncio.sleep(processors.THINKING_FILLER_DELAY_SECONDS + 0.2)
+        return SimpleNamespace(
+            reply="Of course, take your time.",
+            notice=None,
+            warnings=[],
+            llm_latency_seconds=0.0,
+            ended=False,
+            end_reason=None,
+            escalation_packet=None,
+        )
+
+    monkeypatch.setattr(processors, "run_turn", _slow_run_turn)
+    session = create_session("CUST-1001")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    await processor.process_frame(
+        _transcript("Give me a moment to check, please."), FrameDirection.DOWNSTREAM
+    )
+
+    spoken = [f.text for f in sink.frames if isinstance(f, TextFrame)]
+    assert spoken == ["Of course, take your time."], (
+        f"asking the agent to wait must not be answered with a lookup filler: {spoken}"
+    )
+
+
+def test_stalling_and_clarifying_turns_never_get_a_filler():
+    """The two shapes, checked directly rather than through the pipeline.
+
+    Clarifying turns matter most: they usually CONTAIN a topic keyword
+    ("sorry, what does the order number look like?"), so without an explicit
+    check they route to the order phrases and get "let me pull that order up"
+    — for a caller who is asking what an order number even is.
+    """
+    stalling = [
+        "Give me a moment to check, please.",
+        "hold on a second",
+        "let me find it",
+        "I am looking for it",
+        "just a sec",
+        "bear with me",
+    ]
+    clarifying = [
+        "sorry what is the ID number",
+        "what does the order id look like",
+        "what do you mean",
+        "sorry, can you repeat that",
+        "where do I find the order number",
+    ]
+    for text in stalling + clarifying:
+        assert thinking_phrase(text, 2) is None, f"{text!r} should get no filler"
+
+    # And the guard must not swallow real requests that merely share words.
+    assert thinking_phrase("where is my kindle order", 2, order_id_known=True) is not None
+    assert thinking_phrase("how long do I have to return something", 2) is not None
+    assert thinking_phrase("I need to book a callback", 2) is not None
