@@ -42,6 +42,34 @@ GREETING = "Hi there, I'm Ema. Thanks for reaching out — how can I help you to
 # am I speaking to?" must not hear a different name, or no name at all.
 AGENT_NAME = "Ema"
 
+# The last thing a caller hears, used ONLY when the model ends the call
+# without saying anything itself.
+#
+# Live: the caller said "great, that works for me, thank you so much", and the
+# model returned end_conversation with an empty text block. Nothing to speak,
+# so the line simply went dead — the conversation went well and then hung up
+# on them, which is the one moment a support call cannot afford to fumble.
+#
+# A farewell is as predictable as a greeting, so it gets the same treatment as
+# GREETING above (CLAUDE.md rule 7): a constant, not a thing the model has to
+# remember. The prompt still asks for a real closing line, and when it gives
+# one that is what plays — this is the floor, not the plan.
+#
+# Several of them, rotated, for the same reason THINKING_PHRASES rotates: the
+# one thing worse than a canned goodbye is the SAME canned goodbye, which is
+# how a caller who rings twice learns they are talking to a script.
+FAREWELLS: tuple[str, ...] = (
+    "Thanks for calling, and take care.",
+    "Glad I could help — have a good one.",
+    "Happy to help. Take care now.",
+    "Thanks for your time today. Bye for now.",
+)
+
+
+def farewell(counter: int = 0) -> str:
+    """A closing line, varied across calls. See FAREWELLS."""
+    return FAREWELLS[counter % len(FAREWELLS)]
+
 
 # Spoken the instant a caller stops talking, BEFORE the model is asked
 # anything. Silence is the single worst thing a voice agent can do: on a

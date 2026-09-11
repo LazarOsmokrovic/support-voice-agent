@@ -28,7 +28,7 @@ from typing import Any
 
 from agent.confirmation import PendingActionGate
 from agent.core import Agent
-from agent.prompts import SYSTEM_PROMPT
+from agent.prompts import SYSTEM_PROMPT, farewell
 from agent.tools import escalation, orders, policy_rag, refunds, scheduling, summary
 from agent.tools.summary import SessionSummary
 from guardrails.injection import sanitize_user_text
@@ -399,8 +399,23 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
             warnings=warnings,
         )
     elif should_end_session(result.tool_calls):
+        # A call must never end in silence. The model sometimes calls
+        # end_conversation with an empty text block — a tool call and nothing
+        # to say — and on a voice line that is a conversation that went well
+        # and then simply went dead. Done here rather than in a transport so
+        # every I/O layer gets it, and because run_turn is the one place that
+        # knows the call is ending.
+        # Keyed on the session id rather than the turn number: a call ends
+        # exactly once, so a turn-based key would hand every short call the
+        # same sign-off. The id is random per call, so two calls in a row
+        # sound different, while one call always ends the same way however
+        # many times this is evaluated.
         outcome = TurnOutcome(
-            reply=reply, ended=True, end_reason="model_ended", llm_latency_seconds=llm_latency, warnings=warnings
+            reply=reply if reply.strip() else farewell(int(session.session_id[:8], 16)),
+            ended=True,
+            end_reason="model_ended",
+            llm_latency_seconds=llm_latency,
+            warnings=warnings,
         )
     else:
         outcome = TurnOutcome(reply=reply, llm_latency_seconds=llm_latency, warnings=warnings)

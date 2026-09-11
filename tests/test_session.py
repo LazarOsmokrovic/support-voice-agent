@@ -18,6 +18,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agent import session as session_module
+from agent.prompts import FAREWELLS
 from agent.session import create_session, run_turn
 from agent.tools import escalation
 from agent.tools.escalation import TurnClassification
@@ -605,3 +606,69 @@ async def test_a_cancelled_turn_still_propagates_cancellation(tmp_path, monkeypa
         await run_turn(session, "Hi there")
 
     assert not path.exists()
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_ends_never_ends_in_silence(monkeypatch):
+    """Live: the caller said "great, that works for me, thank you so much" and
+    the model returned end_conversation with an EMPTY text block — a tool call
+    and nothing to say. Nothing was spoken and the line went dead: a
+    conversation that went well, hanging up on the customer at the last
+    moment.
+
+    The prompt already asks for a real closing line and the model still
+    returned nothing, which is exactly why this is a deterministic floor
+    rather than more prompt wording (CLAUDE.md rule 7). A farewell is as
+    predictable as a greeting.
+    """
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(
+        side_effect=[_tool_use_response("end_conversation", {}), _text_response("")]
+    )
+    monkeypatch.setattr(escalation, "classify_turn", AsyncMock(return_value=_calm_classification()))
+    session = create_session("CUST-1001", client=fake_client)
+
+    outcome = await run_turn(session, "Alright, great, that works for me. Thank you so much.")
+
+    assert outcome.ended is True
+    assert outcome.reply in FAREWELLS, f"expected a spoken farewell, got {outcome.reply!r}"
+
+
+@pytest.mark.asyncio
+async def test_a_real_sign_off_is_left_alone(monkeypatch):
+    """The fallback is a floor, not a replacement. A model that says goodbye
+    properly must not have its words swapped for a canned line.
+    """
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(
+        side_effect=[
+            _tool_use_response("end_conversation", {}),
+            _text_response("Happy to help — enjoy the Kindle!"),
+        ]
+    )
+    monkeypatch.setattr(escalation, "classify_turn", AsyncMock(return_value=_calm_classification()))
+    session = create_session("CUST-1001", client=fake_client)
+
+    outcome = await run_turn(session, "thanks, bye")
+
+    assert outcome.reply == "Happy to help — enjoy the Kindle!"
+
+
+def test_farewells_vary_between_calls():
+    """The one thing worse than a canned goodbye is the SAME canned goodbye —
+    that is how a caller who rings twice learns they are talking to a script.
+
+    Keyed on the session id rather than the turn number: a call ends exactly
+    once, so a turn-based key would hand every short call an identical
+    sign-off.
+    """
+    import uuid
+
+    from agent.prompts import farewell
+
+    seen = {farewell(int(uuid.uuid4().hex[:8], 16)) for _ in range(200)}
+    assert len(seen) == len(FAREWELLS), f"only {len(seen)} of {len(FAREWELLS)} farewells ever appear"
+
+    session_id = uuid.uuid4().hex
+    key = int(session_id[:8], 16)
+    assert farewell(key) == farewell(key), "one call must end the same way however often it is evaluated"
