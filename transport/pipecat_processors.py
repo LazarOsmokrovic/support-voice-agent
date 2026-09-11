@@ -135,6 +135,19 @@ class ClaudeTurnProcessor(FrameProcessor):
         # importing Twilio — the local-mic pipeline has no phone call to
         # transfer, and CLAUDE.md rule 5 keeps provider code out of here.
         self._on_escalation = on_escalation
+        # Set the moment this processor decides the call is over.
+        #
+        # EndFrame is queued BEHIND the goodbye audio on purpose, so the
+        # reply is spoken in full rather than cut off (see _end_call). The
+        # cost is a window of several seconds between deciding to hang up
+        # and the pipeline actually stopping — and for that whole window the
+        # mic is still live and Deepgram still emits final transcripts.
+        # Without this flag anything the caller says in that gap starts a
+        # brand new turn: a live call returned ended=True at turn 7 and then
+        # ran turns 9 and 10 normally, which is also why the real goodbye
+        # was never heard — its reply was pushed into a pipeline that had
+        # already begun shutting down.
+        self._ended = False
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
         await super().process_frame(frame, direction)
@@ -148,14 +161,25 @@ class ClaudeTurnProcessor(FrameProcessor):
             await self._speak_greeting()
             return
 
+        # Once the call is over, drop the two frame types that would START
+        # new work — and only those two. Everything else still flows: the
+        # EndFrame this processor just pushed has to reach the transport
+        # downstream, and so do the system frames that wind the pipeline up.
+        # A blanket "swallow everything" here would hang the shutdown it is
+        # supposed to be protecting.
         if isinstance(frame, InputDTMFFrame):
-            if frame.button == KeypadEntry.ZERO:
+            if not self._ended and frame.button == KeypadEntry.ZERO:
                 await self._handle_dtmf_escalation()
             return
 
         if isinstance(frame, TranscriptionFrame):
-            if frame.text.strip():
+            if not self._ended and frame.text.strip():
                 await self._handle_final_transcript(frame.text)
+            elif self._ended:
+                # The caller carried on talking while the goodbye plays.
+                # Logged rather than silently binned — on a real line this
+                # is how you find out the farewell is too long.
+                print(f"(call already ended — ignoring late transcript: {frame.text!r})")
             return
 
         await self.push_frame(frame, direction)
@@ -244,6 +268,19 @@ class ClaudeTurnProcessor(FrameProcessor):
         await self.push_frame(LLMFullResponseStartFrame())
         await self.push_frame(TextFrame(text=notice))
         await self.push_frame(LLMFullResponseEndFrame())
+        await self._end_call()
+
+    async def _end_call(self) -> None:
+        """Stop the pipeline, and stop accepting work while it winds down.
+
+        EndFrame is a ControlFrame (ordered, not high-priority) and
+        UninterruptibleFrame — it queues in after the reply already pushed
+        above and survives a stray interruption, and the output transport
+        drains already-queued audio before actually stopping. So the last
+        reply is spoken in full before the call ends; no abrupt cut. The
+        flag covers the gap that politeness buys.
+        """
+        self._ended = True
         await self.push_frame(EndFrame())
 
     async def _speak_thinking(self, user_text: str) -> None:
@@ -355,12 +392,7 @@ class ClaudeTurnProcessor(FrameProcessor):
         if outcome.ended:
             if outcome.end_reason == "escalated":
                 await self._fire_escalation_hook(outcome.escalation_packet)
-            # EndFrame is a ControlFrame (ordered, not high-priority) and
-            # UninterruptibleFrame — it queues in after the reply above and
-            # survives a stray interruption, and the output transport drains
-            # already-queued audio before actually stopping. So this reply
-            # still gets spoken in full before the call ends; no abrupt cut.
-            await self.push_frame(EndFrame())
+            await self._end_call()
 
 
 class MicMuteGate(FrameProcessor):

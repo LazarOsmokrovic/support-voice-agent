@@ -814,3 +814,79 @@ async def test_an_order_question_is_filled_once_the_id_is_known(monkeypatch):
     assert len(spoken) == 2, f"expected a filler then the reply, got {spoken}"
     assert spoken[0] in _all_thinking_phrases()
     assert spoken[1] == "It's out for delivery."
+
+
+@pytest.mark.asyncio
+async def test_a_call_that_has_ended_ignores_anything_said_afterwards(monkeypatch):
+    """Live failure: run_turn returned ended=True at turn 7, and turns 9 and
+    10 then ran normally. It also explains why the real goodbye was never
+    heard — a later turn's reply was pushed into a pipeline already shutting
+    down.
+
+    EndFrame is queued behind the goodbye audio on purpose so the farewell is
+    spoken in full, which leaves several seconds where the mic is live and
+    Deepgram keeps emitting final transcripts. Nothing remembered the call
+    was over, so each of those started a fresh turn.
+    """
+    turns = []
+
+    async def _run_turn(session, text):
+        turns.append(text)
+        return SimpleNamespace(
+            reply="Thanks for calling, goodbye!",
+            notice=None,
+            warnings=[],
+            llm_latency_seconds=0.0,
+            ended=True,
+            end_reason="model_ended",
+            escalation_packet=None,
+        )
+
+    monkeypatch.setattr(processors, "run_turn", _run_turn)
+    session = create_session("CUST-1001")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    await processor.process_frame(_transcript("that's everything, bye"), FrameDirection.DOWNSTREAM)
+    await processor.process_frame(_transcript("oh wait, one more thing"), FrameDirection.DOWNSTREAM)
+
+    assert turns == ["that's everything, bye"], (
+        f"a call that has ended must not run another turn, but ran: {turns}"
+    )
+    spoken = [f.text for f in sink.frames if isinstance(f, TextFrame)]
+    assert spoken == ["Thanks for calling, goodbye!"], (
+        f"only the farewell should be spoken, got {spoken}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ending_the_call_still_lets_shutdown_frames_through(monkeypatch):
+    """The gate drops the two frame types that start work — and nothing else.
+
+    A blanket swallow would block the EndFrame this processor just pushed
+    from reaching the transport downstream, hanging the very shutdown the
+    gate exists to protect.
+    """
+    async def _run_turn(session, text):
+        return SimpleNamespace(
+            reply="Goodbye.",
+            notice=None,
+            warnings=[],
+            llm_latency_seconds=0.0,
+            ended=True,
+            end_reason="model_ended",
+            escalation_packet=None,
+        )
+
+    monkeypatch.setattr(processors, "run_turn", _run_turn)
+    session = create_session("CUST-1001")
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    await processor.process_frame(_transcript("bye"), FrameDirection.DOWNSTREAM)
+    assert any(isinstance(f, EndFrame) for f in sink.frames), "the call must actually end"
+
+    before = len(sink.frames)
+    await processor.process_frame(TextFrame(text="downstream traffic"), FrameDirection.DOWNSTREAM)
+
+    assert len(sink.frames) == before + 1, "unrelated frames must still pass through after the end"
