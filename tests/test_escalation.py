@@ -536,15 +536,30 @@ def test_resetting_a_streak_gives_the_customer_a_clean_run():
 
 def test_a_turn_with_no_tool_calls_does_not_advance_the_lookup_counter():
     """Turn 10 of the live call escalated while the agent was merely asked to
-    repeat a number back — no lookup happened at all."""
+    repeat a number back — no lookup happened at all. The bug was that the
+    threshold check sat OUTSIDE the `if outcomes:` block, so it re-fired on
+    every subsequent turn regardless of whether a lookup was even attempted."""
     tracker = escalation.EscalationTracker()
     neutral = escalation.TurnClassification(
         intent="order_status", sentiment="neutral", policy_restricted=False
     )
-    tracker.record_turn(neutral, [{"name": "get_order_status", "output": {"found": False}}])
+    failed = [{"name": "get_order_status", "output": {"found": False}}]
+
+    # Drive the streak to the threshold — this call SHOULD return a signal.
+    for _ in range(escalation.FAILED_LOOKUP_ESCALATION_THRESHOLD):
+        signal = tracker.record_turn(neutral, failed)
+    assert signal is not None and signal.reason == "repeated failed lookups"
+
     before = tracker.consecutive_failed_lookups
-    tracker.record_turn(neutral, [])
-    assert tracker.consecutive_failed_lookups == before
+    # A turn with NO tool calls at all — nothing was looked up.
+    signal_again = tracker.record_turn(neutral, [])
+
+    assert tracker.consecutive_failed_lookups == before, "the counter must not move"
+    assert signal_again is None, (
+        "an empty-outcomes turn must not re-fire the escalation signal — "
+        "this is the actual bug: the old code re-checked the threshold every "
+        "turn regardless of whether a lookup was attempted"
+    )
 
 
 def test_the_state_machine_opens_amends_and_resolves():
