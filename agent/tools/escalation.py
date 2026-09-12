@@ -18,17 +18,25 @@ Three pieces:
    output — this file doesn't need to know anything refund-specific to
    honor it.
 
-3. HandoffFields / create_handoff_packet — once EscalationTracker decides
-   to escalate, this assembles the actual packet (customer intent, summary,
-   verified account info, actions taken, reason, sentiment) via one more
-   structured-output call, and persists it to the escalations table.
-   Deliberately NOT a tool the model calls itself, unlike
-   get_order_status / search_policy / end_conversation: the decision to
-   escalate has already been made by the time this runs, so there's
+3. HandoffFields / open_escalation / resolve_escalation / create_handoff_packet
+   — once EscalationTracker decides to escalate, this assembles the actual
+   packet (customer intent, summary, verified account info, actions taken,
+   reason, sentiment) via one more structured-output call, and persists it
+   to the escalations table. Deliberately NOT a tool the model calls itself,
+   unlike get_order_status / search_policy / end_conversation: the decision
+   to escalate has already been made by the time this runs, so there's
    nothing left for the model to decide by calling it. It's triggered by
    the application, the same way Phase 2's close_session is — "for now,
    transfer to human just logs the packet" (PROJECT_PLAN.md); a real
-   transfer arrives in Phase 10.
+   transfer arrives in Phase 10. Phase 12 splits the packet's lifecycle in
+   two, because a handover is a process, not an event: open_escalation
+   persists it the moment escalation is decided (so a dropped call still
+   leaves a record) and resolve_escalation finalizes and notifies once an
+   outcome (callback / transfer / customer-will-reach-out / unresolved) is
+   known. create_handoff_packet composes both, unchanged, for callers (like
+   the DTMF-zero path) where the resolution IS the trigger — pressing zero
+   means "put me through now", so there's no gap between opening and
+   resolving to hold a packet across.
 """
 
 from __future__ import annotations
@@ -400,6 +408,32 @@ def mark_notified(escalation_id: int, delivered: bool, notified_at: str | None =
         )
 
 
+def mark_resolved(
+    escalation_id: int,
+    items: list[str],
+    resolution: str,
+    callback_time: str | None = None,
+    resolved_at: str | None = None,
+) -> None:
+    """Persist a handover's final outcome: every item it ended up covering,
+    how it was resolved, and (for a callback) when. `items` is stored
+    newline-separated per the escalations table's schema comment — reasons
+    are written by this codebase, never by a customer, so none can contain a
+    newline.
+
+    Always called by resolve_escalation BEFORE notify_escalation runs, so a
+    webhook that hangs for its full retry budget can never leave the row
+    claiming an already-resolved handover is still open.
+    """
+    resolved_at = resolved_at or datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE escalations SET items = ?, resolution = ?, callback_time = ?, "
+            "resolved_at = ? WHERE escalation_id = ?",
+            ("\n".join(items), resolution, callback_time, resolved_at, escalation_id),
+        )
+
+
 def _next_callback_slot() -> str | None:
     """The earliest open slot a human could call back on, or None.
 
@@ -418,20 +452,28 @@ def _next_callback_slot() -> str | None:
     return available[0] if available else None
 
 
-async def create_handoff_packet(
+async def open_escalation(
     customer_id: str,
     messages: list[dict[str, Any]],
     reason: str,
     client: anthropic.AsyncAnthropic | None = None,
 ) -> dict[str, Any]:
-    """Assemble a structured handoff packet, persist it, and notify an
-    external automation platform (Phase 11) — see agent/tools/notifications.py.
+    """Assemble a structured handoff packet and persist it — but tell nobody
+    yet. Not a tool the model calls itself — see the module docstring.
 
-    Not a tool the model calls itself — see the module docstring. Returns
-    the full packet, including its escalation_id, for the transport layer
-    to relay (e.g. print a transfer notice). Notification delivery never
-    affects this return value — persisting the packet must not depend on
-    whether anyone was actually told about it.
+    Until an outcome is known (a callback booked, a transfer happening now,
+    the customer deciding to reach out themselves) there is nothing useful
+    to tell a human: "a customer needs help, we don't know what about or
+    when to ring" is a message they'd only have to go chase. The row is
+    still written immediately here, so a dropped call still leaves a durable
+    record. Call resolve_escalation with the SAME packet once the outcome is
+    known.
+
+    Returns a packet with `items=[reason]` and `resolution=None` — still
+    open. `callback_time` is a *suggested, unbooked* slot from
+    _next_callback_slot(), kept on this packet only because
+    create_handoff_packet's existing contract returns one; resolve_escalation
+    may overwrite it with the time actually agreed.
     """
     inferred = await _infer_handoff_fields(customer_id, messages, client=client)
     # Redact ONCE, here, so the DB row and the outbound webhook carry
@@ -440,6 +482,8 @@ async def create_handoff_packet(
     fields = HandoffFields(**redact_fields(inferred.model_dump(), HANDOFF_TEXT_FIELDS))
     escalation_id = log_escalation(customer_id, reason, fields)
     packet = {"escalation_id": escalation_id, "reason": reason, **fields.model_dump()}
+    packet["items"] = [reason]
+    packet["resolution"] = None
 
     # The earliest slot a human could ring back on, so the customer hears a
     # specific time and the human agent's notification names the SAME one.
@@ -455,6 +499,49 @@ async def create_handoff_packet(
     # customer who has just asked to stop talking to a bot.
     packet["callback_time"] = _next_callback_slot()
 
+    return packet
+
+
+async def resolve_escalation(
+    packet: dict[str, Any],
+    items: list[str],
+    resolution: str,
+    callback_time: str | None = None,
+) -> bool:
+    """Finalize a handover opened by open_escalation: fix its outcome,
+    persist that outcome, THEN notify the automation platform. Returns
+    whether notify_escalation actually delivered the packet.
+
+    Mutates `packet` IN PLACE — writing final `items`, `resolution`,
+    `callback_time`, and folding the outcome into `reason` — before doing
+    anything else. transport/telephony.py's render_whisper reads this same
+    packet object to brief the human taking the call, so what the caller
+    holds afterward must match what was actually sent, not the open-time
+    state open_escalation returned.
+
+    Order matters: the row is persisted (mark_resolved) BEFORE
+    notify_escalation runs. A webhook that hangs for its full retry budget
+    must never leave the database claiming an already-resolved handover is
+    still open.
+    """
+    packet["items"] = items
+    packet["resolution"] = resolution
+    packet["callback_time"] = callback_time
+    # render_whisper (transport/telephony.py) only reads escalation_id,
+    # reason, customer_intent, verified_account_info, actions_taken and
+    # sentiment — never `items` or `callback_time`. Fold the final items back
+    # into `reason` so the human on the call actually hears them. A
+    # transfer-right-now resolution has no future outcome to add beyond that
+    # (nothing books "later" — the customer is being put through as this
+    # packet is sent), so only a callback's agreed time gets appended; a
+    # single-item transfer's `reason` therefore passes through unchanged.
+    reason = "; ".join(items)
+    if resolution == RESOLUTION_CALLBACK and callback_time:
+        reason += f" — callback agreed for {callback_time}"
+    packet["reason"] = reason
+
+    mark_resolved(packet["escalation_id"], items, resolution, callback_time)
+
     try:
         delivered = await notify_escalation(packet)
     except Exception:  # noqa: BLE001 — a broken webhook must never break escalation
@@ -464,12 +551,45 @@ async def create_handoff_packet(
     # Separate try/except from the notify call above: mark_notified is a
     # second, independent thing that can fail (e.g. a pre-existing DB
     # missing the notified/notified_at columns, or write-lock contention
-    # under simultaneous escalations) and it must not discard a packet that
-    # log_escalation already durably persisted. Kept as its own except block
-    # so the two distinct failure modes stay distinguishable in logs.
+    # under simultaneous escalations) and it must not discard a resolution
+    # that mark_resolved already durably persisted. Kept as its own except
+    # block so the two distinct failure modes stay distinguishable in logs.
     try:
-        mark_notified(escalation_id, delivered)
+        mark_notified(packet["escalation_id"], delivered)
     except Exception:  # noqa: BLE001 — recording delivery status must never break escalation
         logger.exception("mark_notified raised unexpectedly")
 
+    return delivered
+
+
+async def create_handoff_packet(
+    customer_id: str,
+    messages: list[dict[str, Any]],
+    reason: str,
+    client: anthropic.AsyncAnthropic | None = None,
+) -> dict[str, Any]:
+    """Assemble a structured handoff packet, persist it, and notify an
+    external automation platform (Phase 11) — see agent/tools/notifications.py.
+
+    Not a tool the model calls itself — see the module docstring. Returns
+    the full packet, including its escalation_id, for the transport layer
+    to relay (e.g. print a transfer notice). Notification delivery never
+    affects this return value — persisting the packet must not depend on
+    whether anyone was actually told about it.
+
+    This function's external behavior and signature are unchanged from
+    before Phase 12: transport/pipecat_processors.py's DTMF-zero path calls
+    it directly and must keep working unmodified (CLAUDE.md rule 5).
+    Internally it now composes the two halves Phase 12 split apart —
+    open_escalation then resolve_escalation — because pressing zero to be
+    put through right now IS the resolution: there is no process to work
+    through, so open and resolve happen back to back.
+    """
+    packet = await open_escalation(customer_id, messages, reason, client=client)
+    await resolve_escalation(
+        packet,
+        items=packet["items"],
+        resolution=RESOLUTION_TRANSFER,
+        callback_time=packet["callback_time"],
+    )
     return packet
