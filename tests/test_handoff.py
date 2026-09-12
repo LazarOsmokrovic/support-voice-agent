@@ -112,7 +112,7 @@ async def test_scheduling_a_callback_proposes_before_it_books(monkeypatch):
     slot = _free_slot()
 
     result = await handoff.schedule_human_callback(
-        slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID
+        slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID, messages=[]
     )
 
     assert result["scheduled"] is False
@@ -137,9 +137,13 @@ async def test_a_confirmed_callback_books_persists_and_notifies_in_one_await(mon
     gate = PendingActionGate(turn=1)
     slot = _free_slot()
 
-    await handoff.schedule_human_callback(slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID)
+    await handoff.schedule_human_callback(
+        slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID, messages=[]
+    )
     gate.turn = 2  # a later, confirming turn
-    result = await handoff.schedule_human_callback(slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID)
+    result = await handoff.schedule_human_callback(
+        slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID, messages=[]
+    )
 
     assert result["scheduled"] is True
     assert result["callback_time"] == slot
@@ -193,7 +197,7 @@ async def test_a_callback_does_not_share_a_confirmation_key_with_an_appointment(
     )
 
     result = await handoff.schedule_human_callback(
-        slot_time=slot, state=_open_state(), gate=gate, customer_id=CUSTOMER_ID
+        slot_time=slot, state=_open_state(), gate=gate, customer_id=CUSTOMER_ID, messages=[]
     )
 
     assert result["scheduled"] is False, "a callback must need its own confirmation"
@@ -217,7 +221,9 @@ async def test_an_unavailable_slot_leaves_the_handover_open(monkeypatch):
     other_gate.turn = 2
     scheduling.book_appointment(slot_time=slot, reason="someone else", state=other_gate, customer_id="CUST-1002")
 
-    result = await handoff.schedule_human_callback(slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID)
+    result = await handoff.schedule_human_callback(
+        slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID, messages=[]
+    )
 
     assert result["scheduled"] is False
     assert result["error"] == "slot_unavailable"
@@ -233,15 +239,19 @@ async def test_resolving_twice_does_not_book_a_second_callback(monkeypatch):
     state = _open_state()
     gate = PendingActionGate(turn=1)
     slot = _free_slot()
-    await handoff.schedule_human_callback(slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID)
+    await handoff.schedule_human_callback(
+        slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID, messages=[]
+    )
     gate.turn = 2
-    first = await handoff.schedule_human_callback(slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID)
+    first = await handoff.schedule_human_callback(
+        slot_time=slot, state=state, gate=gate, customer_id=CUSTOMER_ID, messages=[]
+    )
     assert first["scheduled"] is True
 
     other_slot = scheduling.find_available_slots()["slots"][1]
     gate.turn = 3
     second = await handoff.schedule_human_callback(
-        slot_time=other_slot, state=state, gate=gate, customer_id=CUSTOMER_ID
+        slot_time=other_slot, state=state, gate=gate, customer_id=CUSTOMER_ID, messages=[]
     )
 
     assert second["scheduled"] is False

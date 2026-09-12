@@ -118,16 +118,24 @@ def build_dispatch_tool(
         ),
         "issue_refund": lambda **kw: refunds.issue_refund(**kw, state=gates.refunds, customer_id=customer_id),
         "schedule_human_callback": lambda **kw: handoff.schedule_human_callback(
-            **kw, state=gates.escalation, gate=gates.scheduling, customer_id=customer_id
+            **kw,
+            state=gates.escalation,
+            gate=gates.scheduling,
+            customer_id=customer_id,
+            # Deferred lookup, not a captured reference: `gates.agent` is
+            # None right now (build_dispatch_tool runs before Agent is
+            # constructed) and gets set by create_session afterwards. See
+            # SessionGates.agent's docstring comment. Without this, a
+            # callback booked via the accepted-offer path built its handoff
+            # packet from an empty transcript — the human colleague got a
+            # blank summary for exactly the outcome this phase exists to
+            # produce.
+            messages=gates.agent.messages if gates.agent is not None else [],
         ),
         "record_customer_will_reach_out": lambda **kw: handoff.record_customer_will_reach_out(
             **kw,
             escalation=gates.escalation,
             customer_id=customer_id,
-            # Deferred lookup, not a captured reference: `gates.agent` is
-            # None right now (build_dispatch_tool runs before Agent is
-            # constructed) and gets set by create_session afterwards. See
-            # SessionGates.agent's docstring comment.
             messages=gates.agent.messages if gates.agent is not None else [],
         ),
         "end_conversation": lambda **kw: summary.end_conversation(

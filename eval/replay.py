@@ -146,7 +146,7 @@ class FakeAnthropicClient:
 # anything.
 MODEL_CONSTRUCTION_SITES: tuple[tuple[str, int], ...] = (
     ("agent/core.py", 101),
-    ("agent/session.py", 240),
+    ("agent/session.py", 248),
     ("agent/tools/summary.py", 142),
     ("agent/tools/escalation.py", 214),
     ("agent/tools/escalation.py", 358),

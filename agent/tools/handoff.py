@@ -92,11 +92,10 @@ async def _persist_resolution(state: EscalationState, customer_id: str, messages
         # trigger calls escalation.open_escalation with the real
         # transcript) by the time one of these tools runs — this branch only
         # exists for the accepted-offer path, where _ensure_open merely
-        # flipped a status flag and never persisted anything. `messages` may
-        # be empty here (schedule_human_callback has no transcript to pass),
-        # which yields a thinner inferred packet than usual; that is an
-        # acceptable trade for not blocking a booking on a transcript that
-        # genuinely was not available.
+        # flipped a status flag and never persisted anything. Both callers
+        # pass the session's real, live transcript here (see each tool's
+        # dispatch wiring in agent/session.py), so the inferred packet is
+        # built from the actual conversation, not a blank one.
         state.packet = await escalation_module.open_escalation(
             customer_id, messages, "; ".join(state.items) or ACCEPTED_OFFER_REASON
         )
@@ -149,6 +148,7 @@ async def schedule_human_callback(
     state: EscalationState,
     gate: PendingActionGate,
     customer_id: str,
+    messages: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Propose-then-confirm booking of a human callback, then resolve the
     handover the moment it's actually booked. See module docstring for why
@@ -188,9 +188,7 @@ async def schedule_human_callback(
 
     state.record_resolution(RESOLUTION_CALLBACK, slot_time)
     try:
-        # schedule_human_callback has no transcript to pass — see
-        # _persist_resolution's docstring for what that costs.
-        await _persist_resolution(state, customer_id, messages=[])
+        await _persist_resolution(state, customer_id, messages)
     except Exception:  # noqa: BLE001 — a tool must never raise into the loop
         logger.exception("failed to persist a resolved callback handover")
 
