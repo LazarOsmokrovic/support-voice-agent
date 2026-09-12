@@ -29,7 +29,7 @@ from typing import Any
 from agent.confirmation import PendingActionGate
 from agent.core import Agent
 from agent.prompts import SYSTEM_PROMPT, farewell
-from agent.tools import escalation, orders, policy_rag, refunds, scheduling, summary
+from agent.tools import escalation, handoff, orders, policy_rag, refunds, scheduling, summary
 from agent.tools.summary import SessionSummary
 from guardrails.injection import sanitize_user_text
 from guardrails.validators import check_reply_grounding, hedge_for
@@ -42,6 +42,8 @@ TOOLS = [
     scheduling.BOOK_APPOINTMENT_SCHEMA,
     scheduling.CANCEL_APPOINTMENT_SCHEMA,
     refunds.TOOL_SCHEMA,
+    handoff.SCHEDULE_CALLBACK_SCHEMA,
+    handoff.RECORD_CALLBACK_DECLINED_SCHEMA,
     summary.END_CONVERSATION_SCHEMA,
 ]
 
@@ -63,6 +65,20 @@ class SessionGates:
 
     scheduling: PendingActionGate = field(default_factory=PendingActionGate)
     refunds: PendingActionGate = field(default_factory=PendingActionGate)
+    # Phase 12. Not a PendingActionGate, but a gate in the most literal sense —
+    # it is what stops the call ending while a handover is unresolved. Here
+    # rather than on Session because the tool handlers close over it, and they
+    # are built before the Session that owns them exists.
+    escalation: escalation.EscalationState = field(default_factory=escalation.EscalationState)
+    # Set by create_session once the Agent exists (build_dispatch_tool runs
+    # BEFORE it does — see create_session below). record_customer_will_reach_out
+    # needs the live transcript for open_escalation's inference; reading
+    # `gates.agent.messages` lazily, at call time, is what lets a handler
+    # closed over `gates` at build_dispatch_tool time see a list that did not
+    # exist yet when it was built. Safe because Agent.messages
+    # (agent/core.py:103) is mutated in place and never rebound, so this
+    # reference stays live and current for the life of the session.
+    agent: Any = field(default=None, repr=False, compare=False)
 
     def advance_turn(self) -> None:
         self.scheduling.turn += 1
@@ -91,6 +107,19 @@ def build_dispatch_tool(
             **kw, state=gates.scheduling, customer_id=customer_id
         ),
         "issue_refund": lambda **kw: refunds.issue_refund(**kw, state=gates.refunds, customer_id=customer_id),
+        "schedule_human_callback": lambda **kw: handoff.schedule_human_callback(
+            **kw, state=gates.escalation, gate=gates.scheduling, customer_id=customer_id
+        ),
+        "record_customer_will_reach_out": lambda **kw: handoff.record_customer_will_reach_out(
+            **kw,
+            escalation=gates.escalation,
+            customer_id=customer_id,
+            # Deferred lookup, not a captured reference: `gates.agent` is
+            # None right now (build_dispatch_tool runs before Agent is
+            # constructed) and gets set by create_session afterwards. See
+            # SessionGates.agent's docstring comment.
+            messages=gates.agent.messages if gates.agent is not None else [],
+        ),
         "end_conversation": summary.end_conversation,
     }
 
@@ -198,6 +227,7 @@ def create_session(customer_id: str, client: Any | None = None, transport: str =
     """
     dispatch_tool, handlers, gates = build_dispatch_tool(customer_id)
     agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool, client=client)
+    gates.agent = agent  # see SessionGates.agent — set only once Agent exists
     return Session(
         customer_id=customer_id,
         session_id=uuid.uuid4().hex,
