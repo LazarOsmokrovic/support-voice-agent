@@ -82,6 +82,20 @@ class TurnRecord:
     escalation_id: int | None
     ended: bool
     end_reason: str | None
+    # Phase 12 Task 5 (F-8). Last field, and the only one with a default:
+    # every preceding field is non-default, so it cannot go anywhere else.
+    # transport/pipecat_processors.py:249 (a file this plan forbids editing)
+    # constructs a TurnRecord on the DTMF path and on the turn-failure path
+    # without ever knowing this field exists — the default is what keeps
+    # those two construction sites from raising TypeError on every call.
+    # A reason that only OFFERED (a suggested trigger the customer hasn't
+    # accepted) — never a reason that opened or amended a handover, which
+    # belongs in `escalation_reason` instead. See agent/session.py's run_turn
+    # for why the two must not be conflated: eval/scoring.py's
+    # score_escalation treats any row with an escalation_reason as "this
+    # scenario escalated", and folding offers into that field would make
+    # every never-escalates scenario that merely offered look escalated.
+    escalation_offered: str | None = None
 
 
 def _log_path() -> Path | None:

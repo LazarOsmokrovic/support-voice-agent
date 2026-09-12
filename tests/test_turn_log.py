@@ -67,6 +67,7 @@ def test_record_carries_every_schema_field(tmp_path, monkeypatch):
         "ts", "session_id", "customer_id", "transport", "turn", "user_text", "reply",
         "original_reply", "grounding_flagged", "hedge_spoken", "tool_calls", "llm_latency_ms",
         "warnings", "escalated", "escalation_reason", "escalation_id", "ended", "end_reason",
+        "escalation_offered",
     ):
         assert field in record, field
 
@@ -251,3 +252,24 @@ def test_escalation_id_field_round_trips(tmp_path, monkeypatch):
     log_turn(_record(escalation_id=42))
 
     assert _read_lines(path)[0]["escalation_id"] == 42
+
+
+def test_escalation_offered_defaults_to_none_for_old_call_sites(tmp_path, monkeypatch):
+    """transport/pipecat_processors.py:249 and agent/session.py's turn-failure
+    path both construct a TurnRecord without ever passing this field — the
+    default is what keeps those call sites from raising TypeError."""
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+
+    log_turn(_record())  # _record() never sets escalation_offered
+
+    assert _read_lines(path)[0]["escalation_offered"] is None
+
+
+def test_escalation_offered_field_round_trips(tmp_path, monkeypatch):
+    path = tmp_path / "turns.jsonl"
+    monkeypatch.setenv("TURN_LOG_PATH", str(path))
+
+    log_turn(_record(escalation_offered="repeated failed lookups"))
+
+    assert _read_lines(path)[0]["escalation_offered"] == "repeated failed lookups"
