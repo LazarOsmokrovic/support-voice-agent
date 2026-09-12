@@ -771,3 +771,16 @@ async def test_create_handoff_packet_still_opens_and_resolves_together(monkeypat
         "create_handoff_packet contract (test_create_handoff_packet_infers_fields_and_logs) "
         "asserts `reason` passes through unchanged"
     )
+
+
+def test_the_prompt_only_names_handover_tools_that_exist():
+    """A prompt naming a renamed tool is a silent failure — the model calls it,
+    gets "unknown tool", and improvises."""
+    from agent.prompts import SYSTEM_PROMPT
+    from agent.session import TOOLS
+
+    names = {schema["name"] for schema in TOOLS}
+    for named in ("find_available_slots", "schedule_human_callback",
+                  "record_customer_will_reach_out"):
+        assert named in names, f"SYSTEM_PROMPT names {named}, which is not a registered tool"
+        assert named in SYSTEM_PROMPT
