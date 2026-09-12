@@ -18,23 +18,31 @@ Three pieces:
    output — this file doesn't need to know anything refund-specific to
    honor it.
 
-3. HandoffFields / create_handoff_packet — once EscalationTracker decides
-   to escalate, this assembles the actual packet (customer intent, summary,
-   verified account info, actions taken, reason, sentiment) via one more
-   structured-output call, and persists it to the escalations table.
-   Deliberately NOT a tool the model calls itself, unlike
-   get_order_status / search_policy / end_conversation: the decision to
-   escalate has already been made by the time this runs, so there's
+3. HandoffFields / open_escalation / resolve_escalation / create_handoff_packet
+   — once EscalationTracker decides to escalate, this assembles the actual
+   packet (customer intent, summary, verified account info, actions taken,
+   reason, sentiment) via one more structured-output call, and persists it
+   to the escalations table. Deliberately NOT a tool the model calls itself,
+   unlike get_order_status / search_policy / end_conversation: the decision
+   to escalate has already been made by the time this runs, so there's
    nothing left for the model to decide by calling it. It's triggered by
    the application, the same way Phase 2's close_session is — "for now,
    transfer to human just logs the packet" (PROJECT_PLAN.md); a real
-   transfer arrives in Phase 10.
+   transfer arrives in Phase 10. Phase 12 splits the packet's lifecycle in
+   two, because a handover is a process, not an event: open_escalation
+   persists it the moment escalation is decided (so a dropped call still
+   leaves a record) and resolve_escalation finalizes and notifies once an
+   outcome (callback / transfer / customer-will-reach-out / unresolved) is
+   known. create_handoff_packet composes both, unchanged, for callers (like
+   the DTMF-zero path) where the resolution IS the trigger — pressing zero
+   means "put me through now", so there's no gap between opening and
+   resolving to hold a packet across.
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -50,6 +58,119 @@ from data.mock_db import get_connection
 from guardrails.pii import HANDOFF_TEXT_FIELDS, redact_fields
 
 logger = logging.getLogger("agent.tools.escalation")
+
+# Named rather than repeated as literals: these values travel across
+# escalation.py, handoff.py, session.py, turn_log.py and a DB column, and a
+# typo in any one fails silently as "this handover is somehow neither open
+# nor resolved".
+STATUS_NONE = "none"
+STATUS_OPEN = "open"
+STATUS_RESOLVED = "resolved"
+
+RESOLUTION_CALLBACK = "callback"
+RESOLUTION_SELF = "customer_will_reach_out"
+RESOLUTION_TRANSFER = "transfer"
+RESOLUTION_UNRESOLVED = "unresolved"
+
+# Whose decision each trigger represents. A mandatory trigger is the
+# customer's or a rule's — the agent has no standing to second-guess it. A
+# suggested trigger is the agent's own inference that it is failing, which is
+# the judgement that hung up on a customer who had mis-dictated one digit,
+# and on another who was calmly cancelling an order. Inferences get offered;
+# they do not get imposed. CLAUDE.md rule 6's principle, applied to handoffs.
+MANDATORY_REASONS = frozenset(
+    {"explicit request for a human", "policy-restricted topic"}
+)
+SUGGESTED_REASONS = frozenset(
+    {
+        "repeated failed lookups",
+        "sustained negative sentiment across multiple turns",
+        "repeated ungrounded replies",
+    }
+)
+
+MAX_END_REFUSALS = 2
+
+
+@dataclass(frozen=True)
+class EscalationSignal:
+    reason: str
+    mandatory: bool
+
+
+@dataclass
+class EscalationState:
+    """One handover per session, for the life of the session.
+
+    That is what happens on a real support line: a human ringing a customer
+    back deals with everything that customer has, rather than booking three
+    calls for three questions. So a second escalation-worthy issue becomes
+    another ITEM on the same handover — which is why `items` is a list and not
+    the single `reason` string it replaced.
+
+    Mutated in place, never rebound: the tool handlers in build_dispatch_tool
+    close over it before the Session that owns it exists.
+    """
+
+    status: str = STATUS_NONE
+    escalation_id: int | None = None
+    packet: dict[str, Any] | None = None
+    items: list[str] = field(default_factory=list)
+    resolution: str | None = None
+    callback_time: str | None = None
+    # Suggested triggers that have already made their offer. Being asked over
+    # and over whether you want a human is its own kind of failure.
+    offered: set[str] = field(default_factory=set)
+    # Anything still unsent. close_session flushes on this, NOT on is_open —
+    # a resolution recorded and then lost to a crashing turn is not open, and
+    # guarding on is_open would drop it silently.
+    pending_persist: bool = False
+    refusals: int = 0
+    _last_refusal_turn: int | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.status == STATUS_OPEN
+
+    def open(self, reason: str) -> None:
+        if self.status == STATUS_NONE:
+            self.status = STATUS_OPEN
+        if reason not in self.items:
+            self.items.append(reason)
+        self.pending_persist = True
+
+    def amend(self, reason: str) -> None:
+        """A second trigger during an existing handover. Never reopens a
+        resolved one and never books a second callback — it adds an item the
+        colleague taking it over can prepare for.
+        """
+        if reason in self.items:
+            return
+        self.items.append(reason)
+        self.pending_persist = True
+
+    def record_resolution(self, resolution: str, callback_time: str | None = None) -> None:
+        self.status = STATUS_RESOLVED
+        self.resolution = resolution
+        self.callback_time = callback_time
+        self.pending_persist = True
+
+    def consume_refusal(self, turn: int) -> bool:
+        """True if end_conversation should be refused. Budget is spent at most
+        once per TURN.
+
+        agent/core.py:91 allows 8 tool iterations, so a model that reads the
+        refusal and retries can call end_conversation three times inside one
+        agent.send(). Counting calls would exhaust the budget with no customer
+        utterance in between — the nudge becomes a rubber stamp on exactly the
+        turn it was meant to catch.
+        """
+        if self.refusals >= MAX_END_REFUSALS and turn != self._last_refusal_turn:
+            return False
+        if turn != self._last_refusal_turn:
+            self.refusals += 1
+            self._last_refusal_turn = turn
+        return True
 
 # How many consecutive turns of the same bad signal before actually
 # escalating — chosen to avoid firing on one grumpy word or one bad lookup,
@@ -144,8 +265,8 @@ class EscalationTracker:
         classification: TurnClassification,
         tool_calls: list[dict[str, Any]],
         ungrounded: bool = False,
-    ) -> str | None:
-        """Update counters from this turn; return an escalation reason the
+    ) -> EscalationSignal | None:
+        """Update counters from this turn; return an escalation signal the
         moment a trigger fires, else None.
 
         Immediate triggers (a tool directly signaling escalation, an
@@ -159,18 +280,18 @@ class EscalationTracker:
         """
         tool_escalation = _tool_signaled_escalation(tool_calls)
         if tool_escalation:
-            return tool_escalation
+            return EscalationSignal(tool_escalation, mandatory=True)
         if classification.intent == "request_human":
-            return "explicit request for a human"
+            return EscalationSignal("explicit request for a human", mandatory=True)
         if classification.policy_restricted:
-            return "policy-restricted topic"
+            return EscalationSignal("policy-restricted topic", mandatory=True)
 
         if classification.sentiment == "negative":
             self.consecutive_negative_turns += 1
         else:
             self.consecutive_negative_turns = 0
         if self.consecutive_negative_turns >= NEGATIVE_SENTIMENT_ESCALATION_THRESHOLD:
-            return "sustained negative sentiment across multiple turns"
+            return EscalationSignal("sustained negative sentiment across multiple turns", mandatory=False)
 
         outcomes = _turn_tool_outcomes(tool_calls)
         if outcomes:
@@ -178,17 +299,31 @@ class EscalationTracker:
                 self.consecutive_failed_lookups = 0
             else:
                 self.consecutive_failed_lookups += 1
-        if self.consecutive_failed_lookups >= FAILED_LOOKUP_ESCALATION_THRESHOLD:
-            return "repeated failed lookups"
+            # INSIDE this block on purpose. It used to sit outside, re-reading
+            # the counter every turn — so once the streak tripped, a turn with
+            # no lookup at all still escalated. One live call produced rows 7,
+            # 8 and 9 for one problem that way, the last from a turn that
+            # merely asked the agent to repeat a number back.
+            if self.consecutive_failed_lookups >= FAILED_LOOKUP_ESCALATION_THRESHOLD:
+                return EscalationSignal("repeated failed lookups", mandatory=False)
 
         if ungrounded:
             self.consecutive_ungrounded_replies += 1
         else:
             self.consecutive_ungrounded_replies = 0
         if self.consecutive_ungrounded_replies >= UNGROUNDED_REPLY_ESCALATION_THRESHOLD:
-            return "repeated ungrounded replies"
+            return EscalationSignal("repeated ungrounded replies", mandatory=False)
 
         return None
+
+    def reset_streak(self, reason: str) -> None:
+        """Reset the streak counter for the given reason."""
+        if reason == "repeated failed lookups":
+            self.consecutive_failed_lookups = 0
+        elif reason == "sustained negative sentiment across multiple turns":
+            self.consecutive_negative_turns = 0
+        elif reason == "repeated ungrounded replies":
+            self.consecutive_ungrounded_replies = 0
 
 
 async def check_escalation(
@@ -197,7 +332,7 @@ async def check_escalation(
     tool_calls: list[dict[str, Any]],
     ungrounded: bool = False,
     client: anthropic.AsyncAnthropic | None = None,
-) -> str | None:
+) -> EscalationSignal | None:
     """classify_turn + tracker.record_turn in one call — shared by
     transport/text_cli.py's real loop and by tests, so the two can't drift
     apart from each other.
@@ -273,6 +408,32 @@ def mark_notified(escalation_id: int, delivered: bool, notified_at: str | None =
         )
 
 
+def mark_resolved(
+    escalation_id: int,
+    items: list[str],
+    resolution: str,
+    callback_time: str | None = None,
+    resolved_at: str | None = None,
+) -> None:
+    """Persist a handover's final outcome: every item it ended up covering,
+    how it was resolved, and (for a callback) when. `items` is stored
+    newline-separated per the escalations table's schema comment — reasons
+    are written by this codebase, never by a customer, so none can contain a
+    newline.
+
+    Always called by resolve_escalation BEFORE notify_escalation runs, so a
+    webhook that hangs for its full retry budget can never leave the row
+    claiming an already-resolved handover is still open.
+    """
+    resolved_at = resolved_at or datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute(
+            "UPDATE escalations SET items = ?, resolution = ?, callback_time = ?, "
+            "resolved_at = ? WHERE escalation_id = ?",
+            ("\n".join(items), resolution, callback_time, resolved_at, escalation_id),
+        )
+
+
 def _next_callback_slot() -> str | None:
     """The earliest open slot a human could call back on, or None.
 
@@ -291,20 +452,28 @@ def _next_callback_slot() -> str | None:
     return available[0] if available else None
 
 
-async def create_handoff_packet(
+async def open_escalation(
     customer_id: str,
     messages: list[dict[str, Any]],
     reason: str,
     client: anthropic.AsyncAnthropic | None = None,
 ) -> dict[str, Any]:
-    """Assemble a structured handoff packet, persist it, and notify an
-    external automation platform (Phase 11) — see agent/tools/notifications.py.
+    """Assemble a structured handoff packet and persist it — but tell nobody
+    yet. Not a tool the model calls itself — see the module docstring.
 
-    Not a tool the model calls itself — see the module docstring. Returns
-    the full packet, including its escalation_id, for the transport layer
-    to relay (e.g. print a transfer notice). Notification delivery never
-    affects this return value — persisting the packet must not depend on
-    whether anyone was actually told about it.
+    Until an outcome is known (a callback booked, a transfer happening now,
+    the customer deciding to reach out themselves) there is nothing useful
+    to tell a human: "a customer needs help, we don't know what about or
+    when to ring" is a message they'd only have to go chase. The row is
+    still written immediately here, so a dropped call still leaves a durable
+    record. Call resolve_escalation with the SAME packet once the outcome is
+    known.
+
+    Returns a packet with `items=[reason]` and `resolution=None` — still
+    open. `callback_time` is a *suggested, unbooked* slot from
+    _next_callback_slot(), kept on this packet only because
+    create_handoff_packet's existing contract returns one; resolve_escalation
+    may overwrite it with the time actually agreed.
     """
     inferred = await _infer_handoff_fields(customer_id, messages, client=client)
     # Redact ONCE, here, so the DB row and the outbound webhook carry
@@ -313,6 +482,8 @@ async def create_handoff_packet(
     fields = HandoffFields(**redact_fields(inferred.model_dump(), HANDOFF_TEXT_FIELDS))
     escalation_id = log_escalation(customer_id, reason, fields)
     packet = {"escalation_id": escalation_id, "reason": reason, **fields.model_dump()}
+    packet["items"] = [reason]
+    packet["resolution"] = None
 
     # The earliest slot a human could ring back on, so the customer hears a
     # specific time and the human agent's notification names the SAME one.
@@ -328,6 +499,49 @@ async def create_handoff_packet(
     # customer who has just asked to stop talking to a bot.
     packet["callback_time"] = _next_callback_slot()
 
+    return packet
+
+
+async def resolve_escalation(
+    packet: dict[str, Any],
+    items: list[str],
+    resolution: str,
+    callback_time: str | None = None,
+) -> bool:
+    """Finalize a handover opened by open_escalation: fix its outcome,
+    persist that outcome, THEN notify the automation platform. Returns
+    whether notify_escalation actually delivered the packet.
+
+    Mutates `packet` IN PLACE — writing final `items`, `resolution`,
+    `callback_time`, and folding the outcome into `reason` — before doing
+    anything else. transport/telephony.py's render_whisper reads this same
+    packet object to brief the human taking the call, so what the caller
+    holds afterward must match what was actually sent, not the open-time
+    state open_escalation returned.
+
+    Order matters: the row is persisted (mark_resolved) BEFORE
+    notify_escalation runs. A webhook that hangs for its full retry budget
+    must never leave the database claiming an already-resolved handover is
+    still open.
+    """
+    packet["items"] = items
+    packet["resolution"] = resolution
+    packet["callback_time"] = callback_time
+    # render_whisper (transport/telephony.py) only reads escalation_id,
+    # reason, customer_intent, verified_account_info, actions_taken and
+    # sentiment — never `items` or `callback_time`. Fold the final items back
+    # into `reason` so the human on the call actually hears them. A
+    # transfer-right-now resolution has no future outcome to add beyond that
+    # (nothing books "later" — the customer is being put through as this
+    # packet is sent), so only a callback's agreed time gets appended; a
+    # single-item transfer's `reason` therefore passes through unchanged.
+    reason = "; ".join(items)
+    if resolution == RESOLUTION_CALLBACK and callback_time:
+        reason += f" — callback agreed for {callback_time}"
+    packet["reason"] = reason
+
+    mark_resolved(packet["escalation_id"], items, resolution, callback_time)
+
     try:
         delivered = await notify_escalation(packet)
     except Exception:  # noqa: BLE001 — a broken webhook must never break escalation
@@ -337,12 +551,45 @@ async def create_handoff_packet(
     # Separate try/except from the notify call above: mark_notified is a
     # second, independent thing that can fail (e.g. a pre-existing DB
     # missing the notified/notified_at columns, or write-lock contention
-    # under simultaneous escalations) and it must not discard a packet that
-    # log_escalation already durably persisted. Kept as its own except block
-    # so the two distinct failure modes stay distinguishable in logs.
+    # under simultaneous escalations) and it must not discard a resolution
+    # that mark_resolved already durably persisted. Kept as its own except
+    # block so the two distinct failure modes stay distinguishable in logs.
     try:
-        mark_notified(escalation_id, delivered)
+        mark_notified(packet["escalation_id"], delivered)
     except Exception:  # noqa: BLE001 — recording delivery status must never break escalation
         logger.exception("mark_notified raised unexpectedly")
 
+    return delivered
+
+
+async def create_handoff_packet(
+    customer_id: str,
+    messages: list[dict[str, Any]],
+    reason: str,
+    client: anthropic.AsyncAnthropic | None = None,
+) -> dict[str, Any]:
+    """Assemble a structured handoff packet, persist it, and notify an
+    external automation platform (Phase 11) — see agent/tools/notifications.py.
+
+    Not a tool the model calls itself — see the module docstring. Returns
+    the full packet, including its escalation_id, for the transport layer
+    to relay (e.g. print a transfer notice). Notification delivery never
+    affects this return value — persisting the packet must not depend on
+    whether anyone was actually told about it.
+
+    This function's external behavior and signature are unchanged from
+    before Phase 12: transport/pipecat_processors.py's DTMF-zero path calls
+    it directly and must keep working unmodified (CLAUDE.md rule 5).
+    Internally it now composes the two halves Phase 12 split apart —
+    open_escalation then resolve_escalation — because pressing zero to be
+    put through right now IS the resolution: there is no process to work
+    through, so open and resolve happen back to back.
+    """
+    packet = await open_escalation(customer_id, messages, reason, client=client)
+    await resolve_escalation(
+        packet,
+        items=packet["items"],
+        resolution=RESOLUTION_TRANSFER,
+        callback_time=packet["callback_time"],
+    )
     return packet

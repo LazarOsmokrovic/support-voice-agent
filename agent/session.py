@@ -29,7 +29,7 @@ from typing import Any
 from agent.confirmation import PendingActionGate
 from agent.core import Agent
 from agent.prompts import SYSTEM_PROMPT, farewell
-from agent.tools import escalation, orders, policy_rag, refunds, scheduling, summary
+from agent.tools import escalation, handoff, orders, policy_rag, refunds, scheduling, summary
 from agent.tools.summary import SessionSummary
 from guardrails.injection import sanitize_user_text
 from guardrails.validators import check_reply_grounding, hedge_for
@@ -42,6 +42,8 @@ TOOLS = [
     scheduling.BOOK_APPOINTMENT_SCHEMA,
     scheduling.CANCEL_APPOINTMENT_SCHEMA,
     refunds.TOOL_SCHEMA,
+    handoff.SCHEDULE_CALLBACK_SCHEMA,
+    handoff.RECORD_CALLBACK_DECLINED_SCHEMA,
     summary.END_CONVERSATION_SCHEMA,
 ]
 
@@ -63,10 +65,34 @@ class SessionGates:
 
     scheduling: PendingActionGate = field(default_factory=PendingActionGate)
     refunds: PendingActionGate = field(default_factory=PendingActionGate)
+    # Phase 12. Not a PendingActionGate, but a gate in the most literal sense —
+    # it is what stops the call ending while a handover is unresolved. Here
+    # rather than on Session because the tool handlers close over it, and they
+    # are built before the Session that owns them exists.
+    escalation: escalation.EscalationState = field(default_factory=escalation.EscalationState)
+    # Set by create_session once the Agent exists (build_dispatch_tool runs
+    # BEFORE it does — see create_session below). record_customer_will_reach_out
+    # needs the live transcript for open_escalation's inference; reading
+    # `gates.agent.messages` lazily, at call time, is what lets a handler
+    # closed over `gates` at build_dispatch_tool time see a list that did not
+    # exist yet when it was built. Safe because Agent.messages
+    # (agent/core.py:103) is mutated in place and never rebound, so this
+    # reference stays live and current for the life of the session.
+    agent: Any = field(default=None, repr=False, compare=False)
+    # Phase 12 Task 4: what end_conversation's refusal budget counts against.
+    # Deliberately its own counter, not a borrowed gates.scheduling.turn /
+    # gates.refunds.turn — those belong to PendingActionGate (the
+    # confirmation mechanism) for an unrelated purpose, and Session.turn's
+    # own comment below explains why that borrowing is a trap: a turn number
+    # that does not advance makes EscalationState.consume_refusal return
+    # True forever, which traps the customer with no unit test able to see
+    # it (the exact bug this phase exists to fix).
+    turn: int = 0
 
     def advance_turn(self) -> None:
         self.scheduling.turn += 1
         self.refunds.turn += 1
+        self.turn += 1  # Phase 12: what the refusal budget counts.
 
 
 def build_dispatch_tool(
@@ -91,7 +117,30 @@ def build_dispatch_tool(
             **kw, state=gates.scheduling, customer_id=customer_id
         ),
         "issue_refund": lambda **kw: refunds.issue_refund(**kw, state=gates.refunds, customer_id=customer_id),
-        "end_conversation": summary.end_conversation,
+        "schedule_human_callback": lambda **kw: handoff.schedule_human_callback(
+            **kw,
+            state=gates.escalation,
+            gate=gates.scheduling,
+            customer_id=customer_id,
+            # Deferred lookup, not a captured reference: `gates.agent` is
+            # None right now (build_dispatch_tool runs before Agent is
+            # constructed) and gets set by create_session afterwards. See
+            # SessionGates.agent's docstring comment. Without this, a
+            # callback booked via the accepted-offer path built its handoff
+            # packet from an empty transcript — the human colleague got a
+            # blank summary for exactly the outcome this phase exists to
+            # produce.
+            messages=gates.agent.messages if gates.agent is not None else [],
+        ),
+        "record_customer_will_reach_out": lambda **kw: handoff.record_customer_will_reach_out(
+            **kw,
+            escalation=gates.escalation,
+            customer_id=customer_id,
+            messages=gates.agent.messages if gates.agent is not None else [],
+        ),
+        "end_conversation": lambda **kw: summary.end_conversation(
+            **kw, escalation=gates.escalation, turn=gates.turn
+        ),
     }
 
     def dispatch_tool(tool_name: str, tool_input: dict) -> Any:
@@ -105,8 +154,17 @@ def build_dispatch_tool(
 
 
 def should_end_session(tool_calls: list[dict]) -> bool:
-    """True if this turn's tool calls included the model deciding to sign off."""
-    return any(call["name"] == "end_conversation" for call in tool_calls)
+    """True if this turn's tool calls included the model deciding to sign off
+    AND end_conversation actually allowed it — a refusal (Phase 12 Task 4,
+    output starting with summary.END_REFUSED_PREFIX) must not count as
+    ending the session, or an open handover would never keep the call going
+    for even one more turn.
+    """
+    return any(
+        call["name"] == "end_conversation"
+        and not str(call.get("output", "")).startswith(summary.END_REFUSED_PREFIX)
+        for call in tool_calls
+    )
 
 
 def _turn_proposed_a_confirmation(tool_calls: list[dict]) -> bool:
@@ -198,6 +256,7 @@ def create_session(customer_id: str, client: Any | None = None, transport: str =
     """
     dispatch_tool, handlers, gates = build_dispatch_tool(customer_id)
     agent = Agent(system=SYSTEM_PROMPT, tools=TOOLS, tool_executor=dispatch_tool, client=client)
+    gates.agent = agent  # see SessionGates.agent — set only once Agent exists
     return Session(
         customer_id=customer_id,
         session_id=uuid.uuid4().hex,
@@ -229,30 +288,84 @@ class TurnOutcome:
     warnings: list[str] = field(default_factory=list)  # non-fatal issues to surface, not swallow
 
 
-def _escalation_notice(callback_time: str | None) -> str:
-    """What the customer actually hears when the agent hands them off.
+def _escalation_handover_notice() -> str:
+    """What the customer hears the moment a handover opens.
 
-    This is spoken aloud, which the original wording forgot: it read the
-    INTERNAL escalation reason out loud ("sustained negative sentiment across
-    multiple turns") and then recited a handoff number. That told an already
-    frustrated customer they had been classified as angry, and gave them a
-    ticket ID they cannot use. Both belong in the turn log and the escalations
-    row, where they already are.
+    No time is named yet — that is the whole change from the old
+    `_escalation_notice`. Escalation used to announce a slot the customer had
+    never agreed to and then end the call. Once a time is actually agreed
+    (schedule_human_callback), the model hears it back in that tool's own
+    `spoken_time` field and says it itself — nothing here needs to guess it.
 
-    It promises a callback rather than a transfer because, outside Phase 10d's
-    Twilio path, no transfer happens — the call simply ends. Saying "connecting
-    you now" and then hanging up is worse than saying nothing.
+    Deliberately keeps the "call you back" phrasing the old notice used
+    (rather than the plan brief's literal "give you a call"):
+    transport/pipecat_processors.py's own escalation test matches on that
+    exact substring, and transport/ is explicitly out of scope for this
+    phase (Global Constraints) with a baseline that must not regress. The
+    design property that actually matters here — no time is promised — is
+    unchanged either way.
     """
-    if callback_time:
-        when = _spoken_time(callback_time)
-        return (
-            "Let me get one of my colleagues to call you back about this. "
-            f"The earliest we have is {when}, and they'll have the full details of our conversation."
-        )
     return (
         "Let me get one of my colleagues to call you back about this. "
-        "They'll be in touch shortly, and they'll have the full details of our conversation."
+        "When would be a good time for them to try you?"
     )
+
+
+def _escalation_offer(reason: str) -> str:
+    """What the customer hears when the agent SUSPECTS it is failing them.
+
+    An offer, not an announcement, naming a way to carry on. Deliberately
+    never names the internal reason: "sustained negative sentiment across
+    multiple turns" read aloud tells an already frustrated customer they have
+    been classified as angry.
+    """
+    if reason == "repeated failed lookups":
+        return (
+            "I'm still not finding that. Would you like to try the number once more, "
+            "or shall I have a colleague call you back about it?"
+        )
+    return "Would it help if I arranged for a colleague to call you back about this?"
+
+
+def _append_to_last_assistant_message(messages: list[dict[str, Any]], text: str) -> str | None:
+    """Record something the agent SAID but did not generate.
+
+    Notices are spoken by every transport and were never written back into
+    history, so a notice that ends in a question left the model waiting on an
+    answer to a question it has no record of asking.
+
+    Same defensive shape as _substitute_hedge_in_history above: never raises,
+    returns a warning string instead of guessing when the message is not the
+    text-only assistant turn it expects. Merges `text` into the EXISTING
+    content of the last assistant message rather than appending a new
+    `{"role": "assistant", ...}` message — appending a new one produces
+    assistant, assistant, user once Agent.send appends the next turn, and the
+    Messages API rejects two consecutive assistant messages, which would kill
+    the call on the very next turn (D-15).
+    """
+    try:
+        for message in reversed(messages):
+            if message.get("role") != "assistant":
+                continue
+            content = message.get("content")
+            if not isinstance(content, list) or not content:
+                return "Could not append notice to history: unexpected assistant message shape."
+            block_types = {
+                block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+                for block in content
+            }
+            if block_types != {"text"}:
+                return "Could not append notice to history: assistant message wasn't text-only."
+            existing = "".join(
+                block.get("text", "") if isinstance(block, dict) else getattr(block, "text", "")
+                for block in content
+            )
+            merged = f"{existing} {text}".strip() if existing else text
+            message["content"] = [{"type": "text", "text": merged}]
+            return None
+        return "Could not append notice to history: no assistant message found."
+    except Exception as exc:  # noqa: BLE001 — a guardrail must never corrupt history or crash the turn
+        return f"Could not append notice to history: {exc}"
 
 
 def _spoken_time(slot: str) -> str:
@@ -260,6 +373,15 @@ def _spoken_time(slot: str) -> str:
 
     "2026-09-11T09:00:00" read aloud by a speech synthesiser is unintelligible;
     "Thursday at 9am" is what a human on a support line would say.
+
+    Phase 12 Task 5: `_escalation_notice` (this function's only caller) is
+    gone — notices no longer name a time at all (D-6), and once a callback IS
+    booked the model reads the agreed time back from
+    schedule_human_callback's own `spoken_time` field (agent/tools/handoff.py,
+    which keeps its own duplicate of this exact helper) and says it in its
+    own words. So this copy is genuinely calleless within this module now.
+    Kept rather than deleted per the task brief; flagged in the Task 5 report
+    since no other call site in this module's new code needs it either.
     """
     try:
         when = datetime.fromisoformat(slot)
@@ -366,59 +488,126 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
             if reconcile_warning:
                 warnings.append(reconcile_warning)
 
-    # Check escalation before should_end_session — a trigger here always
-    # outranks the model deciding on its own the chat is naturally over.
+    # Check escalation before deciding whether the call may end — a trigger
+    # here always outranks the model deciding on its own the chat is
+    # naturally over, and (D-1) the END decision itself is computed only
+    # AFTER this state is known, further down.
     try:
-        reason = await escalation.check_escalation(
+        signal = await escalation.check_escalation(
             session.tracker,
             session.agent.messages,
             result.tool_calls,
             ungrounded=grounding_flagged,
         )
     except Exception as exc:  # noqa: BLE001 — a classifier hiccup must not crash the turn
-        reason = None
+        signal = None
         warnings.append(f"Could not run triage classification this turn: {exc}")
 
-    escalation_id: int | None = None
-    packet: dict[str, Any] | None = None
-    if reason:
-        try:
-            packet = await escalation.create_handoff_packet(session.customer_id, session.agent.messages, reason)
-            escalation_id = packet["escalation_id"]
-            notice = _escalation_notice(packet.get("callback_time"))
-        except Exception as exc:  # noqa: BLE001 — exit path must never crash on this
-            notice = None
-            warnings.append(f"Escalation triggered ({reason}) but the handoff packet couldn't be logged: {exc}")
+    notice: str | None = None          # M-10: unbound otherwise on ordinary turns
+    state = session.gates.escalation
+    escalation_id: int | None = state.escalation_id
+    packet: dict[str, Any] | None = state.packet
+
+    if signal and signal.mandatory:
+        if state.status == escalation.STATUS_NONE:
+            # D-16. Open IN MEMORY first — it cannot fail. Persisting is a
+            # network call that can. Opening first (rather than only after a
+            # successful await) means a failed packet build still leaves a
+            # real, suppressing, notified-at-close handover instead of no
+            # handover at all — losing that on the failure path of "I want a
+            # human" would be the worst regression in this phase.
+            state.open(signal.reason)
+            notice = _escalation_handover_notice()
+            try:
+                packet = await escalation.open_escalation(
+                    session.customer_id, session.agent.messages, signal.reason
+                )
+                state.escalation_id = packet["escalation_id"]
+                state.packet = packet
+                escalation_id = state.escalation_id
+            except Exception as exc:  # noqa: BLE001 — must never crash a live turn
+                # pending_persist stays True; close_session retries.
+                warnings.append(
+                    f"Escalation triggered ({signal.reason}) but couldn't be logged: {exc}"
+                )
+        else:
+            state.amend(signal.reason)
+    elif signal:
+        # STATUS_NONE, not `not is_open`. A RESOLVED handover is not open, so
+        # gating on is_open would re-offer a callback the customer had
+        # already settled — and because that offer ends in "?", the end
+        # suppression below would then hold their goodbye hostage waiting for
+        # an answer to a question the agent has already decided to refuse
+        # (schedule_human_callback returns already_resolved). The spec is
+        # explicit: one handover per session, and after it is arranged the
+        # agent just asks what else it can help with.
+        if signal.reason not in state.offered and state.status == escalation.STATUS_NONE:
+            state.offered.add(signal.reason)
+            notice = _escalation_offer(signal.reason)
+        session.tracker.reset_streak(signal.reason)
+
+    if notice:
+        # The customer is about to hear this. If the model has no record of
+        # saying it, their answer arrives as a non-sequitur.
+        history_warning = _append_to_last_assistant_message(session.agent.messages, notice)
+        if history_warning:
+            warnings.append(history_warning)
+
+    # THE END DECISION — computed here, after the state is known, never
+    # before. agent.send() ran the whole tool loop above, so on the turn a
+    # trigger fires the handover did not exist while end_conversation was
+    # called and could not have been refused. This is what actually stops
+    # the hang-up (D-1).
+    ending = should_end_session(result.tool_calls)
+    if ending and notice and notice.rstrip().endswith("?"):
+        # D-11, first reason: we just asked the customer something. Never
+        # hang up on our own question. This branch is what catches the OFFER
+        # case, where status is still `none` and an is_open check sees
+        # nothing. Costs no refusal budget: asking once is not insisting.
+        ending = False
+        warnings.append("end suppressed: the agent asked a question this turn")
+    elif ending and state.is_open and state.consume_refusal(session.gates.turn):
+        # D-11, second reason: a handover is open and the agent may still
+        # insist. consume_refusal returns False once MAX_END_REFUSALS turns
+        # are spent, and then this branch stops firing and the customer
+        # leaves. gates.turn, NOT session.turn (D-13) — it must be the same
+        # counter end_conversation's own handler reads, or the two call sites
+        # can disagree.
+        ending = False
+        warnings.append("end suppressed: the handover is still open")
+        if not notice:
+            notice = _escalation_handover_notice()
+            history_warning = _append_to_last_assistant_message(session.agent.messages, notice)
+            if history_warning:
+                warnings.append(history_warning)
+
+    if ending:
+        # D-3. The value survives for outcomes that still mean "transfer this
+        # call now" — transport/pipecat_processors.py bridges a live human on
+        # it. A booked callback or a customer-will-reach-out ends as
+        # model_ended: the colleague has already been told out of band, and
+        # bridging someone who agreed to a call next Tuesday is wrong.
+        transferable = state.resolution in (
+            None, escalation.RESOLUTION_TRANSFER, escalation.RESOLUTION_UNRESOLVED
+        )
+        escalated = state.status != escalation.STATUS_NONE and transferable
         outcome = TurnOutcome(
-            reply=reply,
+            reply=reply if reply.strip() else farewell(int(session.session_id[:8], 16)),
             ended=True,
-            end_reason="escalated",
+            end_reason="escalated" if escalated else "model_ended",
             notice=notice,
             escalation_packet=packet,
             llm_latency_seconds=llm_latency,
             warnings=warnings,
         )
-    elif should_end_session(result.tool_calls):
-        # A call must never end in silence. The model sometimes calls
-        # end_conversation with an empty text block — a tool call and nothing
-        # to say — and on a voice line that is a conversation that went well
-        # and then simply went dead. Done here rather than in a transport so
-        # every I/O layer gets it, and because run_turn is the one place that
-        # knows the call is ending.
-        # Keyed on the session id rather than the turn number: a call ends
-        # exactly once, so a turn-based key would hand every short call the
-        # same sign-off. The id is random per call, so two calls in a row
-        # sound different, while one call always ends the same way however
-        # many times this is evaluated.
+    else:
         outcome = TurnOutcome(
-            reply=reply if reply.strip() else farewell(int(session.session_id[:8], 16)),
-            ended=True,
-            end_reason="model_ended",
+            reply=reply,
+            notice=notice,
+            escalation_packet=packet,
             llm_latency_seconds=llm_latency,
             warnings=warnings,
         )
-    else:
-        outcome = TurnOutcome(reply=reply, llm_latency_seconds=llm_latency, warnings=warnings)
 
     # One emit point, at the single exit. log_turn already guarantees it never
     # raises; this wrapper is belt-and-suspenders on top of that, the same
@@ -439,11 +628,15 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
                 tool_calls=result.tool_calls,
                 llm_latency_seconds=llm_latency,
                 warnings=outcome.warnings,
-                escalated=outcome.end_reason == "escalated",
-                escalation_reason=reason,
+                escalated=state.status != escalation.STATUS_NONE,
+                # Only a reason that actually opened or amended a handover. A
+                # suggested trigger that merely OFFERED is not an escalation
+                # — see escalation_offered below and F-8.
+                escalation_reason=signal.reason if (signal and signal.mandatory) else None,
                 escalation_id=escalation_id,
                 ended=outcome.ended,
                 end_reason=outcome.end_reason,
+                escalation_offered=signal.reason if (signal and not signal.mandatory) else None,
             )
         )
     except Exception as exc:  # noqa: BLE001 — telemetry must never break a turn
@@ -464,11 +657,60 @@ async def close_session(session: Session) -> SessionCloseResult:
     conversation to summarize. Never raises — a failure here (e.g. no API
     credit) shouldn't blow up a transport's exit path; the transport
     decides how to surface `.error`.
+
+    Flushes any still-pending handover FIRST (D-5), before the summary call —
+    placement is dictated, not left to the implementer: the summary is a live
+    model call on a teardown path, so it failing is the common case, not the
+    exotic one, and a flush placed after it would simply never run whenever
+    the summary raises. Idempotent: a second close_session on the same
+    session sees pending_persist already False and sends nothing twice.
     """
     if not session.agent.messages:
         return SessionCloseResult()
+
+    close_error: str | None = None
+    # FIRST — the handover. A summary failure must never be able to swallow it.
+    #
+    # Guarded on pending_persist and on the handover EXISTING, not on
+    # `state.packet is not None`: when the open-time packet build failed
+    # (D-16), packet is None and that is precisely the case needing rescue —
+    # guarding on the packet would skip the retry this exists to make and
+    # leave a "get me a human" call with no row, no notification, ever.
+    state = session.gates.escalation
+    if state.pending_persist and state.status != escalation.STATUS_NONE:
+        # NOTE: no RESOLUTION_TRANSFER branch here. Nothing ever sets that
+        # resolution on gates.escalation — the DTMF path builds its own row
+        # and never touches session state (D-14, a known, flagged limitation;
+        # see PROGRESS.md).
+        try:
+            if state.packet is None:
+                # The open-time build failed. THIS is the retry D-16 promises.
+                state.packet = await escalation.open_escalation(
+                    session.customer_id, session.agent.messages, state.items[0]
+                )
+                state.escalation_id = state.packet["escalation_id"]
+            await escalation.resolve_escalation(
+                state.packet,
+                items=state.items,
+                resolution=state.resolution or escalation.RESOLUTION_UNRESOLVED,
+                callback_time=state.callback_time,
+            )
+            state.status = escalation.STATUS_RESOLVED   # idempotent: no second message
+            state.pending_persist = False
+        except Exception as exc:  # noqa: BLE001 — an exit path must never crash
+            close_error = f"Could not record the handover: {exc}"
+
+    # THEN the summary.
     try:
-        session_summary, ticket_id = await summary.close_session(session.customer_id, session.agent.messages)
-        return SessionCloseResult(summary=session_summary, ticket_id=ticket_id)
+        session_summary, ticket_id = await summary.close_session(
+            session.customer_id, session.agent.messages
+        )
+        return SessionCloseResult(
+            summary=session_summary, ticket_id=ticket_id, error=close_error
+        )
     except Exception as exc:  # noqa: BLE001 — exit path must never crash on this
-        return SessionCloseResult(error=f"Could not log session summary: {exc}")
+        return SessionCloseResult(
+            error="; ".join(
+                filter(None, [close_error, f"Could not log session summary: {exc}"])
+            )
+        )

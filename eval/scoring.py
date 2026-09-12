@@ -40,7 +40,7 @@ _NO_DB_PATH = Path()
 
 @dataclass(frozen=True)
 class Failure:
-    kind: str  # "tools" | "escalation" | "end_reason" | "db" | "pii" | "drift"
+    kind: str  # "tools" | "escalation" | "offer" | "end_reason" | "db" | "pii" | "drift"
     detail: str
 
 
@@ -114,6 +114,49 @@ def score_escalation(scenario: Scenario, result: HarnessResult) -> list[Failure]
             Failure(
                 "escalation",
                 f"expected reason {scenario.expect.escalation_reason!r}, got {row.escalation_reason!r}",
+            )
+        )
+    return failures
+
+
+def score_offer(scenario: Scenario, result: HarnessResult) -> list[Failure]:
+    """offer_turn carries two assertions at once — see Expectations.
+
+    Mirrors score_escalation exactly, but reads row.escalation_offered
+    instead of row.escalation_reason: a SUGGESTED trigger (agent/tools/
+    escalation.py's SUGGESTED_REASONS) now produces an offer, not an
+    escalation, and this is the only scorer that can see that distinction —
+    score_escalation's `fired` list is built from escalation_reason, which a
+    mere offer never sets.
+    """
+    fired = [row for row in result.observed if row.escalation_offered]
+    expected_turn = scenario.expect.offer_turn
+
+    if expected_turn is None:
+        if fired:
+            row = fired[0]
+            return [
+                Failure(
+                    "offer",
+                    f"expected no offer, but turn {row.turn} offered: {row.escalation_offered!r}",
+                )
+            ]
+        return []
+
+    if not fired:
+        return [Failure("offer", f"expected an offer on turn {expected_turn}, none fired")]
+
+    row = fired[0]
+    failures: list[Failure] = []
+    if row.turn != expected_turn:
+        failures.append(
+            Failure("offer", f"expected an offer on turn {expected_turn}, it fired on turn {row.turn}")
+        )
+    if scenario.expect.offer_reason and row.escalation_offered != scenario.expect.offer_reason:
+        failures.append(
+            Failure(
+                "offer",
+                f"expected reason {scenario.expect.offer_reason!r}, got {row.escalation_offered!r}",
             )
         )
     return failures
@@ -289,6 +332,7 @@ def score_pii(scenario: Scenario, result: HarnessResult) -> list[Failure]:
 def score_expectations(scenario: Scenario, result: HarnessResult) -> list[Failure]:
     failures = score_tools(scenario, result)
     failures += score_escalation(scenario, result)
+    failures += score_offer(scenario, result)
     if scenario.expect.end_reason is not None:
         actual = result.observed[-1].end_reason if result.observed else None
         if actual != scenario.expect.end_reason:
@@ -328,6 +372,7 @@ def score_drift(recording: Recording, result: HarnessResult) -> list[Failure]:
             "escalation_reason",
             "end_reason",
             "block_input_runtime_type",
+            "escalation_offered",
         ):
             before = _canonical(then.get(key))
             after = _canonical(getattr(now, key))
@@ -428,7 +473,13 @@ def grounding_counts(scenario: Scenario, result: HarnessResult) -> GroundingCoun
             flagged += 1
         if row.hedge_spoken:
             hedged += 1
-        if row.escalation_reason == LADDER_REASON:
+        # Phase 12 (D-9): "repeated ungrounded replies" is a SUGGESTED
+        # trigger, so it now lands in escalation_offered, never
+        # escalation_reason (agent/session.py's run_turn). Checking both
+        # keeps this counter meaningful for recordings made either before or
+        # after that split — an offer is still the ladder firing, whether or
+        # not the customer went on to accept it.
+        if LADDER_REASON in (row.escalation_reason, row.escalation_offered):
             ladder = 1
 
         reply = result.replies[index] if index < len(result.replies) else ""

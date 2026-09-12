@@ -148,7 +148,9 @@ BOOK_APPOINTMENT_SCHEMA: dict[str, Any] = {
 }
 
 
-def book_appointment(slot_time: str, reason: str, state: PendingActionGate, customer_id: str) -> dict[str, Any]:
+def book_appointment(
+    slot_time: str, reason: str, state: PendingActionGate, customer_id: str, *, key_prefix: str = "book"
+) -> dict[str, Any]:
     """Propose-then-confirm booking. See module docstring for the mechanism."""
     if slot_time in _booked_slot_times():
         state.clear()
@@ -169,7 +171,19 @@ def book_appointment(slot_time: str, reason: str, state: PendingActionGate, cust
     # plus a fixed condition, and on an appointment ID: stable identifiers,
     # not sentences. Changing the SLOT still changes the key, which is right,
     # because that genuinely is a different booking.
-    if not state.check(key=("book", slot_time)):
+    #
+    # `key_prefix` exists so a DIFFERENT caller booking the same slot for a
+    # DIFFERENT action doesn't collide on it. Phase 12's
+    # agent/tools/handoff.py books human callbacks through this same
+    # function, passing key_prefix="callback". The slot alone still
+    # identifies which booking a confirmation is for — a callback and an
+    # ordinary appointment at the same time are still two different
+    # bookings — but rule 6 asks the customer to confirm the ACTION, not
+    # just the slot: without a distinct prefix, an unconfirmed ordinary
+    # appointment proposed at slot X would satisfy state.check() for a
+    # callback proposed at that same slot X on a later turn, silently
+    # committing an action the customer was never asked about.
+    if not state.check(key=(key_prefix, slot_time)):
         return {
             "booked": False,
             "status": "pending_confirmation",

@@ -49,12 +49,40 @@ END_CONVERSATION_SCHEMA: dict[str, Any] = {
 }
 
 
-def end_conversation() -> str:
-    """No real work to do — the point is Claude choosing to call this tool at
-    all. The transport layer watches for it in TurnResult.tool_calls and
-    ends the session; the return value just satisfies the tool_result the
-    API requires for every tool_use.
+END_REFUSED_PREFIX = "Not yet."
+
+
+def end_conversation(escalation: Any | None = None, turn: int = 0) -> str:
+    """Normally there is no real work to do — the point is Claude choosing to
+    call this tool at all, and the transport watching for it.
+
+    The exception is an unresolved handover: the agent has told a customer a
+    human will help and has not arranged how, so ending strands them. That is
+    exactly what happened live, where it asked "would you like me to find some
+    callback slots?" and hung up on the same turn.
+
+    Refused as a returned message rather than a raised exception — the same
+    shape issue_refund uses for an outstanding confirmation. The model reads it
+    as a tool result and works the problem; an exception would break the turn.
+
+    This refusal is the model-facing nudge. It is NOT what stops the call
+    ending — run_turn does that, because the escalation for this very turn is
+    not detected until after the tool loop has finished.
+
+    `escalation` is `EscalationState | None` (kept as `Any` here to avoid a
+    circular import — escalation.py already imports from this module). Its
+    default of None, together with `turn=0`, preserves the pre-Phase-12
+    call site: any caller that still calls end_conversation() with no
+    arguments behaves exactly as before, always ending the call.
     """
+    if escalation is not None and escalation.is_open and escalation.consume_refusal(turn):
+        return (
+            f"{END_REFUSED_PREFIX} Sort out the handover before saying goodbye. "
+            "Offer a callback time with find_available_slots and "
+            "schedule_human_callback, or — if they would rather get in touch "
+            "themselves — call record_customer_will_reach_out. If the customer "
+            "insists on leaving after being asked, you may say goodbye."
+        )
     return "Session marked complete."
 
 

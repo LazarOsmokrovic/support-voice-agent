@@ -137,7 +137,7 @@ class FakeAnthropicClient:
 
 # Verified by grep, and kept honest by a test rather than by a comment:
 # tests/test_eval_harness.py asserts these sets never drift. Five entries,
-# not four: agent/session.py:189 is prose inside create_session's docstring
+# not four: agent/session.py:218 is prose inside create_session's docstring
 # ("...creates its own anthropic.AsyncAnthropic() by default...") describing
 # the real construction that happens in agent/core.py:101 — it never
 # executes as code. The grep-guard test matches source text, not AST, so it
@@ -146,10 +146,10 @@ class FakeAnthropicClient:
 # anything.
 MODEL_CONSTRUCTION_SITES: tuple[tuple[str, int], ...] = (
     ("agent/core.py", 101),
-    ("agent/session.py", 190),
-    ("agent/tools/summary.py", 114),
-    ("agent/tools/escalation.py", 93),
-    ("agent/tools/escalation.py", 223),
+    ("agent/session.py", 248),
+    ("agent/tools/summary.py", 142),
+    ("agent/tools/escalation.py", 214),
+    ("agent/tools/escalation.py", 358),
 )
 
 # The ONLY two clock reads that change a decision: the refund return-window

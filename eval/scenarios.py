@@ -98,6 +98,15 @@ class Expectations:
     escalation_turn: int | None = None  # None = never fires
     escalation_reason: str | None = None  # exact literal from agent/tools/escalation.py
     end_reason: str | None = None  # "model_ended" | "escalated" | "error" | None
+    # Phase 12. Same two-assertions-in-one-field shape as escalation_turn:
+    # declaring "offered on turn 2" simultaneously asserts it did NOT offer on
+    # turn 1. None means "never offers", which is the assertion every
+    # mandatory-trigger scenario needs. A SUGGESTED trigger (agent/tools/
+    # escalation.py's SUGGESTED_REASONS) now produces an offer, not an
+    # escalation — see run_turn's escalation_offered vs escalation_reason
+    # split.
+    offer_turn: int | None = None
+    offer_reason: str | None = None
     db_assertions: tuple[DbAssertion, ...] = ()
     # Reads the REAL seeded values at scoring time (mock_db.CUSTOMERS email
     # and phone, mock_db.ORDERS order_id and TBA...US tracking number) and
@@ -307,22 +316,40 @@ SCENARIOS: tuple[Scenario, ...] = (
         name="refund_high_value_escalates",
         capability="refunds",
         customer_id=AIKO,
-        turns=(f"I'd like to return order {SONY} — I don't want them anymore.",),
+        turns=(
+            f"I'd like to return order {SONY} — I don't want them anymore.",
+            "Actually, there's no need to have someone call — I'll reach out myself once "
+            "I know my schedule. That's everything, thanks — goodbye.",
+        ),
         expect=Expectations(
-            tools_called=(ToolExpectation("issue_refund", {"order_id": SONY}, turn=1),),
+            tools_called=(
+                ToolExpectation("issue_refund", {"order_id": SONY}, turn=1),
+                ToolExpectation("record_customer_will_reach_out", turn=2),
+            ),
             escalation_turn=1,
             escalation_reason=HIGH_VALUE_SONY_REASON,
-            end_reason="escalated",
+            end_reason="model_ended",
             db_assertions=(
                 DbAssertion(sql="SELECT * FROM refunds", rows=0),
-                DbAssertion(sql="SELECT reason FROM escalations WHERE customer_id = ?", params=(AIKO,), rows=1),
+                DbAssertion(
+                    sql="SELECT resolution FROM escalations WHERE customer_id = ?",
+                    params=(AIKO,),
+                    rows=1,
+                    columns={"resolution": "customer_will_reach_out"},
+                ),
             ),
         ),
-        grounding_truth=("not_applicable",),
+        grounding_truth=("not_applicable", "not_applicable"),
         notes=(
             "The test that was silently broken for a week. Frozen inside the window it tests escalation "
             "rather than degrading into a window check. Driven through run_turn it also exercises "
-            "create_handoff_packet and writes an escalations row — coverage the original lacked."
+            "open_escalation and writes an escalations row — coverage the original lacked. "
+            "Phase 12 (Task 5, D-1): issue_refund's tool-signalled escalation is MANDATORY, so it opens "
+            "a handover on turn 1 but no longer ends the call there — the call only ends once the "
+            "handover resolves. Turn 2 declines a callback in favour of reaching out later "
+            "(record_customer_will_reach_out), which is not a live transfer, so the call ends "
+            "model_ended, not escalated (D-3) — see test_no_scenario_expects_a_settled_callback_to_"
+            "transfer_the_call's identical reasoning for a booked callback."
         ),
     ),
     Scenario(
@@ -424,15 +451,39 @@ SCENARIOS: tuple[Scenario, ...] = (
         name="triage_explicit_human_request",
         capability="triage",
         customer_id=MARIA,
-        turns=("I don't want to talk to a bot, please connect me with a real person.",),
+        turns=(
+            "I don't want to talk to a bot, please connect me with a real person.",
+            "Tomorrow morning would work, if there's anything available then.",
+            "Yes, please go ahead and book that — that's everything, thanks, goodbye.",
+        ),
         expect=Expectations(
+            tools_called=(
+                ToolExpectation("find_available_slots"),
+                ToolExpectation("schedule_human_callback"),
+            ),
             escalation_turn=1,
             escalation_reason="explicit request for a human",
-            end_reason="escalated",
-            db_assertions=(DbAssertion(sql="SELECT * FROM escalations WHERE customer_id = ?", params=(MARIA,), rows=1),),
+            end_reason="model_ended",
+            db_assertions=(
+                DbAssertion(
+                    sql="SELECT resolution FROM escalations WHERE customer_id = ?",
+                    params=(MARIA,),
+                    rows=1,
+                    columns={"resolution": "callback"},
+                ),
+            ),
         ),
-        grounding_truth=("not_applicable",),
-        notes="Phase 4 checkpoint, 'not too late' half. Migrated from tests/test_text_cli.py.",
+        grounding_truth=("not_applicable", "not_applicable", "not_applicable"),
+        notes=(
+            "Phase 4 checkpoint, 'not too late' half. Migrated from tests/test_text_cli.py, then "
+            "extended for Phase 12 (Task 5, D-1): an explicit human request is MANDATORY, so it opens "
+            "a handover on turn 1 without ending the call there. schedule_human_callback is "
+            "propose-then-confirm (agent/confirmation.py) — the FIRST call (turn 2) proposes a slot "
+            "from find_available_slots, and only a LATER turn (3) can confirm the same slot, so this "
+            "is now the scenario proving a booked human callback ends the call model_ended rather than "
+            "escalated (D-3) — a real Twilio transfer never happens for a call agreed for later. See "
+            "test_no_scenario_expects_a_settled_callback_to_transfer_the_call."
+        ),
     ),
     Scenario(
         name="triage_sustained_frustration",
@@ -443,14 +494,23 @@ SCENARIOS: tuple[Scenario, ...] = (
             "This is ridiculous, it's been late every single time and nobody seems to care.",
         ),
         expect=Expectations(
-            escalation_turn=2,
-            escalation_reason="sustained negative sentiment across multiple turns",
-            end_reason="escalated",
+            escalation_turn=None,
+            offer_turn=2,
+            offer_reason="sustained negative sentiment across multiple turns",
+            db_assertions=(
+                DbAssertion(sql="SELECT * FROM escalations WHERE customer_id = ?", params=(TOM,), rows=0),
+            ),
         ),
         grounding_truth=("not_applicable", "not_applicable"),
         notes=(
-            "escalation_turn=2 expresses BOTH halves of Phase 4's checkpoint in one field: it fired on "
-            "turn 2, and it did not fire on turn 1."
+            "offer_turn=2 expresses BOTH halves of Phase 4's checkpoint in one field: it offered on "
+            "turn 2, and it did not offer on turn 1. Phase 12 (D-9): sustained negative sentiment is a "
+            "SUGGESTED trigger — the agent's own inference that it is failing the customer, not the "
+            "customer's or a rule's decision — so it now OFFERS a colleague callback instead of "
+            "imposing a handover. escalation_turn=None and the empty escalations row together assert "
+            "no handover ever opens unless the customer accepts; this is the coverage the earlier "
+            "'escalation_turn=2, end_reason=escalated' assertion got wrong (D-9) — see "
+            "test_no_scenario_expects_a_suggested_trigger_to_escalate."
         ),
     ),
     Scenario(
@@ -481,27 +541,52 @@ SCENARIOS: tuple[Scenario, ...] = (
                 ToolExpectation("get_order_status", {"order_id": UNKNOWN_ORDER_A}, turn=1),
                 ToolExpectation("get_order_status", {"order_id": UNKNOWN_ORDER_B}, turn=2),
             ),
-            escalation_turn=2,
-            escalation_reason="repeated failed lookups",
-            end_reason="escalated",
+            escalation_turn=None,
+            offer_turn=2,
+            offer_reason="repeated failed lookups",
+            db_assertions=(
+                DbAssertion(sql="SELECT * FROM escalations WHERE customer_id = ?", params=(MARIA,), rows=0),
+            ),
         ),
         grounding_truth=("not_applicable", "not_applicable"),
-        notes="Escalation trigger 4 of 5 — no live coverage before this phase.",
+        notes=(
+            "Escalation trigger 4 of 5 — no live coverage before this phase. Phase 12 (D-9): repeated "
+            "failed lookups is a SUGGESTED trigger, so a second mis-dictated order number now gets an "
+            "OFFER to try again or have a colleague call back — never an imposed handover. This is "
+            "the exact behaviour that hung up on a real customer twice; see "
+            "test_no_scenario_expects_a_suggested_trigger_to_escalate."
+        ),
     ),
     Scenario(
         name="triage_policy_restricted_topic",
         capability="triage",
         customer_id=JAMES,
-        turns=("I've already filed a chargeback with my bank and my attorney is looking at this.",),
+        turns=(
+            "I've already filed a chargeback with my bank and my attorney is looking at this.",
+            "Actually, forget it — I'll follow up myself once I've spoken with them. "
+            "That's everything, goodbye.",
+        ),
         expect=Expectations(
+            tools_called=(ToolExpectation("record_customer_will_reach_out", turn=2),),
             escalation_turn=1,
             escalation_reason="policy-restricted topic",
-            end_reason="escalated",
+            end_reason="model_ended",
+            db_assertions=(
+                DbAssertion(
+                    sql="SELECT resolution FROM escalations WHERE customer_id = ?",
+                    params=(JAMES,),
+                    rows=1,
+                    columns={"resolution": "customer_will_reach_out"},
+                ),
+            ),
         ),
-        grounding_truth=("not_applicable",),
+        grounding_truth=("not_applicable", "not_applicable"),
         notes=(
             "Escalation trigger 2 of 5 — no live coverage before this phase. A chargeback and an "
-            "attorney are both named explicitly in CLASSIFICATION_PROMPT's policy_restricted list."
+            "attorney are both named explicitly in CLASSIFICATION_PROMPT's policy_restricted list. "
+            "Phase 12 (Task 5, D-1/D-3): a policy-restricted topic is MANDATORY, opening a handover on "
+            "turn 1 without ending the call there. Turn 2 resolves it as customer_will_reach_out (no "
+            "callback booked), which is not a live transfer, so the call ends model_ended."
         ),
     ),
     Scenario(
@@ -514,9 +599,12 @@ SCENARIOS: tuple[Scenario, ...] = (
         ),
         expect=Expectations(
             tools_called=(ToolExpectation("search_policy", turn=1), ToolExpectation("search_policy", turn=2)),
-            escalation_turn=2,
-            escalation_reason="repeated ungrounded replies",
-            end_reason="escalated",
+            escalation_turn=None,
+            offer_turn=2,
+            offer_reason="repeated ungrounded replies",
+            db_assertions=(
+                DbAssertion(sql="SELECT * FROM escalations WHERE customer_id = ?", params=(MARIA,), rows=0),
+            ),
         ),
         grounding_truth=("not_applicable", "not_applicable"),
         notes=(
@@ -524,7 +612,9 @@ SCENARIOS: tuple[Scenario, ...] = (
             "deliberately designed to produce `ungrounded` labels, without which the false-negative "
             "count has no denominator. If the recording shows the model correctly declining to invent "
             "numbers, this scenario FAILS honestly and the turns need sharpening — do not relabel a "
-            "grounded reply to make it pass."
+            "grounded reply to make it pass. Phase 12 (D-9): repeated ungrounded replies is a SUGGESTED "
+            "trigger, so the ladder now ends in an OFFER, not an imposed handover — no escalations row "
+            "unless the customer accepts it."
         ),
     ),
     # --- scheduling ---

@@ -270,7 +270,18 @@ async def test_claude_turn_processor_pushes_end_frame_when_model_ends_conversati
 
 
 @pytest.mark.asyncio
-async def test_claude_turn_processor_pushes_notice_and_ends_on_escalation(monkeypatch, tmp_path):
+async def test_claude_turn_processor_pushes_notice_but_keeps_the_call_going_on_the_turn_a_handover_opens(
+    monkeypatch, tmp_path
+):
+    """Phase 12 Task 5 (D-1) updated this test's expectation, not this
+    transport's production code: opening a handover must not end the call on
+    the very turn it opens — that is precisely the trap this phase exists to
+    fix (a customer who has just asked for a human being hung up on before
+    they can even answer "when's good for you?"). ClaudeTurnProcessor itself
+    needed no change; it already just renders whatever agent/session.py's
+    run_turn reports via outcome.ended/outcome.end_reason. See
+    test_session.py's test_the_call_does_not_end_on_the_turn_a_handover_opens
+    for the same regression covered directly at the agent/ level."""
     from data import mock_db
 
     monkeypatch.setattr(mock_db, "DB_PATH", tmp_path / "test_pipecat_processors.db")
@@ -285,7 +296,7 @@ async def test_claude_turn_processor_pushes_notice_and_ends_on_escalation(monkey
     )
     monkeypatch.setattr(
         escalation,
-        "create_handoff_packet",
+        "open_escalation",
         AsyncMock(return_value={"escalation_id": 42, "reason": "explicit request for a human"}),
     )
     session = create_session("CUST-1001", client=fake_client)
@@ -299,6 +310,44 @@ async def test_claude_turn_processor_pushes_notice_and_ends_on_escalation(monkey
     # escalation-notice test for the reasoning.
     notice_frames = [f for f in sink.frames if isinstance(f, TextFrame) and "call you back" in f.text]
     assert len(notice_frames) == 1
+    assert session.gates.escalation.is_open
+    assert not any(isinstance(f, EndWorkerFrame) for f in sink.frames), (
+        "a handover opened this very turn must not end the call — D-1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_claude_turn_processor_ends_escalated_once_the_handover_refusal_budget_is_spent(monkeypatch):
+    """The other half of the same fix, preserving what the old test above
+    used to check in a single turn: an unresolved handover must still end
+    the call eventually, as "escalated", so the Twilio warm-transfer hook
+    (transport/pipecat_processors.py's own _fire_escalation_hook) still
+    fires — once the customer has been asked to sort out the handover and
+    insists on leaving anyway, past the refusal budget
+    (EscalationState.consume_refusal, Phase 12 Task 1/4)."""
+    calls = {"n": 0}
+
+    def _next_response(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] % 2 == 1:
+            return _tool_use_response("end_conversation", {})
+        return _text_response("Understood — let's sort out the handover first.")
+
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(side_effect=_next_response)
+    monkeypatch.setattr(escalation, "check_escalation", AsyncMock(return_value=None))
+    session = create_session("CUST-1001", client=fake_client)
+    session.gates.escalation.open("explicit request for a human")
+    session.gates.escalation.packet = {"escalation_id": 7, "reason": "explicit request for a human"}
+    processor = ClaudeTurnProcessor(session=session, enable_direct_mode=True)
+    sink = await _started(processor)
+
+    for _ in range(escalation.MAX_END_REFUSALS):
+        await processor.process_frame(_transcript("no, just let me go"), FrameDirection.DOWNSTREAM)
+        assert not any(isinstance(f, EndWorkerFrame) for f in sink.frames)
+
+    await processor.process_frame(_transcript("seriously, goodbye"), FrameDirection.DOWNSTREAM)
+
     assert isinstance(sink.frames[-1], EndWorkerFrame)
 
 

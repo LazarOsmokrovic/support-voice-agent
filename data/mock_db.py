@@ -80,6 +80,17 @@ CREATE TABLE IF NOT EXISTS escalations (
     -- with no ESCALATION_WEBHOOK_URL configured leaves every row this way.
     notified                INTEGER NOT NULL DEFAULT 0,
     notified_at             TEXT,
+    -- Phase 12: a handover is a process, not an event. `items` is a
+    -- newline-separated list of every reason on this ONE handover — one
+    -- customer gets one callback, so a second escalation-worthy issue appends
+    -- here rather than opening a second row. Reasons are written by this
+    -- codebase, never by a customer, so none can contain a newline.
+    -- `resolution` is null while the handover is open, which is also how an
+    -- abandoned call is recognised at close_session.
+    items                   TEXT,
+    resolution              TEXT,
+    callback_time           TEXT,
+    resolved_at             TEXT,
     FOREIGN KEY (customer_id) REFERENCES customers (customer_id)
 );
 
