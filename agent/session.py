@@ -79,10 +79,20 @@ class SessionGates:
     # (agent/core.py:103) is mutated in place and never rebound, so this
     # reference stays live and current for the life of the session.
     agent: Any = field(default=None, repr=False, compare=False)
+    # Phase 12 Task 4: what end_conversation's refusal budget counts against.
+    # Deliberately its own counter, not a borrowed gates.scheduling.turn /
+    # gates.refunds.turn — those belong to PendingActionGate (the
+    # confirmation mechanism) for an unrelated purpose, and Session.turn's
+    # own comment below explains why that borrowing is a trap: a turn number
+    # that does not advance makes EscalationState.consume_refusal return
+    # True forever, which traps the customer with no unit test able to see
+    # it (the exact bug this phase exists to fix).
+    turn: int = 0
 
     def advance_turn(self) -> None:
         self.scheduling.turn += 1
         self.refunds.turn += 1
+        self.turn += 1  # Phase 12: what the refusal budget counts.
 
 
 def build_dispatch_tool(
@@ -120,7 +130,9 @@ def build_dispatch_tool(
             # SessionGates.agent's docstring comment.
             messages=gates.agent.messages if gates.agent is not None else [],
         ),
-        "end_conversation": summary.end_conversation,
+        "end_conversation": lambda **kw: summary.end_conversation(
+            **kw, escalation=gates.escalation, turn=gates.turn
+        ),
     }
 
     def dispatch_tool(tool_name: str, tool_input: dict) -> Any:
@@ -134,8 +146,17 @@ def build_dispatch_tool(
 
 
 def should_end_session(tool_calls: list[dict]) -> bool:
-    """True if this turn's tool calls included the model deciding to sign off."""
-    return any(call["name"] == "end_conversation" for call in tool_calls)
+    """True if this turn's tool calls included the model deciding to sign off
+    AND end_conversation actually allowed it — a refusal (Phase 12 Task 4,
+    output starting with summary.END_REFUSED_PREFIX) must not count as
+    ending the session, or an open handover would never keep the call going
+    for even one more turn.
+    """
+    return any(
+        call["name"] == "end_conversation"
+        and not str(call.get("output", "")).startswith(summary.END_REFUSED_PREFIX)
+        for call in tool_calls
+    )
 
 
 def _turn_proposed_a_confirmation(tool_calls: list[dict]) -> bool:

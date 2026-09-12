@@ -20,8 +20,8 @@ import pytest
 from agent import session as session_module
 from agent.prompts import FAREWELLS
 from agent.session import create_session, run_turn
-from agent.tools import escalation
-from agent.tools.escalation import TurnClassification
+from agent.tools import escalation, summary
+from agent.tools.escalation import EscalationState, TurnClassification
 from data import mock_db
 from guardrails.validators import HEDGE_PHRASES
 
@@ -672,3 +672,159 @@ def test_farewells_vary_between_calls():
     session_id = uuid.uuid4().hex
     key = int(session_id[:8], 16)
     assert farewell(key) == farewell(key), "one call must end the same way however often it is evaluated"
+
+
+# --- Phase 12 Task 4: the per-turn bounded refusal ---
+#
+# Two prior planning rounds of this feature shipped an end_conversation that
+# refused to let the call end whenever a handover was open, with NO budget
+# limit — once a handover opened, the customer could never hang up, even
+# after saying "just let me go" repeatedly. EscalationState.consume_refusal
+# (Task 1) is the single source of truth for when that refusal budget runs
+# out; these tests exist to prove it is actually consulted on the real call
+# path, not just at the unit level.
+
+
+def test_end_conversation_is_refused_while_a_handover_is_open():
+    state = EscalationState()
+    state.open("explicit request for a human")
+
+    result = summary.end_conversation(escalation=state, turn=1)
+
+    assert result.startswith(summary.END_REFUSED_PREFIX)
+    assert not session_module.should_end_session([{"name": "end_conversation", "output": result}])
+
+
+def test_the_refusal_budget_survives_a_model_that_retries_inside_one_turn():
+    """agent/core.py allows 8 tool iterations per agent.send(), so a model
+    that reads "Not yet." and simply calls end_conversation again burns a
+    call-counted budget with no customer utterance in between — and the call
+    would end on the very turn the refusal was meant to catch. Calling
+    end_conversation repeatedly with the SAME turn number simulates exactly
+    that in-turn retry; consume_refusal is keyed on the turn number
+    precisely so repeats within one turn cost nothing."""
+    state = EscalationState()
+    state.open("explicit request for a human")
+
+    for _ in range(5):
+        result = summary.end_conversation(escalation=state, turn=7)
+        assert not session_module.should_end_session([{"name": "end_conversation", "output": result}])
+    assert state.refusals == 1
+
+
+def test_the_refusal_budget_is_consistent_across_its_two_call_sites():
+    """consume_refusal is the single source of truth for whether a turn's
+    refusal is "new". A caller checking the outcome after end_conversation
+    already called it for the same turn must see the same answer, not
+    double-spend the budget."""
+    state = EscalationState()
+    state.open("explicit request for a human")
+
+    for turn in range(1, escalation.MAX_END_REFUSALS + 1):
+        assert state.consume_refusal(turn) is True, "the tool refuses"
+        assert state.consume_refusal(turn) is True, "a second check on the same turn agrees"
+    assert state.refusals == escalation.MAX_END_REFUSALS, "one spend per turn, not two"
+
+    spent = escalation.MAX_END_REFUSALS + 1
+    assert state.consume_refusal(spent) is False
+    assert state.consume_refusal(spent) is False
+
+
+def test_end_conversation_is_allowed_once_resolved_and_with_no_handover():
+    """The overwhelming majority of calls: no handover ever opened. Nothing
+    here may make an ordinary goodbye harder."""
+    result = summary.end_conversation()
+    assert result == "Session marked complete."
+    assert session_module.should_end_session([{"name": "end_conversation", "output": result}])
+
+    resolved = EscalationState()
+    resolved.open("explicit request for a human")
+    resolved.record_resolution(escalation.RESOLUTION_SELF)
+    result = summary.end_conversation(escalation=resolved, turn=1)
+    assert result == "Session marked complete."
+    assert session_module.should_end_session([{"name": "end_conversation", "output": result}])
+
+
+def test_dispatch_tool_wires_end_conversation_to_the_live_gates():
+    """Pins the wiring itself, not just an end-to-end symptom of it being
+    right: a turn number that is never advanced (or an escalation state that
+    isn't the live one) makes consume_refusal return True forever and traps
+    the customer, with no assertion able to see it unless this closure is
+    actually built over gates.escalation / gates.turn."""
+    session = create_session("CUST-1001")
+    session.gates.escalation.open("explicit request for a human")
+    session.gates.turn = 5
+
+    result = session.handlers["end_conversation"]()
+
+    assert result.startswith(summary.END_REFUSED_PREFIX)
+    assert session.gates.escalation.refusals == 1
+
+
+def _session_always_calling_end_conversation(customer_id: str = "CUST-1001"):
+    """A fake client that has the model try to sign off on every turn: one
+    tool_use call to end_conversation, then a plain-text reply — so each
+    run_turn() call makes exactly one real attempt to end the call, not
+    eight, which would trip agent/core.py's runaway-tool-loop guard."""
+    calls = {"n": 0}
+
+    def _next_response(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] % 2 == 1:
+            return _tool_use_response("end_conversation", {})
+        return _text_response("Understood — let's sort out the handover first.")
+
+    fake_client = MagicMock()
+    fake_client.messages.create = AsyncMock(side_effect=_next_response)
+    return create_session(customer_id, client=fake_client)
+
+
+@pytest.mark.asyncio
+async def test_the_refusal_gives_up_rather_than_trapping_the_customer(monkeypatch):
+    """A refusal is a nudge, not a cage. A customer who says "just let me go"
+    and never picks a callback must still be able to leave; the handover
+    stays unresolved so the human still hears about them.
+
+    Drives run_turn — not summary.end_conversation directly, and not a
+    synthetic loop over a hand-picked turn number repeated. A prior draft's
+    test for this exact behavior called the tool and should_end_session in a
+    plain Python loop and passed even while the real trap (refusing forever,
+    with no budget) was live in run_turn's own call path, because the loop
+    never went anywhere near that path. gates.turn only exists to be
+    advanced by run_turn/advance_turn, so this is the one test that actually
+    proves the budget exhausts across genuine sequential turns rather than
+    repeated function calls.
+
+    check_escalation is stubbed to None because wiring an escalation SIGNAL
+    to automatically open gates.escalation is Task 5's job, not this one —
+    here the handover is opened directly on gates.escalation, exactly the
+    state Task 5's wiring will produce.
+    """
+    monkeypatch.setattr(escalation, "check_escalation", AsyncMock(return_value=None))
+    session = _session_always_calling_end_conversation()
+    session.gates.escalation.open("explicit request for a human")
+
+    for _ in range(escalation.MAX_END_REFUSALS):
+        outcome = await run_turn(session, "no, just let me go")
+        assert outcome.ended is False, "the agent may insist, within its budget"
+
+    outcome = await run_turn(session, "seriously, goodbye")
+
+    assert outcome.ended is True, "the customer must always be able to leave"
+    assert session.gates.escalation.is_open, "and the handover stays unresolved, not faked"
+
+
+def test_should_end_session_budget_exhausts_across_sequential_real_turns():
+    """Companion to the run_turn-level test above, at should_end_session's
+    own level: sequential turn numbers (1, 2, ..., budget+1), never the same
+    turn repeated, so the budget is shown to exhaust across turns rather
+    than across calls sharing one hand-picked turn number."""
+    state = EscalationState()
+    state.open("explicit request for a human")
+
+    for turn in range(1, escalation.MAX_END_REFUSALS + 1):
+        result = summary.end_conversation(escalation=state, turn=turn)
+        assert not session_module.should_end_session([{"name": "end_conversation", "output": result}])
+
+    result = summary.end_conversation(escalation=state, turn=escalation.MAX_END_REFUSALS + 1)
+    assert session_module.should_end_session([{"name": "end_conversation", "output": result}])
