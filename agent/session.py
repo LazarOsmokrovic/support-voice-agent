@@ -381,14 +381,16 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
 
     escalation_id: int | None = None
     packet: dict[str, Any] | None = None
+    escalation_reason_str: str | None = None
     if reason:
+        escalation_reason_str = reason.reason
         try:
-            packet = await escalation.create_handoff_packet(session.customer_id, session.agent.messages, reason)
+            packet = await escalation.create_handoff_packet(session.customer_id, session.agent.messages, escalation_reason_str)
             escalation_id = packet["escalation_id"]
             notice = _escalation_notice(packet.get("callback_time"))
         except Exception as exc:  # noqa: BLE001 — exit path must never crash on this
             notice = None
-            warnings.append(f"Escalation triggered ({reason}) but the handoff packet couldn't be logged: {exc}")
+            warnings.append(f"Escalation triggered ({escalation_reason_str}) but the handoff packet couldn't be logged: {exc}")
         outcome = TurnOutcome(
             reply=reply,
             ended=True,
@@ -440,7 +442,7 @@ async def run_turn(session: Session, user_text: str) -> TurnOutcome:
                 llm_latency_seconds=llm_latency,
                 warnings=outcome.warnings,
                 escalated=outcome.end_reason == "escalated",
-                escalation_reason=reason,
+                escalation_reason=escalation_reason_str,
                 escalation_id=escalation_id,
                 ended=outcome.ended,
                 end_reason=outcome.end_reason,

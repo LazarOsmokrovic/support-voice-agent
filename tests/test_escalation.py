@@ -38,14 +38,14 @@ def _classification(
 
 def test_explicit_human_request_escalates_immediately():
     tracker = EscalationTracker()
-    reason = tracker.record_turn(_classification(intent="request_human"), [])
-    assert reason == "explicit request for a human"
+    signal = tracker.record_turn(_classification(intent="request_human"), [])
+    assert signal is not None and signal.reason == "explicit request for a human"
 
 
 def test_policy_restricted_topic_escalates_immediately():
     tracker = EscalationTracker()
-    reason = tracker.record_turn(_classification(policy_restricted=True), [])
-    assert reason == "policy-restricted topic"
+    signal = tracker.record_turn(_classification(policy_restricted=True), [])
+    assert signal is not None and signal.reason == "policy-restricted topic"
 
 
 def test_a_tool_signaling_escalate_fires_immediately():
@@ -61,18 +61,18 @@ def test_a_tool_signaling_escalate_fires_immediately():
         }
     ]
 
-    reason = tracker.record_turn(_classification(), tool_calls)
+    signal = tracker.record_turn(_classification(), tool_calls)
 
-    assert reason == "high-value refund ($349.99) requires specialist approval"
+    assert signal is not None and signal.reason == "high-value refund ($349.99) requires specialist approval"
 
 
 def test_a_tool_escalate_flag_takes_priority_over_a_calm_classification():
     tracker = EscalationTracker()
     tool_calls = [{"name": "issue_refund", "input": {}, "output": {"escalate": True}}]
 
-    reason = tracker.record_turn(_classification(sentiment="positive"), tool_calls)
+    signal = tracker.record_turn(_classification(sentiment="positive"), tool_calls)
 
-    assert reason == "a high-value action requires human approval"  # default reason, none was provided
+    assert signal is not None and signal.reason == "a high-value action requires human approval"  # default reason, none was provided
 
 
 def test_single_negative_turn_does_not_escalate():
@@ -84,8 +84,8 @@ def test_single_negative_turn_does_not_escalate():
 def test_two_consecutive_negative_turns_escalates():
     tracker = EscalationTracker()
     assert tracker.record_turn(_classification(sentiment="negative"), []) is None
-    reason = tracker.record_turn(_classification(sentiment="negative"), [])
-    assert reason == "sustained negative sentiment across multiple turns"
+    signal = tracker.record_turn(_classification(sentiment="negative"), [])
+    assert signal is not None and signal.reason == "sustained negative sentiment across multiple turns"
 
 
 def test_a_calm_turn_resets_the_negative_streak():
@@ -107,8 +107,8 @@ def test_two_consecutive_failed_lookups_escalates():
     tracker = EscalationTracker()
     failed = [{"name": "get_order_status", "input": {}, "output": {"found": False}}]
     assert tracker.record_turn(_classification(), failed) is None
-    reason = tracker.record_turn(_classification(), failed)
-    assert reason == "repeated failed lookups"
+    signal = tracker.record_turn(_classification(), failed)
+    assert signal is not None and signal.reason == "repeated failed lookups"
 
 
 def test_a_successful_lookup_resets_the_failure_streak():
@@ -126,8 +126,8 @@ def test_turns_without_lookups_do_not_affect_the_failure_streak():
     failed = [{"name": "get_order_status", "input": {}, "output": {"found": False}}]
     assert tracker.record_turn(_classification(), failed) is None
     assert tracker.record_turn(_classification(), []) is None  # chitchat turn, no lookup at all
-    reason = tracker.record_turn(_classification(), failed)
-    assert reason == "repeated failed lookups"  # streak was NOT reset by the chitchat turn
+    signal = tracker.record_turn(_classification(), failed)
+    assert signal is not None and signal.reason == "repeated failed lookups"  # streak was NOT reset by the chitchat turn
 
 
 def test_single_ungrounded_reply_does_not_escalate():
@@ -138,7 +138,8 @@ def test_single_ungrounded_reply_does_not_escalate():
 def test_two_consecutive_ungrounded_replies_escalates():
     tracker = EscalationTracker()
     assert tracker.record_turn(_classification(), [], ungrounded=True) is None
-    assert tracker.record_turn(_classification(), [], ungrounded=True) == "repeated ungrounded replies"
+    signal = tracker.record_turn(_classification(), [], ungrounded=True)
+    assert signal is not None and signal.reason == "repeated ungrounded replies"
 
 
 def test_a_grounded_reply_resets_the_ungrounded_streak():
@@ -434,3 +435,161 @@ def test_the_prompt_tells_the_agent_what_to_do_when_no_id_arrives():
     assert "do not call a tool" in prompt, (
         "a caller who has not given a number yet must not trigger a lookup"
     )
+
+
+# --- Phase 12: EscalationSignal and EscalationState ---
+
+
+def test_a_mandatory_trigger_is_marked_mandatory():
+    """An explicit request for a human is the customer's decision, not the
+    agent's inference, so it opens a handover without asking permission."""
+    tracker = escalation.EscalationTracker()
+    signal = tracker.record_turn(
+        escalation.TurnClassification(
+            intent="request_human", sentiment="neutral", policy_restricted=False
+        ),
+        tool_calls=[],
+    )
+    assert signal is not None and signal.mandatory is True
+    assert signal.reason == "explicit request for a human"
+
+
+def test_inferred_triggers_are_only_suggestions():
+    """Both of these hung up on customers who were fine: one had mis-dictated
+    a digit and corrected themselves, the other was calmly cancelling an
+    order. They are the AGENT's inference that it is failing — sometimes
+    true, sometimes not. Inferences get offered, not imposed."""
+    tracker = escalation.EscalationTracker()
+    neutral = escalation.TurnClassification(
+        intent="order_status", sentiment="neutral", policy_restricted=False
+    )
+    failed = [{"name": "get_order_status", "output": {"found": False}}]
+    for _ in range(escalation.FAILED_LOOKUP_ESCALATION_THRESHOLD):
+        signal = tracker.record_turn(neutral, failed)
+    assert signal.reason == "repeated failed lookups"
+    assert signal.mandatory is False
+    assert signal.reason in escalation.SUGGESTED_REASONS
+
+    tracker2 = escalation.EscalationTracker()
+    upset = escalation.TurnClassification(
+        intent="complaint", sentiment="negative", policy_restricted=False
+    )
+    for _ in range(escalation.NEGATIVE_SENTIMENT_ESCALATION_THRESHOLD):
+        signal2 = tracker2.record_turn(upset, [])
+    assert signal2.mandatory is False
+
+
+def test_the_sets_are_disjoint_and_are_not_the_mechanism():
+    """MANDATORY_REASONS / SUGGESTED_REASONS are for tests, eval scoring and
+    readers — never for deriving `mandatory` (D-12)."""
+    assert escalation.MANDATORY_REASONS & escalation.SUGGESTED_REASONS == set()
+
+
+def test_a_tool_signalled_escalation_is_mandatory_even_though_no_set_contains_it():
+    """agent/tools/refunds.py:185 builds its reason with an f-string carrying
+    the amount, so the string is different for every refund and can never be a
+    member of a static set. An implementation deriving mandatory as
+    `reason in MANDATORY_REASONS` therefore downgrades "a specialist must
+    approve this $200 refund" to "would you like a human?" — and breaks
+    eval/scenarios.py:314.
+
+    A tool asking for a specialist is a rule, not an inference. Asserting on a
+    dynamic reason is the only way this test can tell the two implementations
+    apart."""
+    tracker = escalation.EscalationTracker()
+    calm = escalation.TurnClassification(
+        intent="refund_or_return", sentiment="neutral", policy_restricted=False
+    )
+    signalled = [
+        {
+            "name": "issue_refund",
+            "output": {
+                "escalate": True,
+                "escalation_reason": "high-value refund ($249.99) requires specialist approval",
+            },
+        }
+    ]
+
+    signal = tracker.record_turn(calm, signalled)
+
+    assert signal is not None
+    assert signal.mandatory is True, "a specialist requirement is a rule, not an offer"
+    assert signal.reason not in escalation.MANDATORY_REASONS, (
+        "and it is mandatory despite no set containing it — proving the set is not the mechanism"
+    )
+
+
+def test_resetting_a_streak_gives_the_customer_a_clean_run():
+    tracker = escalation.EscalationTracker()
+    neutral = escalation.TurnClassification(
+        intent="order_status", sentiment="neutral", policy_restricted=False
+    )
+    failed = [{"name": "get_order_status", "output": {"found": False}}]
+    for _ in range(escalation.FAILED_LOOKUP_ESCALATION_THRESHOLD):
+        tracker.record_turn(neutral, failed)
+
+    tracker.reset_streak("repeated failed lookups")
+
+    assert tracker.consecutive_failed_lookups == 0
+    assert tracker.record_turn(neutral, failed) is None
+
+
+def test_a_turn_with_no_tool_calls_does_not_advance_the_lookup_counter():
+    """Turn 10 of the live call escalated while the agent was merely asked to
+    repeat a number back — no lookup happened at all."""
+    tracker = escalation.EscalationTracker()
+    neutral = escalation.TurnClassification(
+        intent="order_status", sentiment="neutral", policy_restricted=False
+    )
+    tracker.record_turn(neutral, [{"name": "get_order_status", "output": {"found": False}}])
+    before = tracker.consecutive_failed_lookups
+    tracker.record_turn(neutral, [])
+    assert tracker.consecutive_failed_lookups == before
+
+
+def test_the_state_machine_opens_amends_and_resolves():
+    state = escalation.EscalationState()
+    assert state.status == escalation.STATUS_NONE and state.is_open is False
+
+    state.open("explicit request for a human")
+    assert state.status == escalation.STATUS_OPEN
+    assert state.items == ["explicit request for a human"]
+
+    state.amend("policy-restricted topic")
+    assert state.status == escalation.STATUS_OPEN, "an amendment never reopens"
+    assert state.items == ["explicit request for a human", "policy-restricted topic"]
+
+    state.record_resolution(escalation.RESOLUTION_CALLBACK, callback_time="2026-09-14T09:00:00")
+    assert state.status == escalation.STATUS_RESOLVED and state.is_open is False
+
+
+def test_amending_a_resolved_handover_keeps_it_resolved():
+    state = escalation.EscalationState()
+    state.open("explicit request for a human")
+    state.record_resolution(escalation.RESOLUTION_SELF)
+    state.amend("high-value refund requires approval")
+    assert state.status == escalation.STATUS_RESOLVED
+    assert len(state.items) == 2
+
+
+def test_a_repeated_trigger_does_not_duplicate_an_item():
+    """One tripped trigger firing every turn produced escalation rows 7, 8
+    and 9 for one problem in a live call."""
+    state = escalation.EscalationState()
+    state.open("explicit request for a human")
+    state.amend("explicit request for a human")
+    assert state.items == ["explicit request for a human"]
+
+
+def test_the_refusal_budget_is_spent_once_per_turn():
+    """agent/core.py:91 allows 8 tool iterations, so a model that reads the
+    refusal and simply retries can call end_conversation three times inside
+    ONE agent.send(). A call-counted budget is exhausted with no customer
+    utterance in between, and the call ends on the trigger turn with the
+    handover open — which is the bug this phase exists to fix."""
+    state = escalation.EscalationState()
+    state.open("explicit request for a human")
+
+    assert state.consume_refusal(turn=4) is True
+    assert state.consume_refusal(turn=4) is True, "a repeat within one turn still refuses"
+    assert state.refusals == 1, "but it must not spend budget"

@@ -34,7 +34,7 @@ Three pieces:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -50,6 +50,119 @@ from data.mock_db import get_connection
 from guardrails.pii import HANDOFF_TEXT_FIELDS, redact_fields
 
 logger = logging.getLogger("agent.tools.escalation")
+
+# Named rather than repeated as literals: these values travel across
+# escalation.py, handoff.py, session.py, turn_log.py and a DB column, and a
+# typo in any one fails silently as "this handover is somehow neither open
+# nor resolved".
+STATUS_NONE = "none"
+STATUS_OPEN = "open"
+STATUS_RESOLVED = "resolved"
+
+RESOLUTION_CALLBACK = "callback"
+RESOLUTION_SELF = "customer_will_reach_out"
+RESOLUTION_TRANSFER = "transfer"
+RESOLUTION_UNRESOLVED = "unresolved"
+
+# Whose decision each trigger represents. A mandatory trigger is the
+# customer's or a rule's — the agent has no standing to second-guess it. A
+# suggested trigger is the agent's own inference that it is failing, which is
+# the judgement that hung up on a customer who had mis-dictated one digit,
+# and on another who was calmly cancelling an order. Inferences get offered;
+# they do not get imposed. CLAUDE.md rule 6's principle, applied to handoffs.
+MANDATORY_REASONS = frozenset(
+    {"explicit request for a human", "policy-restricted topic"}
+)
+SUGGESTED_REASONS = frozenset(
+    {
+        "repeated failed lookups",
+        "sustained negative sentiment across multiple turns",
+        "repeated ungrounded replies",
+    }
+)
+
+MAX_END_REFUSALS = 2
+
+
+@dataclass(frozen=True)
+class EscalationSignal:
+    reason: str
+    mandatory: bool
+
+
+@dataclass
+class EscalationState:
+    """One handover per session, for the life of the session.
+
+    That is what happens on a real support line: a human ringing a customer
+    back deals with everything that customer has, rather than booking three
+    calls for three questions. So a second escalation-worthy issue becomes
+    another ITEM on the same handover — which is why `items` is a list and not
+    the single `reason` string it replaced.
+
+    Mutated in place, never rebound: the tool handlers in build_dispatch_tool
+    close over it before the Session that owns it exists.
+    """
+
+    status: str = STATUS_NONE
+    escalation_id: int | None = None
+    packet: dict[str, Any] | None = None
+    items: list[str] = field(default_factory=list)
+    resolution: str | None = None
+    callback_time: str | None = None
+    # Suggested triggers that have already made their offer. Being asked over
+    # and over whether you want a human is its own kind of failure.
+    offered: set[str] = field(default_factory=set)
+    # Anything still unsent. close_session flushes on this, NOT on is_open —
+    # a resolution recorded and then lost to a crashing turn is not open, and
+    # guarding on is_open would drop it silently.
+    pending_persist: bool = False
+    refusals: int = 0
+    _last_refusal_turn: int | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.status == STATUS_OPEN
+
+    def open(self, reason: str) -> None:
+        if self.status == STATUS_NONE:
+            self.status = STATUS_OPEN
+        if reason not in self.items:
+            self.items.append(reason)
+        self.pending_persist = True
+
+    def amend(self, reason: str) -> None:
+        """A second trigger during an existing handover. Never reopens a
+        resolved one and never books a second callback — it adds an item the
+        colleague taking it over can prepare for.
+        """
+        if reason in self.items:
+            return
+        self.items.append(reason)
+        self.pending_persist = True
+
+    def record_resolution(self, resolution: str, callback_time: str | None = None) -> None:
+        self.status = STATUS_RESOLVED
+        self.resolution = resolution
+        self.callback_time = callback_time
+        self.pending_persist = True
+
+    def consume_refusal(self, turn: int) -> bool:
+        """True if end_conversation should be refused. Budget is spent at most
+        once per TURN.
+
+        agent/core.py:91 allows 8 tool iterations, so a model that reads the
+        refusal and retries can call end_conversation three times inside one
+        agent.send(). Counting calls would exhaust the budget with no customer
+        utterance in between — the nudge becomes a rubber stamp on exactly the
+        turn it was meant to catch.
+        """
+        if self.refusals >= MAX_END_REFUSALS and turn != self._last_refusal_turn:
+            return False
+        if turn != self._last_refusal_turn:
+            self.refusals += 1
+            self._last_refusal_turn = turn
+        return True
 
 # How many consecutive turns of the same bad signal before actually
 # escalating — chosen to avoid firing on one grumpy word or one bad lookup,
@@ -144,8 +257,8 @@ class EscalationTracker:
         classification: TurnClassification,
         tool_calls: list[dict[str, Any]],
         ungrounded: bool = False,
-    ) -> str | None:
-        """Update counters from this turn; return an escalation reason the
+    ) -> EscalationSignal | None:
+        """Update counters from this turn; return an escalation signal the
         moment a trigger fires, else None.
 
         Immediate triggers (a tool directly signaling escalation, an
@@ -159,18 +272,18 @@ class EscalationTracker:
         """
         tool_escalation = _tool_signaled_escalation(tool_calls)
         if tool_escalation:
-            return tool_escalation
+            return EscalationSignal(tool_escalation, mandatory=True)
         if classification.intent == "request_human":
-            return "explicit request for a human"
+            return EscalationSignal("explicit request for a human", mandatory=True)
         if classification.policy_restricted:
-            return "policy-restricted topic"
+            return EscalationSignal("policy-restricted topic", mandatory=True)
 
         if classification.sentiment == "negative":
             self.consecutive_negative_turns += 1
         else:
             self.consecutive_negative_turns = 0
         if self.consecutive_negative_turns >= NEGATIVE_SENTIMENT_ESCALATION_THRESHOLD:
-            return "sustained negative sentiment across multiple turns"
+            return EscalationSignal("sustained negative sentiment across multiple turns", mandatory=False)
 
         outcomes = _turn_tool_outcomes(tool_calls)
         if outcomes:
@@ -178,17 +291,31 @@ class EscalationTracker:
                 self.consecutive_failed_lookups = 0
             else:
                 self.consecutive_failed_lookups += 1
-        if self.consecutive_failed_lookups >= FAILED_LOOKUP_ESCALATION_THRESHOLD:
-            return "repeated failed lookups"
+            # INSIDE this block on purpose. It used to sit outside, re-reading
+            # the counter every turn — so once the streak tripped, a turn with
+            # no lookup at all still escalated. One live call produced rows 7,
+            # 8 and 9 for one problem that way, the last from a turn that
+            # merely asked the agent to repeat a number back.
+            if self.consecutive_failed_lookups >= FAILED_LOOKUP_ESCALATION_THRESHOLD:
+                return EscalationSignal("repeated failed lookups", mandatory=False)
 
         if ungrounded:
             self.consecutive_ungrounded_replies += 1
         else:
             self.consecutive_ungrounded_replies = 0
         if self.consecutive_ungrounded_replies >= UNGROUNDED_REPLY_ESCALATION_THRESHOLD:
-            return "repeated ungrounded replies"
+            return EscalationSignal("repeated ungrounded replies", mandatory=False)
 
         return None
+
+    def reset_streak(self, reason: str) -> None:
+        """Reset the streak counter for the given reason."""
+        if reason == "repeated failed lookups":
+            self.consecutive_failed_lookups = 0
+        elif reason == "sustained negative sentiment across multiple turns":
+            self.consecutive_negative_turns = 0
+        elif reason == "repeated ungrounded replies":
+            self.consecutive_ungrounded_replies = 0
 
 
 async def check_escalation(
@@ -197,7 +324,7 @@ async def check_escalation(
     tool_calls: list[dict[str, Any]],
     ungrounded: bool = False,
     client: anthropic.AsyncAnthropic | None = None,
-) -> str | None:
+) -> EscalationSignal | None:
     """classify_turn + tracker.record_turn in one call — shared by
     transport/text_cli.py's real loop and by tests, so the two can't drift
     apart from each other.

@@ -143,7 +143,7 @@ async def test_an_escalated_turn_exposes_the_handoff_packet(monkeypatch):
     fake_client = MagicMock()
     fake_client.messages.create = AsyncMock(return_value=_text_response("Let me get someone."))
     monkeypatch.setattr(
-        escalation, "check_escalation", AsyncMock(return_value="explicit request for a human")
+        escalation, "check_escalation", AsyncMock(return_value=escalation.EscalationSignal("explicit request for a human", mandatory=True))
     )
     monkeypatch.setattr(
         escalation,
