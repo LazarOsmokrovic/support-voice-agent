@@ -708,9 +708,14 @@ def test_every_escalation_reason_is_a_literal_the_code_can_actually_produce():
         assert literal in source, f"{literal!r} is no longer produced by agent/tools/escalation.py"
     for scenario in SCENARIOS:
         reason = scenario.expect.escalation_reason
-        if reason is None:
-            continue
-        assert reason in fixed or reason.startswith("high-value refund ("), scenario.name
+        if reason is not None:
+            assert reason in fixed or reason.startswith("high-value refund ("), scenario.name
+        # Phase 12: offer_reason draws from the same fixed vocabulary — it is
+        # just which FIELD a given reason lands in (escalation_reason for a
+        # mandatory trigger, offer_reason for a suggested one) that changed.
+        offer_reason = scenario.expect.offer_reason
+        if offer_reason is not None:
+            assert offer_reason in fixed, scenario.name
 
 
 def test_every_scenario_declares_one_grounding_label_per_turn_and_a_known_capability():
@@ -758,13 +763,72 @@ def test_the_roster_is_exactly_twenty_and_covers_all_six_capabilities():
 def test_every_escalation_trigger_the_agent_can_take_is_exercised_by_some_scenario():
     """Before this phase, live coverage reached two of five escalation
     triggers (agent/tools/escalation.py:161-186). These scenarios close the
-    other three, so every escalation path is exercised for the first time."""
+    other three, so every escalation path is exercised for the first time.
+
+    Phase 12 Task 7: MANDATORY triggers (explicit human request,
+    policy-restricted topic, a tool-signalled escalation) still open a
+    handover and are asserted via escalation_reason. SUGGESTED triggers
+    (sustained negative sentiment, repeated failed lookups, repeated
+    ungrounded replies) now only OFFER — see agent/tools/escalation.py's
+    SUGGESTED_REASONS — so their coverage lives in offer_reason instead.
+    """
     from eval.scenarios import SCENARIOS
 
-    reasons = {scenario.expect.escalation_reason for scenario in SCENARIOS}
-    assert "explicit request for a human" in reasons
-    assert "policy-restricted topic" in reasons
-    assert "sustained negative sentiment across multiple turns" in reasons
-    assert "repeated failed lookups" in reasons
-    assert "repeated ungrounded replies" in reasons
-    assert any(r and r.startswith("high-value refund (") for r in reasons)
+    escalation_reasons = {scenario.expect.escalation_reason for scenario in SCENARIOS}
+    offer_reasons = {scenario.expect.offer_reason for scenario in SCENARIOS}
+    assert "explicit request for a human" in escalation_reasons
+    assert "policy-restricted topic" in escalation_reasons
+    assert "sustained negative sentiment across multiple turns" in offer_reasons
+    assert "repeated failed lookups" in offer_reasons
+    assert "repeated ungrounded replies" in offer_reasons
+    assert any(r and r.startswith("high-value refund (") for r in escalation_reasons)
+
+
+def test_no_scenario_expects_a_suggested_trigger_to_escalate():
+    """Suggested triggers offer; they do not escalate. A scenario still
+    pinning end_reason="escalated" on one of them encodes deleted behaviour
+    and will fail at the next live eval run — after credit has been spent."""
+    from agent.tools.escalation import SUGGESTED_REASONS
+    from eval.scenarios import SCENARIOS
+
+    # A positive control. After Task 7's rewrite no scenario has a suggested
+    # escalation_reason, so the loop body stops running and the test passes by
+    # examining nothing — the same way v2's `grep -c` passed while all six
+    # scenarios were broken. Counting what was actually checked is the only
+    # thing separating this from that.
+    examined = 0
+    for scenario in SCENARIOS:
+        if scenario.expect.offer_reason in SUGGESTED_REASONS:
+            examined += 1
+            assert scenario.expect.end_reason != "escalated", (
+                f"{scenario.name} expects a suggested trigger to escalate"
+            )
+            assert scenario.expect.escalation_turn is None, (
+                f"{scenario.name} pins an escalation turn for a trigger that only offers"
+            )
+    assert examined >= 3, (
+        f"expected the three rewritten suggested-trigger scenarios, examined {examined}"
+    )
+
+
+def test_no_scenario_expects_a_settled_callback_to_transfer_the_call():
+    """D-3: end_reason="escalated" still bridges a live Twilio call
+    (transport/pipecat_processors.py:418). A scenario that both books a
+    callback and expects "escalated" is asserting that a customer who agreed
+    to a call next Tuesday gets connected to a human immediately."""
+    from eval.scenarios import SCENARIOS
+
+    examined = 0
+    for scenario in SCENARIOS:
+        booked = any(
+            tool.name == "schedule_human_callback" for tool in scenario.expect.tools_called
+        )
+        if booked:
+            examined += 1
+            assert scenario.expect.end_reason != "escalated", (
+                f"{scenario.name} books a callback and still expects a live transfer"
+            )
+    assert examined >= 1, (
+        "no scenario books a callback, so this test checked nothing — Group A must "
+        "add one that does"
+    )

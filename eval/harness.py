@@ -58,6 +58,14 @@ class ObservedTurn:
     escalation_reason: str | None
     end_reason: str | None
     block_input_runtime_type: str | None
+    # Phase 12 Task 7. A reason that only OFFERED (a suggested trigger the
+    # customer hasn't accepted yet) — never a reason that opened or amended a
+    # handover, which stays in escalation_reason above. See
+    # observability/turn_log.py's TurnRecord.escalation_offered and
+    # agent/session.py's run_turn for why the two fields must not be
+    # conflated. Default so every existing positional construction (this
+    # file, tests/test_eval_harness.py's hand-built rows) keeps working.
+    escalation_offered: str | None = None
 
 
 @dataclass
@@ -149,6 +157,7 @@ async def run_scenario(
                             escalation_reason=record.escalation_reason,
                             end_reason=record.end_reason,
                             block_input_runtime_type=_block_input_runtime_type(record.tool_calls),
+                            escalation_offered=record.escalation_offered,
                         )
                     )
                     if outcome.ended:

@@ -21,6 +21,7 @@ from eval.scoring import (
     score_db,
     score_escalation,
     score_expectations,
+    score_offer,
     score_pii,
     score_redactor_preserves_identifiers,
     score_tools,
@@ -147,6 +148,92 @@ def test_escalation_reason_mismatch_names_both_reasons():
     assert len(failures) == 1
     assert "policy-restricted topic" in failures[0].detail
     assert "explicit request for a human" in failures[0].detail
+
+
+def test_offer_turn_none_fails_when_an_offer_fired():
+    """Mirrors test_escalation_turn_none_fails_when_an_escalation_fired.
+    Proves score_offer can fail in the "expected no offer" direction."""
+    scenario = _scenario(expect=Expectations(offer_turn=None))
+    result = _result(observed=[_turn(1, escalation_offered="repeated failed lookups")])
+    failures = score_offer(scenario, result)
+    assert len(failures) == 1
+    assert "expected no offer" in failures[0].detail
+
+
+def test_offer_turn_fails_when_the_expected_offer_never_happens():
+    """The exact shape the brief calls out: a scenario expects an offer on
+    turn 2, and the observed turns carry none at all. This is the check that
+    distinguishes 'the framework can express offers' from 'the framework has
+    an offer-shaped field nobody reads' — score_offer must actively fail
+    here, not silently pass because nothing crashed."""
+    scenario = _scenario(
+        expect=Expectations(offer_turn=2, offer_reason="repeated failed lookups")
+    )
+    result = _result(
+        observed=[
+            _turn(1, tool_calls=[{"name": "get_order_status", "input": {}, "output": {"found": False}}]),
+            _turn(2, tool_calls=[{"name": "get_order_status", "input": {}, "output": {"found": False}}]),
+        ]
+    )
+    failures = score_offer(scenario, result)
+    assert len(failures) == 1
+    assert failures[0].kind == "offer"
+    assert "expected an offer on turn 2" in failures[0].detail
+    assert "none fired" in failures[0].detail
+
+
+def test_offer_turn_passes_when_the_expected_offer_actually_happens():
+    """The mirror case: score_offer must NOT fail when the offer is present
+    exactly where expected — a scorer that always fails is as useless as one
+    that never does."""
+    scenario = _scenario(
+        expect=Expectations(offer_turn=2, offer_reason="repeated failed lookups")
+    )
+    result = _result(
+        observed=[
+            _turn(1, tool_calls=[{"name": "get_order_status", "input": {}, "output": {"found": False}}]),
+            _turn(2, escalation_offered="repeated failed lookups"),
+        ]
+    )
+    assert score_offer(scenario, result) == []
+
+
+def test_offer_turn_two_fails_when_it_fired_too_eagerly_on_turn_one():
+    """One field, two assertions, same shape as escalation_turn."""
+    scenario = _scenario(expect=Expectations(offer_turn=2, offer_reason="repeated failed lookups"))
+    result = _result(observed=[_turn(1, escalation_offered="repeated failed lookups")])
+    failures = score_offer(scenario, result)
+    assert len(failures) == 1
+    assert "turn 1" in failures[0].detail
+
+
+def test_offer_reason_mismatch_names_both_reasons():
+    scenario = _scenario(expect=Expectations(offer_turn=1, offer_reason="repeated failed lookups"))
+    result = _result(
+        observed=[_turn(1, escalation_offered="sustained negative sentiment across multiple turns")]
+    )
+    failures = score_offer(scenario, result)
+    assert len(failures) == 1
+    assert "repeated failed lookups" in failures[0].detail
+    assert "sustained negative sentiment across multiple turns" in failures[0].detail
+
+
+def test_score_expectations_fails_end_to_end_when_an_expected_offer_never_happens():
+    """The explicit brief requirement: prove score_offer is actually WIRED
+    IN to score_expectations, not just defined and never invoked. A scenario
+    expecting an offer that doesn't happen must cause score_expectations
+    itself — the function the real scorer calls — to report a failure."""
+    scenario = _scenario(expect=Expectations(offer_turn=1, offer_reason="repeated failed lookups"))
+    result = _result(observed=[_turn(1)])  # no offer at all this turn
+    failures = score_expectations(scenario, result)
+    assert any(failure.kind == "offer" for failure in failures)
+
+
+def test_score_expectations_passes_when_an_expected_offer_actually_happens():
+    scenario = _scenario(expect=Expectations(offer_turn=1, offer_reason="repeated failed lookups"))
+    result = _result(observed=[_turn(1, escalation_offered="repeated failed lookups")])
+    failures = score_expectations(scenario, result)
+    assert not any(failure.kind == "offer" for failure in failures)
 
 
 def test_db_assertion_counts_rows_and_pins_column_values(tmp_path):
@@ -411,6 +498,44 @@ def test_score_drift_reports_a_tool_output_that_changed_since_recording():
     assert "turn 1" in failures[0].detail
 
 
+def test_score_drift_catches_a_regression_in_whether_a_turn_offered():
+    """Step 0c: escalation_offered must be in score_drift's key tuple, or a
+    regression that silently stops offering (or starts offering when it
+    shouldn't) goes undetected between recordings — exactly the blind spot
+    the brief calls out."""
+    from eval.recording import Recording, current_hashes
+    from eval.scoring import score_drift
+
+    observed_then = [
+        {
+            "turn": 1,
+            "tool_calls": [],
+            "grounding_flagged": False,
+            "hedge_spoken": False,
+            "escalation_reason": None,
+            "end_reason": None,
+            "block_input_runtime_type": None,
+            "escalation_offered": "repeated failed lookups",
+        }
+    ]
+    recording = Recording(
+        scenario="demo",
+        recorded_at="2026-09-08T12:00:00",
+        model="claude-opus-5",
+        anthropic_sdk_version="1.0.0",
+        creates=[],
+        parses=[],
+        observed=observed_then,
+        **current_hashes(),
+    )
+    result = _result(observed=[_turn(1, escalation_offered=None)])
+
+    failures = score_drift(recording, result)
+    assert len(failures) == 1
+    assert failures[0].kind == "drift"
+    assert "escalation_offered" in failures[0].detail
+
+
 def test_rate_reports_n_over_n_and_never_a_bare_percentage():
     from eval.scoring import rate
 
@@ -474,6 +599,29 @@ def test_grounding_counts_counts_unreachable_claims_and_the_ladder():
     counts = grounding_counts(scenario, result)
 
     assert counts.unreachable_claims == 1
+    assert counts.ladder_fired == 1
+
+
+def test_grounding_counts_counts_the_ladder_when_it_only_offered():
+    """Phase 12 (D-9): 'repeated ungrounded replies' is a SUGGESTED trigger,
+    so it now shows up in escalation_offered, never escalation_reason (see
+    agent/session.py's run_turn). Without this, ladder_fired silently drops
+    to 0 for every real conversation the moment this phase ships, even
+    though the ladder genuinely fired — it just offered instead of
+    escalating."""
+    from eval.scoring import grounding_counts
+
+    scenario = _scenario(turns=("a", "b"), grounding_truth=("not_applicable", "not_applicable"))
+    result = _result(
+        replies=["Hedge one.", "Hedge two."],
+        observed=[
+            _turn(1, grounding_flagged=True),
+            _turn(2, grounding_flagged=True, escalation_offered="repeated ungrounded replies"),
+        ],
+    )
+
+    counts = grounding_counts(scenario, result)
+
     assert counts.ladder_fired == 1
 
 
